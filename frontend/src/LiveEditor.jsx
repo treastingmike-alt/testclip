@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getTranscript, saveClipEdit, exportClip, previewUrl,
          uploadOverlayImage, overlayImageUrl, gameplayUrl } from "./api";
-import { FontPicker, SizePicker, LanguagePicker, useFonts } from "./CaptionToolbar";
+import { FontPicker, SizePicker, LanguagePicker, useFonts,
+         useTitleStyles, titleLookCss } from "./CaptionToolbar";
 import { useEditHistory } from "./useEditHistory";
 import { PLATFORMS, platformOverlay, BACKGROUNDS, logoSrc } from "./EditorPresets";
 import TimelineTracks from "./TimelineTracks";
@@ -20,9 +21,16 @@ const STYLES = {
   gameplay: { color: "#fff", active: "#3ad43a", weight: 900, shadow: true, caps: true, px: 84 },
 };
 
-/* The renderer lays captions out on a 1080-wide canvas. Converting px to
-   container-query width keeps the preview proportional at any stage size. */
-const CANVAS_W = 1080;
+/* Caption and title sizes are absolute px on the OUTPUT canvas, whose width
+   changes with the ratio (1080 at 9:16 and 1:1, 1920 at 16:9). Dividing by a
+   fixed 1080 made every 16:9 preview draw text ~78% too large. The live width
+   comes from `outW` below. */
+
+/* Mirrors backend subtitles.TITLE_STYLE, so the card previews where and when it
+   actually burns in. */
+const TITLE_PX = 92;
+const TITLE_SECONDS = 4.5;
+const TITLE_TOP = 0.07;
 
 /* Mirrors backend subtitles.group_words. The renderer shows short cues, not
    whole sentences, so a preview built from utterance text was showing captions
@@ -48,6 +56,22 @@ function groupWords(words, maxWords, maxSeconds) {
 const FONT_FALLBACK = "'Archivo Black', sans-serif";
 
 const RATIOS = { "9:16": 9 / 16, "1:1": 1, "16:9": 16 / 9 };
+
+/* Mirrors render.MIN_CONTENT_FRACTION / MAX_ZOOM / content_height().
+   The renderer's default frame is `blur`: the source centred at a computed
+   height over a blurred copy of itself -- NOT edge-to-edge. Previewing it with
+   a plain object-fit: cover was showing a crop that never gets exported, which
+   is why the editor and the finished clip disagreed about what was on screen. */
+const MIN_CONTENT_FRACTION = 0.44;
+const MAX_ZOOM = 1.35;
+
+function contentHeightFrac(srcW, srcH, outW, outH) {
+  if (!srcW || !srcH) return 1;
+  const natural = (outW * srcH) / srcW;        // height at full output width
+  if (natural >= outH) return 1;
+  const zoom = Math.min(Math.max((outH * MIN_CONTENT_FRACTION) / natural, 1), MAX_ZOOM);
+  return Math.min((natural * zoom) / outH, 1);
+}
 
 /* Mirrors pipeline/overlays.SAFE_* -- the bands Reels/TikTok/Shorts cover with
    their own buttons. Drawn as guides so nothing important lands under them. */
@@ -94,6 +118,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     capAnim: initial.caption_anim || "none",
     translateTo: initial.translate_to ?? null,
     title: clip.title || "",
+    titleStyle: initial.title_style || "plate",
+    titleFont: initial.title_font ?? null,
     speed: initial.speed ?? 1,
     speedPitched: Boolean(initial.speed_pitched),
     background: initial.background || "black",
@@ -105,7 +131,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const doc = history.state;
   const {
     start, end, ratio, capStyle, capFont, capSize, capPos, capAnim,
-    translateTo, title, speed, speedPitched, background, overlayList, lineEdits,
+    translateTo, title, titleStyle, titleFont, speed, speedPitched, background,
+    overlayList, lineEdits,
   } = doc;
 
   // Setters keep the rest of this component unchanged. `discrete` marks
@@ -122,6 +149,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const setCapAnim = (v) => history.apply({ capAnim: v }, { discrete: true });
   const setTranslateTo = (v) => history.apply({ translateTo: v }, { discrete: true });
   const setTitle = (v) => history.apply({ title: v });
+  const setTitleStyle = (v) => history.apply({ titleStyle: v }, { discrete: true });
+  const setTitleFont = (v) => history.apply({ titleFont: v }, { discrete: true });
   const setSpeed = (v) => history.apply({ speed: v }, { discrete: true });
   const setSpeedPitched = (v) => history.apply({ speedPitched: v }, { discrete: true });
   const setBackground = (v) => history.apply({ background: v }, { discrete: true });
@@ -144,6 +173,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const fontCss = (id) =>
     fontList.find((f) => f.id === id)?.css || FONT_FALLBACK;
 
+  const titleLooks = useTitleStyles();
+  const titleLook = titleLooks.find((l) => l.id === titleStyle) || titleLooks[0];
+
   const [selected, setSelected] = useState(null);      // index into overlayList
   const [showSafe, setShowSafe] = useState(true);
   const [dragOverlay, setDragOverlay] = useState(null);
@@ -155,6 +187,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const frame = job.options?.frame
     || (job.options?.template === "gameplay" ? "gameplay" : null);
   const isSplit = frame === "gameplay" || job.options?.template === "gameplay";
+  /* render.render_clip defaults to "blur" when no frame is set, so the preview
+     has to default the same way or it previews a mode nobody exports. */
+  const frameMode = isSplit ? "gameplay" : (frame || "blur");
 
   const [now, setNow] = useState(initial.start ?? clip.start);
   const [playing, setPlaying] = useState(false);
@@ -166,8 +201,14 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
 
   const videoRef = useRef(null);
   const gameplayRef = useRef(null);
+  const blurRef = useRef(null);
   const trackRef = useRef(null);
   const saveTimer = useRef(null);
+
+  /* Real source dimensions, read off the proxy once it has metadata. The
+     renderer's zoom policy is a function of them, so the preview cannot mirror
+     the framing until they are known. */
+  const [srcDims, setSrcDims] = useState(null);
 
   useEffect(() => {
     getTranscript(job.id).then(setTranscript).catch((e) => setLoadError(e.message));
@@ -186,6 +227,29 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       el.webkitPreservesPitch = !speedPitched;
     }
   }, [speed, speedPitched, transcript]);
+
+  function onMeta(e) {
+    e.target.currentTime = start;
+    setSrcDims({ w: e.target.videoWidth, h: e.target.videoHeight });
+  }
+
+  /* Share of the frame height the sharp layer occupies, matching the
+     renderer's zoom policy exactly. */
+  const [outW, outH] = ratio === "1:1" ? [1080, 1080]
+    : ratio === "16:9" ? [1920, 1080] : [1080, 1920];
+  const fgHeight = frameMode === "blur"
+    ? contentHeightFrac(srcDims?.w, srcDims?.h, outW, outH) : 1;
+
+  /* The blurred backdrop is a second decode of the same file, so it has to be
+     told where the playhead is. Exact frame-lock is unnecessary -- it is
+     blurred at sigma 12 in the export and reads as wallpaper either way. */
+  useEffect(() => {
+    const bg = blurRef.current, v = videoRef.current;
+    if (!bg || !v) return;
+    if (Math.abs(bg.currentTime - v.currentTime) > 0.25) bg.currentTime = v.currentTime;
+    bg.playbackRate = speed || 1;
+    if (playing) bg.play().catch(() => {}); else bg.pause();
+  }, [now, playing, speed]);
 
   useEffect(() => {
     if (proxyReady) return;
@@ -235,6 +299,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         caption_pos: capPos,
         translate_to: translateTo,
         title: title.trim() || null,
+        title_style: titleStyle,
+        title_font: titleFont,
         caption_anim: capAnim,
         speed,
         speed_pitched: speedPitched,
@@ -336,8 +402,12 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         const v = Math.min(t, end - MIN_CLIP);
         setStart(v);
         if (videoRef.current) videoRef.current.currentTime = v;
-      } else {
+      } else if (dragging === "end") {
         setEnd(Math.max(t, start + MIN_CLIP));
+      } else {
+        // Scrubbing the playhead. Clamped to the trim window, because time
+        // outside it is not part of the clip and cannot be previewed.
+        seek(Math.min(Math.max(t, start), end));
       }
     }
     const stop = () => setDragging(null);
@@ -378,6 +448,17 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     if (activeIndex < 0) activeIndex = now > active[active.length - 1].e ? active.length - 1 : 0;
     return { words: active.map((w) => w.w), activeIndex };
   }, [transcript, now, lineEdits]);
+
+  /* One place that moves the playhead, so scrubbing from the trim bar, the
+     layer strip or the transcript all behave identically -- including keeping
+     the blurred backdrop in step. */
+  function seek(t) {
+    const v = videoRef.current;
+    if (!v) return;
+    v.currentTime = t;
+    setNow(t);
+    if (blurRef.current) blurRef.current.currentTime = t;
+  }
 
   function togglePlay() {
     const v = videoRef.current;
@@ -504,9 +585,18 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </header>
 
         <div className="live-body">
-          {/* Stage: the proxy, cropped to the chosen ratio, captions on top */}
+          {/* The clip and the two timelines that describe it are ONE column and
+              scroll as one. Previously they were three separate grid items, one
+              of which collided with the footer's row -- which is how the trim
+              bar and the layer strip ended up painted over the video. */}
+          <div className="live-left">
+          {/* Stage: the proxy, framed exactly as the renderer frames it */}
           <div className="live-stage">
-            <div className="stage-frame" style={{ aspectRatio: String(RATIOS[ratio] ?? 9 / 16) }}>
+            <div className={`stage-frame frame-${frameMode}`}
+                 style={{ aspectRatio: String(RATIOS[ratio] ?? 9 / 16),
+                          background: frameMode === "fit"
+                            ? (background === "black" ? "#000" : background)
+                            : "#000" }}>
               {isSplit ? (
                 /* Speaker on top, looping gameplay below -- the same vstack the
                    renderer builds, so what you trim is what you export. */
@@ -517,7 +607,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                     playsInline
                     preload="auto"
                     onClick={togglePlay}
-                    onLoadedMetadata={(e) => { e.target.currentTime = start; }}
+                    onLoadedMetadata={onMeta}
                   />
                   <video
                     ref={gameplayRef}
@@ -530,14 +620,31 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   />
                 </div>
               ) : (
-                <video
-                  ref={videoRef}
-                  src={previewUrl(job.id)}
-                  playsInline
-                  preload="auto"
-                  onClick={togglePlay}
-                  onLoadedMetadata={(e) => { e.target.currentTime = start; }}
-                />
+                <>
+                  {/* The default frame is a blurred copy of the source behind
+                      the source itself. Drawing only the sharp layer left the
+                      preview with black bars the export does not have. */}
+                  {frameMode === "blur" && (
+                    <video
+                      ref={blurRef}
+                      className="stage-blur"
+                      src={previewUrl(job.id)}
+                      playsInline muted preload="auto" aria-hidden="true"
+                    />
+                  )}
+                  <video
+                    ref={videoRef}
+                    className="stage-fg"
+                    src={previewUrl(job.id)}
+                    playsInline
+                    preload="auto"
+                    onClick={togglePlay}
+                    onLoadedMetadata={onMeta}
+                    style={frameMode === "blur"
+                      ? { height: `${fgHeight * 100}%`, top: `${(1 - fgHeight) * 50}%` }
+                      : undefined}
+                  />
+                </>
               )}
               {!proxyReady && (
                 <div className="stage-wait">
@@ -546,6 +653,22 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   <em>Your clips are already done — this is the scrubbing copy.</em>
                 </div>
               )}
+              {/* The title card, drawn on the same schedule the renderer uses
+                  (subtitles.TITLE_STYLE: top 7%, first 4.5s). Editing the title
+                  or its look now shows up here instead of only after an
+                  export. */}
+              {title.trim() && (now - start) < TITLE_SECONDS && (
+                <div className="stage-title" style={{ top: `${TITLE_TOP * 100}%` }}>
+                  <span style={{
+                    fontFamily: fontCss(titleFont),
+                    fontSize: `${(TITLE_PX / outW) * 100}cqw`,
+                    ...titleLookCss(titleLook),
+                  }}>
+                    {title}
+                  </span>
+                </div>
+              )}
+
               {cue && (
                 <div
                   className={`stage-caption draggable ${st.mid && capPos === null ? "mid" : ""}`}
@@ -559,7 +682,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                     className="cap-inner"
                     style={{
                       fontFamily: fontCss(capFont),
-                      fontSize: `${((capSize ?? st.px) / CANVAS_W) * 100}cqw`,
+                      fontSize: `${((capSize ?? st.px) / outW) * 100}cqw`,
                       fontWeight: st.weight,
                       color: st.color,
                       background: st.plate || "transparent",
@@ -665,17 +788,32 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
 
         {/* Timeline */}
         <div className="live-timeline">
-          <div className="tl-track" ref={trackRef}>
+          <div className="tl-track" ref={trackRef}
+               onMouseDown={(e) => {
+                 // Clicking the bar scrubs. Handles stop propagation, so
+                 // grabbing an in/out point still trims rather than seeks.
+                 const r = trackRef.current.getBoundingClientRect();
+                 const t = view.from
+                   + Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1) * span;
+                 seek(Math.min(Math.max(t, start), end));
+                 setDragging("scrub");
+               }}>
             {transcript?.utterances?.map((u, i) => (
               <span key={i} className="tl-tick"
                     style={{ left: `${pct(u.start)}%`, width: `${Math.max(pct(u.end) - pct(u.start), 0.3)}%` }} />
             ))}
             <span className="tl-selection" style={{ left: `${pct(start)}%`, width: `${pct(end) - pct(start)}%` }} />
-            <span className="tl-playhead" style={{ left: `${pct(now)}%` }} />
+            {/* Grabbable, so you can step back through a moment instead of
+                replaying the clip from the top to reach it. */}
+            <span className="tl-playhead" style={{ left: `${pct(now)}%` }}
+                  onMouseDown={(e) => { e.stopPropagation(); setDragging("scrub"); }}
+                  role="slider" aria-label="Playhead" />
             <span className="tl-handle" style={{ left: `${pct(start)}%` }}
-                  onMouseDown={() => setDragging("start")} role="slider" aria-label="Clip start" />
+                  onMouseDown={(e) => { e.stopPropagation(); setDragging("start"); }}
+                  role="slider" aria-label="Clip start" />
             <span className="tl-handle end" style={{ left: `${pct(end)}%` }}
-                  onMouseDown={() => setDragging("end")} role="slider" aria-label="Clip end" />
+                  onMouseDown={(e) => { e.stopPropagation(); setDragging("end"); }}
+                  role="slider" aria-label="Clip end" />
           </div>
           <div className="tl-scale"><span>{fmt(view.from)}</span><span>{fmt(view.to)}</span></div>
         </div>
@@ -689,6 +827,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
           onSeek={(t) => { if (videoRef.current) videoRef.current.currentTime = start + t; }}
           onChange={(i, patch) => patchOverlay(i, patch)}
         />
+          </div>
 
           {/* Transcript and every control share one scrolling inspector column,
              so the clip on the left is never pushed off screen by them. */}
@@ -736,6 +875,30 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
             {Object.keys(STYLES).map((k) => (
               <button key={k} className={`chip-btn ${capStyle === k ? "on" : ""}`} onClick={() => setCapStyle(k)}>{k}</button>
             ))}
+          </div>
+        </div>
+
+        {/* The title is its own design decision, not a second caption -- a
+            white plate is right for a talking-head clip and wrong for a gaming
+            one, so the look and the typeface are both choices here. */}
+        <div className="live-controls">
+          <div className="ctl">
+            <span className="ctl-label">Title look</span>
+            <div className="title-looks">
+              {titleLooks.map((l) => (
+                <button key={l.id}
+                        className={`title-look ${titleStyle === l.id ? "on" : ""}`}
+                        onClick={() => setTitleStyle(l.id)}
+                        title={l.id}>
+                  <span style={titleLookCss(l)}>Aa</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="ctl">
+            <span className="ctl-label">Title font</span>
+            <FontPicker value={titleFont} onChange={setTitleFont}
+                        needsDevanagari={/[ऀ-ॿ]/.test(title)} />
           </div>
         </div>
 

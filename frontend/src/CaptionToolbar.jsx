@@ -50,6 +50,50 @@ export function useFonts() {
   return fonts;
 }
 
+/* Fallback shapes only. The real list is served from subtitles.TITLE_LOOKS, so
+   adding a look on the backend makes it selectable without touching this file
+   -- the same reason the font list is no longer hardcoded. */
+const TITLE_STYLE_FALLBACK = [
+  { id: "plate", text: "#101010", edge: "#FFFFFF", boxed: true },
+];
+
+/** Title looks, served by the renderer so the swatches cannot drift. */
+export function useTitleStyles() {
+  const [looks, setLooks] = useState(TITLE_STYLE_FALLBACK);
+  useEffect(() => {
+    let alive = true;
+    getCaptionOptions()
+      .then((o) => { if (alive && o.title_styles?.length) setLooks(o.title_styles); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  return looks;
+}
+
+/** CSS that makes a preview of a title look -- box, stroke or shadow. */
+export function titleLookCss(look) {
+  if (!look) return {};
+  if (look.boxed) {
+    return { color: look.text, background: look.edge, textShadow: "none",
+             padding: "0.12em 0.4em" };
+  }
+  if (look.id === "shadow") {
+    return { color: look.text, background: "transparent",
+             textShadow: `0.03em 0.04em 0.05em ${look.edge}` };
+  }
+  if (look.id === "clean") {
+    return { color: look.text, background: "transparent", textShadow: "none" };
+  }
+  // Outline: four offsets approximate a stroke without -webkit-text-stroke,
+  // which thins glyphs rather than growing them the way libass does.
+  const e = look.edge;
+  return {
+    color: look.text,
+    background: "transparent",
+    textShadow: `0.04em 0 0 ${e}, -0.04em 0 0 ${e}, 0 0.04em 0 ${e}, 0 -0.04em 0 ${e}`,
+  };
+}
+
 /* Sizes in px on the 1080x1920 canvas -- the same number the renderer writes
    into the subtitle file, so the field is not a mystery multiplier. */
 export const SIZE_PRESETS = [40, 48, 56, 64, 72, 80, 90, 100, 120, 140];

@@ -18,7 +18,7 @@ import traceback
 
 from fastapi import (BackgroundTasks, Depends, FastAPI, File, HTTPException,
                      Request, UploadFile)
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
@@ -106,7 +106,29 @@ def caption_options():
         ],
         "animations": [{"id": k, **v} for k, v in subtitles.ANIMATIONS.items()],
         "speed": {"min": render.MIN_SPEED, "max": render.MAX_SPEED},
+        # Title looks are served rather than duplicated in the editor, for the
+        # same reason as fonts: a look added here must not need a matching edit
+        # on the frontend to become selectable.
+        "title_styles": [
+            {"id": k,
+             # Enough for the editor to draw a faithful swatch without knowing
+             # anything about ASS colour notation.
+             "text": _ass_colour_to_css(v["colour"]),
+             "edge": _ass_colour_to_css(v["edge"]),
+             "boxed": v["border_style"] == 3}
+            for k, v in subtitles.TITLE_LOOKS.items()
+        ],
+        "default_title_style": subtitles.DEFAULT_TITLE_LOOK,
     }
+
+
+def _ass_colour_to_css(value: str) -> str:
+    """&HAABBGGRR (ASS, alpha first and BGR order) -> #RRGGBB (CSS)."""
+    digits = value.lstrip("&H").lstrip("&h")
+    if len(digits) < 6:
+        return "#000000"
+    bb, gg, rr = digits[-6:-4], digits[-4:-2], digits[-2:]
+    return f"#{rr}{gg}{bb}"
 
 
 @app.get("/templates")
@@ -407,12 +429,17 @@ def job_gameplay(job_id: str):
     return FileResponse(loops[0], media_type="video/mp4")
 
 
-@app.get("/jobs/{job_id}/preview")
+@app.api_route("/jobs/{job_id}/preview", methods=["GET", "HEAD"])
 def job_preview(job_id: str, request: Request):
     """Streams the editor proxy with HTTP range support.
 
     Range support is not optional here -- without it a browser cannot seek, and
     the whole point of the proxy is scrubbing.
+
+    HEAD is declared explicitly. FastAPI, unlike bare Starlette, does NOT add it
+    alongside GET, so the editor's "is the proxy ready yet?" poll was getting 405
+    forever and the loading veil never lifted -- over a video that was in fact
+    playing underneath it.
     """
     path = os.path.join(STORAGE_DIR, job_id, "preview.mp4")
     if not os.path.exists(path):
@@ -423,6 +450,11 @@ def job_preview(job_id: str, request: Request):
         )
 
     size = os.path.getsize(path)
+
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="video/mp4",
+                        headers={"Accept-Ranges": "bytes",
+                                 "Content-Length": str(size)})
     range_header = request.headers.get("range")
     if not range_header:
         return FileResponse(path, media_type="video/mp4",
@@ -499,6 +531,11 @@ class ClipRecipe(BaseModel):
     speed: Optional[float] = None           # 0.5 - 3.0 playback speed
     speed_pitched: Optional[bool] = None    # True = pitch rides with speed (meme)
     background: Optional[str] = None        # bar colour for the fit/pad frame
+    # The title is its own design decision, not a second caption. Look and
+    # typeface move independently: the same white plate reads very differently
+    # in Anton than in Merriweather.
+    title_style: Optional[str] = None       # key into subtitles.TITLE_LOOKS
+    title_font: Optional[str] = None        # font id, independent of captions
 
 
 @app.put("/jobs/{job_id}/clips/{index}/edit")
@@ -615,6 +652,8 @@ def export_clip(job_id: str, index: int):
             speed=recipe.get("speed"),
             speed_pitched=bool(recipe.get("speed_pitched")),
             background=recipe.get("background"),
+            title_style=recipe.get("title_style"),
+            title_font=recipe.get("title_font"),
         )
         with SessionLocal() as session:
             clip = (session.query(Clip)

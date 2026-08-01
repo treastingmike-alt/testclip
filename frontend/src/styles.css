@@ -3255,27 +3255,99 @@ body::after {
 /* stage */
 .live-stage { display: flex; flex-direction: column; gap: 10px; }
 
+/* Sized by HEIGHT, not width.
+   With `width: 100%` plus `aspect-ratio: 9/16`, the computed height was ~1600px
+   and `max-height` then clamped it -- leaving a box that was still full column
+   width. A 9:16 clip was previewed in a wide rectangle, which is why the editor
+   never showed the shape being exported. Fixing the height and letting
+   aspect-ratio derive the width makes the frame genuinely portrait. */
 .stage-frame {
   position: relative;
-  width: 100%;
-  max-height: 62vh;
+  height: min(62vh, 720px);
+  width: auto;
+  max-width: 100%;
   margin: 0 auto;
   background: #000;
   border-radius: 14px;
   overflow: hidden;
   /* caption size is a share of the FRAME width, so the preview scales with the
      stage the way burned-in captions scale with the output canvas */
-  container-type: inline-size;
+  container-type: size;
 }
 
-/* object-fit: cover is what makes the ratio buttons feel instant -- the same
-   proxy is simply framed differently, no re-encode involved. */
 .stage-frame video {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
   cursor: pointer;
+}
+
+/* Frame modes, mirroring pipeline/render.py:
+     fill  -- edge to edge, sides cropped        (fill_filter)
+     fit   -- whole frame on flat bars           (fit_filter)
+     blur  -- centred over a blurred copy        (blur_filter, the default) */
+.stage-frame.frame-fit video { object-fit: contain; }
+
+.stage-frame.frame-blur .stage-blur {
+  position: absolute;
+  inset: 0;
+  object-fit: cover;
+  filter: blur(18px) saturate(1.1);
+  transform: scale(1.12);      /* hides the blur's soft edges, as gblur does */
+  pointer-events: none;
+  z-index: 0;
+}
+.stage-frame.frame-blur .stage-fg {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  object-fit: cover;
+  z-index: 1;
+}
+
+/* Title card, positioned like the renderer's \an8 top-centre event. */
+.stage-title {
+  position: absolute;
+  left: 5%;
+  right: 5%;
+  text-align: center;
+  pointer-events: none;
+  z-index: 3;
+  line-height: 1.2;
+}
+.stage-title span {
+  display: inline-block;
+  max-width: 100%;
+  font-weight: 900;
+  border-radius: 3px;
+  overflow-wrap: break-word;
+}
+
+/* Title look swatches: each renders in its own treatment, so the choice is
+   made by looking rather than by reading a label. */
+.title-looks { display: flex; flex-wrap: wrap; gap: 6px; }
+.title-look {
+  width: 46px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  border: 1.5px solid var(--line);
+  background: #2a2a30;      /* neutral dark, so light and dark looks both read */
+  cursor: pointer;
+  padding: 0;
+}
+.title-look span {
+  font-size: 13px;
+  font-weight: 900;
+  border-radius: 2px;
+  line-height: 1.1;
+}
+.title-look:hover { border-color: var(--ink-faint); }
+.title-look.on {
+  border-color: var(--violet);
+  box-shadow: 0 0 0 2px rgba(109, 40, 217, 0.22);
 }
 
 .stage-caption {
@@ -3338,13 +3410,32 @@ body::after {
 /* timeline */
 .live-timeline { padding: 0 28px; }
 .live-timeline .tl-track { height: 64px; }
+/* Grabbable: a hairline is impossible to hit, so the hit area is widened with
+   a transparent pseudo-element while the visible line stays 2px. */
 .tl-playhead {
   position: absolute;
   top: 0; bottom: 0;
   width: 2px;
   background: var(--danger);
-  pointer-events: none;
+  cursor: ew-resize;
+  z-index: 4;
 }
+.tl-playhead::after {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -7px; right: -7px;
+}
+.tl-playhead::before {
+  content: "";
+  position: absolute;
+  top: -4px; left: 50%;
+  width: 11px; height: 11px;
+  border-radius: 50%;
+  background: var(--danger);
+  transform: translateX(-50%);
+}
+.live-timeline .tl-track { cursor: pointer; }
 
 /* controls */
 .live-controls {
@@ -3387,7 +3478,7 @@ body::after {
 
 @media (max-width: 1000px) {
   .live-body { grid-template-columns: 1fr; padding: 18px; }
-  .stage-frame { max-height: 44vh; }
+  .stage-frame { height: min(46vh, 420px); }
   .live-transcript { max-height: 34vh; }
   .live-head-mid { display: none; }
 }
@@ -3886,9 +3977,11 @@ body::after {
   vertical-align: middle;
 }
 
-/* The stage stays put while the controls below it scroll -- changing a font or
-   an animation and then scrolling back up to see the result is not editing. */
-@media (min-height: 700px) {
+/* Narrow/short layouts only: the clip column is not yet beside the controls,
+   so the stage alone sticks. On the two-column layout .live-left takes this
+   over for the whole column (stage + both timelines) -- sticking only the
+   stage there is what let the timelines slide over the video. */
+@media (min-height: 700px) and (max-width: 1179px) {
   .live-stage {
     position: sticky;
     top: 62px;
@@ -3947,35 +4040,40 @@ body::after {
     align-items: start;
   }
 
-  /* Rows are explicit: the header owns row 1, the clip column owns rows 2-3,
-     and the inspector spans both so its own contents stack from the top
-     instead of being dragged down by the stage's height. */
+  /* Three rows only: header, the two columns, footer. The clip column is a
+     single grid item (.live-left) rather than three siblings competing for
+     rows -- the old row-4 placement collided with the footer, which is what
+     painted the trim bar and the layer strip on top of the video. */
   .live-head { grid-column: 1 / -1; grid-row: 1; }
-  .live-foot { grid-column: 1 / -1; grid-row: 4; }
+  .live-foot { grid-column: 1 / -1; grid-row: 3; }
 
   .live-body {
     display: contents;
   }
 
-  /* Left: the clip and its timeline, nothing else competing for the space. */
-  .live-stage {
+  /* Left: the clip and both timelines, moving together and staying put. */
+  .live-left {
     grid-column: 1;
     grid-row: 2;
     position: sticky;
     top: 74px;
-    padding: 0 0 4px 26px;
-  }
-  .live-timeline {
-    grid-column: 1;
-    grid-row: 3;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
     padding-left: 26px;
+    background: var(--bg);
   }
+  /* The pieces no longer position themselves -- the column does. */
+  .live-left .live-stage,
+  .live-left .live-timeline,
+  .live-left .tracks { position: static; padding-left: 0; margin-left: 0; }
 
   /* Right: one real column, so its contents stack tightly instead of being
      stretched to match the (much taller) stage row. */
   .live-inspector {
     grid-column: 2;
-    grid-row: 2 / span 2;
+    grid-row: 2;
     align-self: start;
     position: sticky;
     top: 74px;
@@ -4007,7 +4105,7 @@ body::after {
   }
 
   /* The stage can now take real height, since nothing sits under it. */
-  .stage-frame { max-height: 68vh; }
+  .stage-frame { height: min(64vh, 760px); }
 }
 
 /* Wide screens: give the inspector a little more room for the pickers. */
@@ -4142,14 +4240,30 @@ body::after {
   bottom: 0;
   width: 2px;
   background: #e2483d;
-  pointer-events: none;
-  z-index: 3;
+  cursor: ew-resize;
+  z-index: 5;
+}
+/* Widened hit area; the visible line stays a hairline. */
+.tracks-playhead::after {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -7px; right: -7px;
+}
+.tracks-playhead::before {
+  content: "";
+  position: absolute;
+  top: -3px; left: 50%;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #e2483d;
+  transform: translateX(-50%);
 }
 
-@media (min-width: 1180px) {
-  .tracks { grid-column: 1; grid-row: 4; margin: 0 0 14px 26px; }
-  .live-foot { grid-row: 5; }
-}
+/* No grid placement for .tracks any more: it is a child of .live-left, which
+   owns the whole clip column. The old rule put it on the same row as the
+   footer, so the two stacked on top of each other -- and because .live-stage
+   was independently sticky, the strip scrolled straight across the video. */
 
 /* An overlay outside its time window is not in the exported frame. Drawn faint
    and labelled, so a selected one can still be positioned without pretending it

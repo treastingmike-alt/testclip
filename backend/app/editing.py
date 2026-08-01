@@ -83,7 +83,8 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                   ratio: str = None, overlay_list: list = None,
                   caption_size: int = None, caption_pos: float = None,
                   caption_anim: str = None, speed: float = None,
-                  speed_pitched: bool = False, background: str = None):
+                  speed_pitched: bool = False, background: str = None,
+                  title_style: str = None, title_font: str = None):
     """Re-cuts clip `index` of `job_id` to [start, end]. Returns the updated clip.
 
     `caption_style` overrides the template's caption look for this clip only.
@@ -165,12 +166,14 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                 subtitles.build_ass_lines(translated, subtitle_path, margin_v,
                                           style=style, play_res=(out_w, out_h),
                                           title=clip.title or "", font=caption_font,
-                                          size_px=size_px, animation=caption_anim)
+                                          size_px=size_px, animation=caption_anim,
+                                          title_style=title_style, title_font=title_font)
             else:
                 subtitles.build_ass(caption_words, start, subtitle_path, margin_v,
                                     style=style, play_res=(out_w, out_h),
                                     title=clip.title or "", keywords=clip.keywords,
-                                    font=caption_font, size_px=size_px, animation=caption_anim)
+                                    font=caption_font, size_px=size_px, animation=caption_anim,
+                                    title_style=title_style, title_font=title_font)
 
         out_name = f"clip_{index + 1}.mp4"
         final_path = os.path.join(job_dir, out_name)

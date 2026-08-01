@@ -38,6 +38,10 @@ export default function TimelineTracks({
     if (!drag) return;
     function move(e) {
       const t = timeAt(e.clientX);
+      // Scrubbing carries no overlay index, so it is answered before the
+      // overlay lookup rather than after it.
+      if (drag.mode === "scrub") { onSeek?.(t); return; }
+
       const ov = overlays[drag.index];
       if (!ov) return;
       const s = ov.t_start ?? 0;
@@ -61,7 +65,7 @@ export default function TimelineTracks({
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
     };
-  }, [drag, overlays, clipDuration, onChange, timeAt]);
+  }, [drag, overlays, clipDuration, onChange, onSeek, timeAt]);
 
   const rows = [
     { key: "socials", label: "Socials" },
@@ -89,6 +93,7 @@ export default function TimelineTracks({
                // Clicking empty rail scrubs, which is what a timeline should do.
                if (e.target.closest(".ov-bar")) return;
                onSeek?.(timeAt(e.clientX));
+               setDrag({ mode: "scrub" });   // keep scrubbing while held
              }}>
           {rows.map((r) => (
             <div key={r.key} className={`track-row ${r.key}`}>
@@ -129,7 +134,9 @@ export default function TimelineTracks({
             </div>
           ))}
 
-          <span className="tracks-playhead" style={{ left: pct(now) }} />
+          <span className="tracks-playhead" style={{ left: pct(now) }}
+                onMouseDown={(e) => { e.stopPropagation(); setDrag({ mode: "scrub" }); }}
+                role="slider" aria-label="Playhead" />
         </div>
       </div>
     </div>

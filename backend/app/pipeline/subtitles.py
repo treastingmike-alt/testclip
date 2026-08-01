@@ -303,8 +303,10 @@ def group_words(words: list) -> list:
     return cues
 
 
-def _header(margin_v: int, st: dict, play_res: tuple) -> str:
+def _header(margin_v: int, st: dict, play_res: tuple,
+            title_style: str = None, title_font: str = None) -> str:
     res_x, res_y = play_res
+    ts = title_look(title_style, title_font)
     pos = POSITIONS.get(st.get("position", "bottom"), POSITIONS["bottom"])
     alignment = pos["alignment"]
     if "margin_frac" in pos:
@@ -330,7 +332,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Caption,{st["font"]},{st["size"]},{st["base"]},{st["base"]},{outline_colour},&H00000000,-1,0,0,0,100,100,0,0,{border_style},{st["outline"]},0,{alignment},60,60,{margin_v},1
-Style: Title,{TITLE_STYLE["font"]},{TITLE_STYLE["size"]},{TITLE_STYLE["colour"]},{TITLE_STYLE["colour"]},{TITLE_STYLE["plate"]},&H00000000,-1,0,0,0,100,100,0,0,3,{TITLE_STYLE["outline"]},0,8,90,90,60,1
+Style: Title,{ts["font"]},{ts["size"]},{ts["colour"]},{ts["colour"]},{ts["edge"]},&H00000000,-1,0,0,0,100,100,0,0,{ts["border_style"]},{ts["outline"]},{ts["shadow"]},8,90,90,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -349,6 +351,57 @@ TITLE_STYLE = {
     "seconds": 4.5,                 # long enough to actually be read
     "top_frac": 0.07,               # distance from the top of the frame
 }
+
+
+# A title is a design decision, not a fixed asset. The white plate reads as
+# "documentary caption" and is wrong for a gaming or meme clip, so the plate is
+# now one option among several rather than the only thing on offer.
+#
+# BorderStyle 3 fills OutlineColour as a box behind the glyphs (the plate looks);
+# BorderStyle 1 strokes it as an edge (the outline looks). `shadow` is the ASS
+# drop-shadow distance in px.
+TITLE_LOOKS = {
+    "plate": {                       # white block, near-black text -- the default
+        "colour": "&H00101010", "edge": "&H00FFFFFF",
+        "border_style": 3, "outline": 24, "shadow": 0,
+    },
+    "ink": {                         # inverted plate: dark block, white text
+        "colour": "&H00FFFFFF", "edge": "&H00161212",
+        "border_style": 3, "outline": 24, "shadow": 0,
+    },
+    "outline": {                     # white text with a hard black stroke, no box
+        "colour": "&H00FFFFFF", "edge": "&H00000000",
+        "border_style": 1, "outline": 7, "shadow": 0,
+    },
+    "shadow": {                      # white text on a soft drop shadow
+        "colour": "&H00FFFFFF", "edge": "&H00000000",
+        "border_style": 1, "outline": 2, "shadow": 5,
+    },
+    "lime": {                        # highlighter block, the meme/gaming look
+        "colour": "&H00101010", "edge": "&H004EF2D8",
+        "border_style": 3, "outline": 24, "shadow": 0,
+    },
+    "clean": {                       # bare white text, nothing behind it
+        "colour": "&H00FFFFFF", "edge": "&H00000000",
+        "border_style": 1, "outline": 0, "shadow": 0,
+    },
+}
+DEFAULT_TITLE_LOOK = "plate"
+
+
+def title_look(name: str = None, font: str = None) -> dict:
+    """Resolve a title look, with the font overridable independently.
+
+    Look and typeface are separate choices: the same white plate reads very
+    differently in Anton than in Merriweather, and forcing them to move together
+    would collapse the useful combinations.
+    """
+    look = TITLE_LOOKS.get(name or DEFAULT_TITLE_LOOK, TITLE_LOOKS[DEFAULT_TITLE_LOOK])
+    return {
+        **look,
+        "font": resolve_font(font) or TITLE_STYLE["font"],
+        "size": TITLE_STYLE["size"],
+    }
 
 
 def _title_events(title: str, play_res: tuple) -> str:
@@ -374,7 +427,8 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
               play_res: tuple = (PLAY_RES_X, PLAY_RES_Y),
               title: str = "", keywords: list = None,
               font: str = None, size_px: int = None,
-              animation: str = None) -> str:
+              animation: str = None,
+              title_style: str = None, title_font: str = None) -> str:
     """Writes an ASS file whose timings are relative to the clip's own start.
 
     words:           Deepgram word objects with absolute 'start'/'end' seconds
@@ -391,7 +445,7 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
     # this caption style was designed at", which is what most people want.
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
-    lines = [_header(margin_v, st, play_res)]
+    lines = [_header(margin_v, st, play_res, title_style, title_font)]
     lines.append(_title_events(title, play_res))
 
     # Keywords stay coloured for the whole cue, independent of the karaoke
@@ -468,7 +522,9 @@ def first_meaningful_word_time(words: list, limit: int = 4) -> float:
 def build_ass_lines(caption_lines: list, out_path: str,
                     margin_v: int = 150, style: str = "classic",
                     play_res: tuple = (PLAY_RES_X, PLAY_RES_Y),
-                    title: str = "", font: str = None) -> str:
+                    title: str = "", font: str = None, size_px: int = None,
+                    animation: str = None,
+                    title_style: str = None, title_font: str = None) -> str:
     """Whole-line captions with no karaoke, for translated subtitles.
 
     A translation has different words with different lengths from the speech,
@@ -483,7 +539,8 @@ def build_ass_lines(caption_lines: list, out_path: str,
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
 
-    out = [_header(margin_v, st, play_res), _title_events(title, play_res)]
+    out = [_header(margin_v, st, play_res, title_style, title_font),
+           _title_events(title, play_res)]
     for line in caption_lines:
         text = _escape((line.get("text") or "").strip())
         if not text:
@@ -493,9 +550,19 @@ def build_ass_lines(caption_lines: list, out_path: str,
         start, end = float(line["start"]), float(line["end"])
         if end <= start:
             continue
-        colour = f"{{\\c{st['active']}}}" if st.get("box") == "none" else ""
+        colour = f"\\c{st['active']}" if st.get("box") == "none" else ""
+        # One cue per line here (no karaoke), so the entrance animation plays
+        # once per sentence rather than once per word -- the same tags, applied
+        # at the only granularity a translated line has.
+        anim = ""
+        if animation and animation != "none":
+            anim = animation_tags(animation, int((end - start) * 1000),
+                                  play_res, margin_v)
+        # animation_tags returns BARE tags; unbraced they render as literal
+        # text, so colour and animation share one override block.
+        override = f"{{{anim}{colour}}}" if (anim or colour) else ""
         out.append(
-            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{colour}{text}"
+            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{override}{text}"
         )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
