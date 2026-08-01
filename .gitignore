@@ -1,0 +1,38 @@
+# databases
+clipper.db
+*.db
+
+# live YouTube session -- never commit
+cookies.txt
+backend/cookies.txt
+
+# secrets
+.env
+backend/.env
+
+# backend runtime data / assets
+backend/storage
+backend/assets
+
+# python
+venv/
+backend/venv/
+__pycache__/
+*.pyc
+
+# node
+node_modules/
+
+# build output
+frontend/dist/
+
+# large / partial media downloads
+*.part
+*.mp4
+*.mkv
+*.webm
+
+# editor / OS junk
+.DS_Store
+.claude/
+CHANGES_THIS_SESSION.md

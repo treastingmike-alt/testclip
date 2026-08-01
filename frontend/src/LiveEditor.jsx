@@ -1,0 +1,911 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { getTranscript, saveClipEdit, exportClip, previewUrl,
+         uploadOverlayImage, overlayImageUrl, gameplayUrl } from "./api";
+import { FontPicker, SizePicker, LanguagePicker, useFonts } from "./CaptionToolbar";
+import { useEditHistory } from "./useEditHistory";
+import { PLATFORMS, platformOverlay, BACKGROUNDS, logoSrc } from "./EditorPresets";
+import TimelineTracks from "./TimelineTracks";
+
+/* Caption looks, mirrored from backend subtitles.STYLES so the preview matches
+   the export. The renderer remains the source of truth -- this is a visual
+   approximation whose job is to make choices obvious, not pixel-exact. */
+/* `px` mirrors backend subtitles.STYLES sizes, so the number in the editor is
+   the number written into the subtitle file. */
+const STYLES = {
+  classic:  { color: "#fff", active: "#d8f24e", weight: 900, shadow: true, px: 76 },
+  fitbox:   { color: "#fff", active: "#fff", chip: "#2b6cf6", weight: 800, px: 66 },
+  tech:     { color: "#fff", active: "#7fd4f0", weight: 900, shadow: true, mid: true, px: 80 },
+  business: { color: "#1e1a1a", active: "#1e1a1a", plate: "#efeae2", weight: 700, px: 58 },
+  gameplay: { color: "#fff", active: "#3ad43a", weight: 900, shadow: true, caps: true, px: 84 },
+};
+
+/* The renderer lays captions out on a 1080-wide canvas. Converting px to
+   container-query width keeps the preview proportional at any stage size. */
+const CANVAS_W = 1080;
+
+/* Mirrors backend subtitles.group_words. The renderer shows short cues, not
+   whole sentences, so a preview built from utterance text was showing captions
+   that would never appear in the export. Same rules, same breaks. */
+function groupWords(words, maxWords, maxSeconds) {
+  const cues = [];
+  let cur = [];
+  for (const w of words) {
+    cur.push(w);
+    const span = cur[cur.length - 1].e - cur[0].t;
+    const endsSentence = /[.!?]$/.test(w.w || "");
+    if (cur.length >= maxWords || span >= maxSeconds || endsSentence) {
+      cues.push(cur);
+      cur = [];
+    }
+  }
+  if (cur.length) cues.push(cur);
+  return cues;
+}
+
+/* Fallback only. The real face list comes from the server via useFonts(), so a
+   newly installed font previews in ITSELF rather than silently falling back. */
+const FONT_FALLBACK = "'Archivo Black', sans-serif";
+
+const RATIOS = { "9:16": 9 / 16, "1:1": 1, "16:9": 16 / 9 };
+
+/* Mirrors pipeline/overlays.SAFE_* -- the bands Reels/TikTok/Shorts cover with
+   their own buttons. Drawn as guides so nothing important lands under them. */
+const SAFE = { top: 0.06, bottom: 0.12, right: 0.10 };
+const MIN_CLIP = 3;
+const CONTEXT = 30;
+
+function fmt(t) {
+  const s = Math.max(0, t);
+  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}.${String(Math.floor((s % 1) * 10))}`;
+}
+
+/**
+ * Non-destructive clip editor.
+ *
+ * Plays the job's PROXY (one small copy of the whole source) and draws captions
+ * as DOM on top. Trimming, restyling, changing ratio or font are pure state
+ * changes -- instant, free, and reversible. An MP4 is only rendered when the
+ * user exports, which is the one operation that costs real time.
+ */
+export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
+  const [transcript, setTranscript] = useState(null);
+  const [loadError, setLoadError] = useState("");
+  /* The proxy is built after the clips, so the editor can open before it
+     exists. Showing a black video in that window looked broken -- especially in
+     split-screen, where only the top half went black. */
+  const [proxyReady, setProxyReady] = useState(job.proxy_ready !== false);
+
+  const initial = clip.edit || {};
+
+  /* Everything that describes the exported clip lives in ONE object behind an
+     undo/redo stack. Keeping it together is what makes undo total: a control
+     added later is covered without touching history logic. Transient UI state
+     (what is playing, what is selected) deliberately stays out -- undoing a
+     selection would be baffling. */
+  const initialDoc = useMemo(() => ({
+    start: initial.start ?? clip.start,
+    end: initial.end ?? clip.end,
+    ratio: initial.ratio || job.options?.ratio || "9:16",
+    capStyle: initial.caption_style || "classic",
+    capFont: initial.caption_font ?? null,
+    capSize: initial.caption_size ?? null,       // null = the style's own size
+    capPos: initial.caption_pos ?? null,         // null = automatic placement
+    capAnim: initial.caption_anim || "none",
+    translateTo: initial.translate_to ?? null,
+    title: clip.title || "",
+    speed: initial.speed ?? 1,
+    speedPitched: Boolean(initial.speed_pitched),
+    background: initial.background || "black",
+    overlayList: initial.overlays || [],
+    lineEdits: {},
+  }), []);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const history = useEditHistory(initialDoc);
+  const doc = history.state;
+  const {
+    start, end, ratio, capStyle, capFont, capSize, capPos, capAnim,
+    translateTo, title, speed, speedPitched, background, overlayList, lineEdits,
+  } = doc;
+
+  // Setters keep the rest of this component unchanged. `discrete` marks
+  // click-like actions so undo steps over them one at a time, while drags
+  // coalesce into a single step.
+  const set = (key) => (v, opts) => history.apply({ [key]: v }, opts);
+  const setStart = set("start");
+  const setEnd = set("end");
+  const setRatio = (v) => history.apply({ ratio: v }, { discrete: true });
+  const setCapStyle = (v) => history.apply({ capStyle: v }, { discrete: true });
+  const setCapFont = (v) => history.apply({ capFont: v }, { discrete: true });
+  const setCapSize = (v) => history.apply({ capSize: v });
+  const setCapPos = set("capPos");
+  const setCapAnim = (v) => history.apply({ capAnim: v }, { discrete: true });
+  const setTranslateTo = (v) => history.apply({ translateTo: v }, { discrete: true });
+  const setTitle = (v) => history.apply({ title: v });
+  const setSpeed = (v) => history.apply({ speed: v }, { discrete: true });
+  const setSpeedPitched = (v) => history.apply({ speedPitched: v }, { discrete: true });
+  const setBackground = (v) => history.apply({ background: v }, { discrete: true });
+  const setLineEdits = (v) =>
+    history.apply((p) => ({ ...p, lineEdits: typeof v === "function" ? v(p.lineEdits) : v }),
+                  { discrete: true });
+  const setOverlayList = (v, opts) =>
+    history.apply((p) => ({ ...p, overlayList: typeof v === "function" ? v(p.overlayList) : v }),
+                  opts);
+
+  /* Whether this clip's captions contain Devanagari. Drives the font picker's
+     warning, because a face with no Hindi glyphs renders empty boxes. */
+  const hasDevanagari = useMemo(
+    () => /[\u0900-\u097F]/.test(
+      (transcript?.utterances || []).map((u) => u.text || "").join(" ")),
+    [transcript]);
+
+  /* Server fonts, so the preview can render in any installed face. */
+  const fontList = useFonts();
+  const fontCss = (id) =>
+    fontList.find((f) => f.id === id)?.css || FONT_FALLBACK;
+
+  const [selected, setSelected] = useState(null);      // index into overlayList
+  const [showSafe, setShowSafe] = useState(true);
+  const [dragOverlay, setDragOverlay] = useState(null);
+  const [dragCaption, setDragCaption] = useState(false);
+
+  /* Templates that composite something on top of the source have to be shown
+     composited, or the editor is previewing a different video than it exports.
+     Split-screen is the loud case: half the frame is gameplay. */
+  const frame = job.options?.frame
+    || (job.options?.template === "gameplay" ? "gameplay" : null);
+  const isSplit = frame === "gameplay" || job.options?.template === "gameplay";
+
+  const [now, setNow] = useState(initial.start ?? clip.start);
+  const [playing, setPlaying] = useState(false);
+  const [dragging, setDragging] = useState(null);
+  const [exporting, setExporting] = useState(false);
+  const [exported, setExported] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [status, setStatus] = useState("");
+
+  const videoRef = useRef(null);
+  const gameplayRef = useRef(null);
+  const trackRef = useRef(null);
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    getTranscript(job.id).then(setTranscript).catch((e) => setLoadError(e.message));
+  }, [job.id]);
+
+  /* Speed is applied to the PREVIEW, not just the export. Hearing 1.5x before
+     paying for a render is the entire point of an editor -- and preservesPitch
+     mirrors the renderer: off means pitch rides with speed (the meme effect),
+     on means atempo-style natural pitch. */
+  useEffect(() => {
+    for (const el of [videoRef.current, gameplayRef.current]) {
+      if (!el) continue;
+      el.playbackRate = speed || 1;
+      el.preservesPitch = !speedPitched;
+      el.mozPreservesPitch = !speedPitched;
+      el.webkitPreservesPitch = !speedPitched;
+    }
+  }, [speed, speedPitched, transcript]);
+
+  useEffect(() => {
+    if (proxyReady) return;
+    const t = setInterval(async () => {
+      try {
+        const r = await fetch(previewUrl(job.id), { method: "HEAD" });
+        if (r.ok) { setProxyReady(true); clearInterval(t); }
+      } catch { /* keep waiting */ }
+    }, 1500);
+    return () => clearInterval(t);
+  }, [proxyReady, job.id]);
+
+  /* Playback is confined to [start, end] without touching the file: seek in,
+     and loop back when the playhead runs past the out-point. */
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    function onTime() {
+      setNow(v.currentTime);
+      if (v.currentTime >= end) {
+        v.currentTime = start;
+        if (!playing) v.pause();
+      }
+    }
+    v.addEventListener("timeupdate", onTime);
+    return () => v.removeEventListener("timeupdate", onTime);
+  }, [start, end, playing]);
+
+  // Persist the recipe, debounced. Cheap (no render), so it can be automatic.
+  useEffect(() => {
+    if (!transcript) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      const lines = (transcript.utterances || [])
+        .map((u, i) => ({ ...u, i }))
+        .filter((u) => u.end > start && u.start < end)
+        .map((u) => ({
+          start: Math.max(u.start, start),
+          end: Math.min(u.end, end),
+          text: lineEdits[u.i] ?? u.text,
+        }));
+      saveClipEdit(job.id, index, {
+        start, end, ratio,
+        caption_style: capStyle,
+        caption_font: capFont,
+        caption_size: capSize,
+        caption_pos: capPos,
+        translate_to: translateTo,
+        title: title.trim() || null,
+        caption_anim: capAnim,
+        speed,
+        speed_pitched: speedPitched,
+        background,
+        lines: Object.keys(lineEdits).length ? lines : null,
+        overlays: overlayList.length ? overlayList : null,
+      })
+        .then(() => setStatus("Saved"))
+        .catch((e) => setStatus(e.message));
+    }, 400);
+    return () => clearTimeout(saveTimer.current);
+  }, [doc, transcript, job.id, index]);
+
+  // Captions drag vertically only -- they are a full-width block, so horizontal
+  // freedom would just let people misalign them.
+  useEffect(() => {
+    if (!dragCaption) return;
+    function onMove(e) {
+      const stage = document.querySelector(".stage-frame");
+      if (!stage) return;
+      const r = stage.getBoundingClientRect();
+      setCapPos(Math.min(Math.max(((e.clientY ?? 0) - r.top) / r.height, 0.05), 0.95));
+    }
+    const stop = () => setDragCaption(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", stop);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", stop);
+    };
+  }, [dragCaption]);
+
+  /* Dragging an overlay writes back FRACTIONS of the stage, which is what the
+     renderer consumes -- so what you drag is literally what gets burned in,
+     at any output ratio. */
+  useEffect(() => {
+    if (dragOverlay === null) return;
+    function onMove(e) {
+      const stage = document.querySelector(".stage-frame");
+      if (!stage) return;
+      const r = stage.getBoundingClientRect();
+      const x = Math.min(Math.max(((e.clientX ?? 0) - r.left) / r.width, 0), 1);
+      const y = Math.min(Math.max(((e.clientY ?? 0) - r.top) / r.height, 0), 1);
+      setOverlayList((list) =>
+        list.map((o, i) => (i === dragOverlay ? { ...o, x, y } : o)));
+    }
+    const stop = () => setDragOverlay(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", stop);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", stop);
+    };
+  }, [dragOverlay]);
+
+  function addText() {
+    setOverlayList((l) => [...l, {
+      type: "text", text: "@yourhandle",
+      x: 0.5, y: 0.9, size: 0.045, color: "#ffffff", font: "anton", opacity: 1,
+    }]);
+    setSelected(overlayList.length);
+  }
+
+  async function addLogo(file) {
+    if (!file) return;
+    setStatus("Uploading logo…");
+    try {
+      const { file: name } = await uploadOverlayImage(job.id, file);
+      setOverlayList((l) => [...l, {
+        type: "image", file: name, x: 0.86, y: 0.09, size: 0.12, opacity: 1,
+      }]);
+      setSelected(overlayList.length);
+      setStatus("Logo added");
+    } catch (e) { setStatus(e.message); }
+  }
+
+  const patchOverlay = (i, patch) =>
+    setOverlayList((l) => l.map((o, k) => (k === i ? { ...o, ...patch } : o)));
+  const removeOverlay = (i) => {
+    setOverlayList((l) => l.filter((_, k) => k !== i));
+    setSelected(null);
+  };
+
+  const view = useMemo(() => {
+    const total = transcript?.duration ?? clip.end + CONTEXT;
+    return { from: Math.max(0, clip.start - CONTEXT), to: Math.min(total, clip.end + CONTEXT) };
+  }, [transcript, clip.start, clip.end]);
+
+  const span = Math.max(view.to - view.from, 0.001);
+  const pct = (t) => ((t - view.from) / span) * 100;
+
+  useEffect(() => {
+    if (!dragging) return;
+    function onMove(e) {
+      const rect = trackRef.current.getBoundingClientRect();
+      const x = e.clientX ?? e.touches?.[0]?.clientX;
+      const t = view.from + Math.min(Math.max((x - rect.left) / rect.width, 0), 1) * span;
+      if (dragging === "start") {
+        const v = Math.min(t, end - MIN_CLIP);
+        setStart(v);
+        if (videoRef.current) videoRef.current.currentTime = v;
+      } else {
+        setEnd(Math.max(t, start + MIN_CLIP));
+      }
+    }
+    const stop = () => setDragging(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", stop);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", stop);
+    };
+  }, [dragging, start, end, view.from, span]);
+
+  /* The cue under the playhead, chunked exactly as the renderer will chunk it. */
+  const cue = useMemo(() => {
+    if (!transcript?.utterances) return null;
+    const rules = transcript.cue_rules || { max_words: 4, max_seconds: 1.8 };
+
+    const u = transcript.utterances.find((x) => now >= x.start && now <= x.end);
+    if (!u) return null;
+    const i = transcript.utterances.indexOf(u);
+
+    // A rewritten line has no per-word timings any more, so spread its tokens
+    // evenly -- the same compromise the backend makes for edited lines.
+    let words = u.words;
+    if (lineEdits[i] !== undefined || !words?.length) {
+      const text = lineEdits[i] ?? u.text;
+      const toks = text.split(/\s+/).filter(Boolean);
+      const dt = (u.end - u.start) / Math.max(toks.length, 1);
+      words = toks.map((w, k) => ({ t: u.start + k * dt, e: u.start + (k + 1) * dt, w }));
+    }
+
+    const cues = groupWords(words, rules.max_words, rules.max_seconds);
+    const active = cues.find((c) => now >= c[0].t && now <= c[c.length - 1].e)
+      || cues.find((c) => now < c[0].t)
+      || cues[cues.length - 1];
+    if (!active) return null;
+
+    let activeIndex = active.findIndex((w) => now >= w.t && now <= w.e);
+    if (activeIndex < 0) activeIndex = now > active[active.length - 1].e ? active.length - 1 : 0;
+    return { words: active.map((w) => w.w), activeIndex };
+  }, [transcript, now, lineEdits]);
+
+  function togglePlay() {
+    const v = videoRef.current;
+    if (!v) return;
+    const g = gameplayRef.current;
+    if (v.paused) {
+      if (v.currentTime < start || v.currentTime >= end) v.currentTime = start;
+      v.play(); g?.play().catch(() => {});
+      setPlaying(true);
+    } else {
+      v.pause(); g?.pause();
+      setPlaying(false);
+    }
+  }
+
+  async function doExport() {
+    setExporting(true);
+    setStatus("");
+    setExportError("");
+    try {
+      const updated = await exportClip(job.id, index);
+      onSaved(index, updated);
+      // Rendering is the slow, expensive step -- finishing it deserves more
+      // than a word of grey text. Confirm it, then return to the clips, which
+      // is where someone goes next anyway (to watch or download it).
+      setExported(true);
+    } catch (e) {
+      setExportError(e.message);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const st = STYLES[capStyle] || STYLES.classic;
+  const duration = end - start;
+
+  return createPortal(
+    <div className="live-page">
+      <div className="live">
+        {exporting && (
+          <div className="export-veil">
+            <div className="export-card">
+              <span className="export-spinner" aria-hidden="true" />
+              <strong>Rendering your clip</strong>
+              <p>Burning in captions and overlays at full quality. This is the
+                 only step that takes real time.</p>
+            </div>
+          </div>
+        )}
+
+        {exported && (
+          <div className="export-veil" onClick={onClose}>
+            <div className="export-card done" onClick={(e) => e.stopPropagation()}>
+              <span className="export-tick" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="26" height="26" fill="none">
+                  <path d="m5 13 4 4L19 7" stroke="currentColor" strokeWidth="2.6"
+                        strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+              <strong>Clip exported</strong>
+              <p>Your changes are baked into the file and ready to download.</p>
+              <div className="export-actions">
+                <button className="btn btn-ghost btn-sm"
+                        onClick={() => setExported(false)}>
+                  Keep editing
+                </button>
+                <button className="btn btn-primary btn-sm" onClick={onClose}>
+                  Back to clips
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <header className="live-head">
+          <button className="live-back" onClick={onClose}>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" stroke="currentColor" strokeWidth="2.2"
+                    strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Back to clips
+          </button>
+          <div className="live-head-mid">
+            <input
+              className="title-input"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Untitled clip"
+              maxLength={120}
+              aria-label="Clip title"
+            />
+            <p className="editor-sub">
+              Burned into the video · also the download filename
+            </p>
+          </div>
+          <div className="live-head-tools">
+            <button className="tool-btn" onClick={history.undo} disabled={!history.canUndo}
+                    title="Undo (⌘Z)" aria-label="Undo">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+                <path d="M9 14 4 9l5-5M4 9h9a7 7 0 0 1 0 14h-3" stroke="currentColor"
+                      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <button className="tool-btn" onClick={history.redo} disabled={!history.canRedo}
+                    title="Redo (⇧⌘Z)" aria-label="Redo">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+                <path d="m15 14 5-5-5-5m5 5h-9a7 7 0 0 0 0 14h3" stroke="currentColor"
+                      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <button className="tool-btn wide" onClick={history.reset} disabled={!history.isDirty}
+                    title="Discard all edits and return to the original clip">
+              Reset
+            </button>
+          </div>
+
+          <div className="live-head-right">
+            {exportError && <span className="live-status err">{exportError}</span>}
+            {!exportError && status && <span className="live-status">{status}</span>}
+            <button className="btn btn-primary btn-sm" onClick={doExport} disabled={exporting}>
+              {exporting ? "Rendering…" : "Export clip"}
+            </button>
+          </div>
+        </header>
+
+        <div className="live-body">
+          {/* Stage: the proxy, cropped to the chosen ratio, captions on top */}
+          <div className="live-stage">
+            <div className="stage-frame" style={{ aspectRatio: String(RATIOS[ratio] ?? 9 / 16) }}>
+              {isSplit ? (
+                /* Speaker on top, looping gameplay below -- the same vstack the
+                   renderer builds, so what you trim is what you export. */
+                <div className="split-stage">
+                  <video
+                    ref={videoRef}
+                    src={previewUrl(job.id)}
+                    playsInline
+                    preload="auto"
+                    onClick={togglePlay}
+                    onLoadedMetadata={(e) => { e.target.currentTime = start; }}
+                  />
+                  <video
+                    ref={gameplayRef}
+                    src={gameplayUrl(job.id)}
+                    playsInline
+                    muted
+                    loop
+                    preload="auto"
+                    aria-hidden="true"
+                  />
+                </div>
+              ) : (
+                <video
+                  ref={videoRef}
+                  src={previewUrl(job.id)}
+                  playsInline
+                  preload="auto"
+                  onClick={togglePlay}
+                  onLoadedMetadata={(e) => { e.target.currentTime = start; }}
+                />
+              )}
+              {!proxyReady && (
+                <div className="stage-wait">
+                  <span className="stage-spinner" />
+                  <strong>Preparing the editor preview</strong>
+                  <em>Your clips are already done — this is the scrubbing copy.</em>
+                </div>
+              )}
+              {cue && (
+                <div
+                  className={`stage-caption draggable ${st.mid && capPos === null ? "mid" : ""}`}
+                  style={capPos !== null
+                    ? { top: `${capPos * 100}%`, bottom: "auto", transform: "translateY(-50%)" }
+                    : undefined}
+                  onMouseDown={(e) => { e.stopPropagation(); setDragCaption(true); }}
+                  title="Drag to move captions"
+                >
+                  <span
+                    className="cap-inner"
+                    style={{
+                      fontFamily: fontCss(capFont),
+                      fontSize: `${((capSize ?? st.px) / CANVAS_W) * 100}cqw`,
+                      fontWeight: st.weight,
+                      color: st.color,
+                      background: st.plate || "transparent",
+                      textShadow: st.shadow ? "0 2px 0 #000, 0 0 12px rgba(0,0,0,.7)" : "none",
+                      textTransform: st.caps ? "uppercase" : "none",
+                    }}
+                  >
+                    {cue.words.map((w, i) => (
+                      <span
+                        key={i}
+                        style={
+                          i === cue.activeIndex
+                            ? st.chip
+                              ? { background: st.chip, color: "#fff", padding: "0 .18em", borderRadius: 4 }
+                              : { color: st.active }
+                            : undefined
+                        }
+                      >
+                        {w}{" "}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              )}
+
+              {/* Safe areas: where the platform puts its own buttons */}
+              {showSafe && (
+                <div className="safe-guides" aria-hidden="true">
+                  <span className="safe-band" style={{ top: 0, height: `${SAFE.top * 100}%` }} />
+                  <span className="safe-band" style={{ bottom: 0, height: `${SAFE.bottom * 100}%` }} />
+                  <span className="safe-band right" style={{ right: 0, width: `${SAFE.right * 100}%` }} />
+                </div>
+              )}
+
+              {overlayList.map((o, i) => {
+                /* `now` is source time; overlay windows are clip-relative, which
+                   is the same basis the renderer uses after trimming. */
+                const rel = now - start;
+                const on = rel >= (o.t_start ?? 0) && rel <= (o.t_end ?? (end - start));
+                // Outside its window an overlay is GONE from the export. A
+                // selected one is still drawn, faint, so it can be positioned --
+                // but never at full strength, which would claim it is on screen.
+                if (!on && selected !== i) return null;
+                return (
+                <div
+                  key={i}
+                  className={`ov ${selected === i ? "sel" : ""} ${on ? "" : "ghost"}`}
+                  style={{ left: `${o.x * 100}%`, top: `${o.y * 100}%`,
+                           opacity: on ? (o.opacity ?? 1) : 0.28 }}
+                  onMouseDown={(e) => { e.stopPropagation(); setSelected(i); setDragOverlay(i); }}
+                >
+                  {o.type === "image" ? (
+                    <img src={overlayImageUrl(job.id, o.file)} alt=""
+                         style={{ height: `${(o.size ?? 0.12) * 100}cqh` }} draggable={false} />
+                  ) : (
+                    <span className={o.platform ? "ov-handle" : undefined} style={{
+                      fontFamily: fontCss(o.font),
+                      fontSize: `${(o.size ?? 0.045) * 100}cqh`,
+                      color: o.color || "#fff",
+                      /* Mirrors platform_logos.compose_handle: dark glass pill
+                         with the platform accent as its edge. */
+                      ...(o.platform ? {
+                        background: "rgba(18,18,22,0.84)",
+                        border: `0.055em solid ${PLATFORMS.find((p) => p.id === o.platform)?.accent || "#fff"}`,
+                        padding: "0.30em 0.40em",
+                        borderRadius: "999px",
+                        textShadow: "none",
+                      } : {
+                        background: o.plate || "transparent",
+                        padding: o.plate ? "0.1em 0.35em" : 0,
+                        borderRadius: o.plate ? 4 : 0,
+                        textShadow: o.plate ? "none" : "0 2px 0 #000, 0 0 10px rgba(0,0,0,.8)",
+                      }),
+                      whiteSpace: "nowrap",
+                    }}>
+                      {/* The export draws the brand mark beside the handle, so
+                          the preview has to as well -- otherwise the editor is
+                          showing a different overlay than the one rendered. */}
+                      {o.platform && (
+                        /* The renderer's own PNG, not a lookalike icon -- the
+                           preview then shows the exact mark that gets burned in. */
+                        <img className="ov-logo" alt="" draggable={false}
+                             src={`/api/platform-logos/${o.platform}.png`} />
+                      )}
+                      {o.text}
+                    </span>
+                  )}
+                </div>
+                );
+              })}
+            </div>
+
+            <div className="stage-controls">
+              <button className="stage-play" onClick={togglePlay}>
+                {playing ? "❚❚" : "▶"}
+              </button>
+              <span className="stage-time">
+                {fmt(Math.max(0, now - start))} / {duration.toFixed(1)}s
+              </span>
+            </div>
+          </div>
+
+
+        {/* Timeline */}
+        <div className="live-timeline">
+          <div className="tl-track" ref={trackRef}>
+            {transcript?.utterances?.map((u, i) => (
+              <span key={i} className="tl-tick"
+                    style={{ left: `${pct(u.start)}%`, width: `${Math.max(pct(u.end) - pct(u.start), 0.3)}%` }} />
+            ))}
+            <span className="tl-selection" style={{ left: `${pct(start)}%`, width: `${pct(end) - pct(start)}%` }} />
+            <span className="tl-playhead" style={{ left: `${pct(now)}%` }} />
+            <span className="tl-handle" style={{ left: `${pct(start)}%` }}
+                  onMouseDown={() => setDragging("start")} role="slider" aria-label="Clip start" />
+            <span className="tl-handle end" style={{ left: `${pct(end)}%` }}
+                  onMouseDown={() => setDragging("end")} role="slider" aria-label="Clip end" />
+          </div>
+          <div className="tl-scale"><span>{fmt(view.from)}</span><span>{fmt(view.to)}</span></div>
+        </div>
+
+        <TimelineTracks
+          clipDuration={Math.max(end - start, 0.1)}
+          now={Math.min(Math.max(now - start, 0), end - start)}
+          overlays={overlayList}
+          selected={selected}
+          onSelect={setSelected}
+          onSeek={(t) => { if (videoRef.current) videoRef.current.currentTime = start + t; }}
+          onChange={(i, patch) => patchOverlay(i, patch)}
+        />
+
+          {/* Transcript and every control share one scrolling inspector column,
+             so the clip on the left is never pushed off screen by them. */}
+          <div className="live-inspector">
+          <div className="live-transcript">
+            {loadError && <div className="editor-error">{loadError}</div>}
+            {!transcript && !loadError && <div className="editor-loading">Loading…</div>}
+            {transcript?.utterances?.map((u, i) => {
+              const inClip = u.end > start && u.start < end;
+              const active = now >= u.start && now <= u.end;
+              return (
+                <div
+                  key={i}
+                  className={`tx-line ${inClip ? "in" : ""} ${active ? "playing" : ""}`}
+                  onClick={() => { if (videoRef.current) videoRef.current.currentTime = u.start; }}
+                >
+                  <span className="tx-time">{fmt(u.start)}</span>
+                  <span
+                    className="tx-text"
+                    contentEditable
+                    suppressContentEditableWarning
+                    onBlur={(e) => {
+                      const t = e.target.textContent.trim();
+                      if (t && t !== u.text) setLineEdits({ ...lineEdits, [i]: t });
+                    }}
+                  >
+                    {lineEdits[i] ?? u.text}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+
+        {/* Controls — every one of these is instant */}
+        <div className="live-controls">
+          <div className="ctl">
+            <span className="ctl-label">Ratio</span>
+            {Object.keys(RATIOS).map((r) => (
+              <button key={r} className={`chip-btn ${ratio === r ? "on" : ""}`} onClick={() => setRatio(r)}>{r}</button>
+            ))}
+          </div>
+          <div className="ctl">
+            <span className="ctl-label">Captions</span>
+            {Object.keys(STYLES).map((k) => (
+              <button key={k} className={`chip-btn ${capStyle === k ? "on" : ""}`} onClick={() => setCapStyle(k)}>{k}</button>
+            ))}
+          </div>
+        </div>
+
+        <div className="live-controls type-bar">
+          <div className="ctl">
+            <span className="ctl-label">Font</span>
+            <FontPicker value={capFont} onChange={setCapFont}
+                        needsDevanagari={hasDevanagari} />
+          </div>
+          <div className="ctl">
+            <span className="ctl-label">Size</span>
+            <SizePicker value={capSize} defaultPx={st.px} onChange={setCapSize} />
+            {capSize !== null && (
+              <button className="chip-btn subtle" onClick={() => setCapSize(null)}>Auto</button>
+            )}
+          </div>
+          <div className="ctl">
+            <span className="ctl-label">Subtitles</span>
+            <LanguagePicker value={translateTo} onChange={setTranslateTo} />
+          </div>
+          <div className="ctl">
+            <span className="ctl-label">Position</span>
+            <span className="ctl-hint">drag captions on the video</span>
+            {capPos !== null && (
+              <button className="chip-btn subtle" onClick={() => setCapPos(null)}>Reset</button>
+            )}
+          </div>
+        </div>
+
+        <div className="live-controls">
+          <div className="ctl">
+            <span className="ctl-label">Animation</span>
+            <div className="anim-row">
+              {["none","fade","pop","riseup","punch","bounce"].map((a) => (
+                <button key={a}
+                        className={`anim-chip ${capAnim === a ? "on" : ""}`}
+                        onClick={() => setCapAnim(a)}>
+                  <span className={`anim-demo anim-${a}`}>Aa</span>
+                  <em>{a === "riseup" ? "rise" : a}</em>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="live-controls">
+          <div className="ctl">
+            <span className="ctl-label">Speed</span>
+            {[0.5, 0.75, 1, 1.25, 1.5, 2].map((sp) => (
+              <button key={sp} className={`chip-btn ${speed === sp ? "on" : ""}`}
+                      onClick={() => setSpeed(sp)}>
+                {sp}×
+              </button>
+            ))}
+            {/* Two genuinely different effects, so it is a choice, not a toggle
+                buried in settings. */}
+            <button className={`chip-btn ${speedPitched ? "on" : ""}`}
+                    onClick={() => setSpeedPitched(!speedPitched)}
+                    title="Let pitch move with speed — the chipmunk/deep meme effect">
+              {speedPitched ? "Pitch: meme" : "Pitch: natural"}
+            </button>
+          </div>
+
+          {ratio && (
+            <div className="ctl">
+              <span className="ctl-label">Bars</span>
+              <div className="bg-row">
+                {BACKGROUNDS.map((b) => (
+                  <button key={b.id}
+                          className={`bg-dot ${background === b.id ? "on" : ""}`}
+                          style={{ background: b.css }}
+                          onClick={() => setBackground(b.id)}
+                          title={b.label} aria-label={b.label} />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="live-controls ov-panel">
+          <div className="ctl">
+            <span className="ctl-label">Overlays</span>
+            <button className="chip-btn" onClick={addText}>+ Text</button>
+            <label className="chip-btn as-label">
+              + Logo
+              <input type="file" accept="image/png,image/jpeg,image/webp" hidden
+                     onChange={(e) => addLogo(e.target.files?.[0])} />
+            </label>
+            <button className={`chip-btn ${showSafe ? "on" : ""}`}
+                    onClick={() => setShowSafe((v) => !v)}>
+              Safe areas
+            </button>
+          </div>
+
+          <div className="ctl">
+            <span className="ctl-label">Handle</span>
+            {/* One click puts a correctly branded handle in the right place --
+                platform colours and a placement clear of the platform's own UI. */}
+            {PLATFORMS.map((pf) => (
+              <button key={pf.id} className="platform-btn"
+                      style={{ "--pf": pf.plate }}
+                      title={`Add ${pf.name} handle`}
+                      onClick={() => {
+                        setOverlayList((l) => [...l,
+                          { ...platformOverlay(pf, ""), t_start: 0, t_end: end - start }],
+                          { discrete: true });
+                        setSelected(overlayList.length);
+                      }}>
+                <img className="pf-logo" src={logoSrc(pf.id)} alt="" />
+                <span>{pf.name}</span>
+              </button>
+            ))}
+          </div>
+
+          {selected !== null && overlayList[selected] && (
+            <div className="ov-edit">
+              {overlayList[selected].type === "text" && (
+                <>
+                  <input
+                    className="ov-text"
+                    value={overlayList[selected].text || ""}
+                    onChange={(e) => patchOverlay(selected, { text: e.target.value })}
+                    placeholder="@yourhandle"
+                  />
+                  <FontPicker
+                    value={overlayList[selected].font ?? null}
+                    onChange={(id) => patchOverlay(selected, { font: id })}
+                  />
+                  <SizePicker
+                    value={Math.round((overlayList[selected].size ?? 0.045) * 1920)}
+                    defaultPx={86}
+                    onChange={(px) => patchOverlay(selected, { size: px / 1920 })}
+                  />
+                  <input type="color" className="ov-color"
+                         value={overlayList[selected].color || "#ffffff"}
+                         onChange={(e) => patchOverlay(selected, { color: e.target.value })}
+                         aria-label="Text colour" />
+                  <button className={`chip-btn ${overlayList[selected].plate ? "on" : ""}`}
+                          onClick={() => patchOverlay(selected,
+                            { plate: overlayList[selected].plate ? null : "#000000" })}>
+                    Plate
+                  </button>
+                </>
+              )}
+              {overlayList[selected].type === "image" && (
+                <SizePicker
+                  value={Math.round((overlayList[selected].size ?? 0.12) * 1920)}
+                  defaultPx={230}
+                  onChange={(px) => patchOverlay(selected, { size: px / 1920 })}
+                />
+              )}
+              <button className="chip-btn danger" onClick={() => removeOverlay(selected)}>
+                Delete
+              </button>
+            </div>
+          )}
+        </div>
+
+        </div>
+        </div>
+
+        <footer className="live-foot">
+          <span className="live-hint">
+            {clip.rendered === false
+              ? "Unsaved changes — export to update the downloadable file"
+              : "Export is up to date"}
+          </span>
+        </footer>
+      </div>
+    </div>,
+    document.body
+  );
+}

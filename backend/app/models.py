@@ -1,0 +1,193 @@
+"""Persistent schema: users, jobs, clips.
+
+Two things here exist for features that do not exist yet, and are worth calling
+out so they are not mistaken for dead weight:
+
+  Job.transcript   the full word-level Deepgram result. Re-running transcription
+                   just to let someone drag a clip boundary would be absurd, so
+                   the editor needs this stored the first time.
+  Clip.words       the exact words in the rendered clip, so a trim/extend edit
+                   can recompute captions without touching the source video.
+
+User.credits is likewise the hook billing will decrement; it is enforced nowhere
+yet, and anonymous jobs are still allowed.
+"""
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Integer,
+                        String, Text)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db import Base
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    # Billing hook: 1 credit == 1 minute of source video, matching how the
+    # market prices this. Not enforced yet.
+    credits: Mapped[int] = mapped_column(Integer, default=100)
+    plan: Mapped[str] = mapped_column(String(32), default="free")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    jobs: Mapped[list["Job"]] = relationship(back_populates="user")
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # Nullable so the app keeps working without accounts; jobs made while signed
+    # out simply have no owner.
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True, index=True
+    )
+
+    url: Mapped[str] = mapped_column(Text)
+    options: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    progress_message: Mapped[str] = mapped_column(Text, default="")
+    percent: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, nullable=True)
+
+    # Kept so the editor can reopen a job without paying Deepgram again.
+    transcript: Mapped[dict] = mapped_column(JSON, nullable=True)
+    source_duration: Mapped[float] = mapped_column(Float, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    user: Mapped["User"] = relationship(back_populates="jobs")
+    clips: Mapped[list["Clip"]] = relationship(
+        back_populates="job", cascade="all, delete-orphan",
+        order_by="Clip.index", lazy="selectin",
+    )
+
+    def _proxy_ready(self) -> bool:
+        """Whether the editor's scrubbing proxy has finished building."""
+        import os
+        storage = os.path.join(os.path.dirname(__file__), "..", "storage")
+        try:
+            return os.path.getsize(
+                os.path.join(storage, self.id, "preview.mp4")) > 0
+        except OSError:
+            return False
+
+    def to_dict(self) -> dict:
+        """Shape the existing frontend already consumes."""
+        return {
+            "id": self.id,
+            "url": self.url,
+            "options": self.options or {},
+            "status": self.status,
+            "progress_message": self.progress_message or "",
+            "percent": self.percent or 0,
+            "error": self.error,
+            "clips": [c.to_dict() for c in self.clips],
+            # The editor plays this proxy; it is built AFTER the clips so results
+            # appear sooner, so the editor must be able to tell "not ready yet"
+            # from "broken" instead of showing a black frame.
+            "proxy_ready": self._proxy_ready(),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CreditLedger(Base):
+    """Every credit movement, so a balance can always be explained.
+
+    A bare integer on the user row cannot answer "why am I down 40 credits?",
+    which is the first question anyone asks about metered billing.
+    """
+
+    __tablename__ = "credit_ledger"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    delta: Mapped[int] = mapped_column(Integer)            # negative = spent
+    balance_after: Mapped[int] = mapped_column(Integer)
+    job_id: Mapped[str] = mapped_column(String(36), nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class Clip(Base):
+    __tablename__ = "clips"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("jobs.id"), index=True
+    )
+    index: Mapped[int] = mapped_column(Integer, default=0)
+
+    file: Mapped[str] = mapped_column(String(255))
+    title: Mapped[str] = mapped_column(Text, default="")
+    hook: Mapped[str] = mapped_column(Text, default="")
+
+    start: Mapped[float] = mapped_column(Float, default=0.0)
+    end: Mapped[float] = mapped_column(Float, default=0.0)
+    duration: Mapped[float] = mapped_column(Float, default=0.0)
+
+    score: Mapped[float] = mapped_column(Float, nullable=True)
+    scores: Mapped[dict] = mapped_column(JSON, nullable=True)
+    keywords: Mapped[list] = mapped_column(JSON, nullable=True)
+    # Word-level timings for this clip, so trim/extend can rebuild captions.
+    words: Mapped[list] = mapped_column(JSON, nullable=True)
+
+    # The clip as a RECIPE rather than a baked file: everything needed to
+    # reproduce it. The editor changes these instantly in the browser and only
+    # pays for an ffmpeg render when the user exports.
+    #   {ratio, frame, caption_style, caption_font, speed, translate_to,
+    #    lines: [{start,end,text}], overlays: [{type,text,x,y,...}]}
+    edit: Mapped[dict] = mapped_column(JSON, nullable=True)
+    # Whether `file` reflects the current recipe. False after an unexported edit.
+    rendered: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    job: Mapped["Job"] = relationship(back_populates="clips")
+
+    def to_dict(self) -> dict:
+        return {
+            "file": self.file,
+            "title": self.title,
+            "hook": self.hook,
+            "start": self.start,
+            "end": self.end,
+            "duration": self.duration,
+            "score": self.score,
+            "scores": self.scores or {},
+            "keywords": self.keywords or [],
+            "edit": self.edit or {},
+            "rendered": bool(self.rendered),
+            # Re-exporting overwrites clip_N.mp4 at the SAME url, so a browser
+            # that already has it happily shows the pre-edit video -- which is
+            # why an edited title appeared on the card but not in the picture.
+            # The file's mtime changes on every render, so appending it as ?v=
+            # makes each export a distinct url with no schema change.
+            "version": self._file_version(),
+        }
+
+    def _file_version(self) -> int:
+        # Resolved here rather than imported from app.main, which imports this
+        # module -- the import would be circular.
+        import os
+        storage = os.path.join(os.path.dirname(__file__), "..", "storage")
+        try:
+            return int(os.path.getmtime(
+                os.path.join(storage, self.job_id, self.file or "")))
+        except OSError:
+            return 0
