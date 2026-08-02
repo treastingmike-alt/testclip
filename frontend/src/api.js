@@ -6,7 +6,7 @@ function authHeaders() {
 }
 
 
-export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, voice, language, template, ratio, lengthPref, intent }) {
+export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, voice, language, template, ratio, lengthPref, intent }) {
   const resp = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -16,6 +16,7 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
       mode,
       burn_subtitles: burnSubtitles,
       auto_censor: autoCensor !== false,
+      multilingual: multilingual === true,
       voice,
       language,
       template,
@@ -158,8 +159,13 @@ export async function listJobs() {
 
 /* ---- live (non-destructive) editing ---- */
 
-export function previewUrl(jobId) {
-  return `${API_BASE}/jobs/${jobId}/preview`;
+/* Each clip has its own proxy, covering only the window its trim handles can
+   reach. `clipIndex` is the editor's 0-based index; the files on disk are
+   1-based (preview_1.mp4, next to clip_1.mp4). */
+export function previewUrl(jobId, clipIndex) {
+  const q = clipIndex === undefined || clipIndex === null
+    ? "" : `?clip=${clipIndex + 1}`;
+  return `${API_BASE}/jobs/${jobId}/preview${q}`;
 }
 
 /** Saves the clip recipe. No render, no cost -- safe to call on every change. */

@@ -80,12 +80,18 @@ class Job(Base):
     )
 
     def _proxy_ready(self) -> bool:
-        """Whether the editor's scrubbing proxy has finished building."""
+        """Whether ANY scrubbing proxy for this job has finished building.
+
+        Readiness is really per-clip now (each clip gets its own windowed
+        proxy, and clip 1 is playable long before the last one), so the editor
+        reads `proxy_ready` off the clip. This stays for the job-level views
+        that only need to know whether live editing has started working at all.
+        """
         import os
         storage = os.path.join(os.path.dirname(__file__), "..", "storage")
         try:
-            return os.path.getsize(
-                os.path.join(storage, self.id, "preview.mp4")) > 0
+            return any(n.startswith("preview") and n.endswith(".mp4")
+                       for n in os.listdir(os.path.join(storage, self.id)))
         except OSError:
             return False
 
@@ -179,7 +185,32 @@ class Clip(Base):
             # The file's mtime changes on every render, so appending it as ?v=
             # makes each export a distinct url with no schema change.
             "version": self._file_version(),
+            # This clip's scrubbing proxy covers a window around the clip rather
+            # than the whole source, so the editor must know where that window
+            # starts: proxy time zero is source time `proxy_offset`.
+            **self._proxy_state(),
         }
+
+    def _proxy_state(self) -> dict:
+        """Whether this clip's scrubbing copy exists, and where it starts.
+
+        Old jobs have a single whole-source preview.mp4 and no windowed file;
+        they report offset 0, which is exactly right for a proxy that starts at
+        the beginning of the source.
+        """
+        import os
+        from app.pipeline import render
+        storage = os.path.join(os.path.dirname(__file__), "..", "storage")
+        job_dir = os.path.join(storage, self.job_id)
+        # `index` is 0-based; the files rendering writes are 1-based, matching
+        # clip_1.mp4 / preview_1.mp4.
+        windowed = os.path.join(job_dir, f"preview_{self.index + 1}.mp4")
+        if os.path.exists(windowed):
+            lo, _ = render.proxy_window(self.start, self.end,
+                                        self.job.source_duration if self.job else None)
+            return {"proxy_ready": True, "proxy_offset": lo}
+        return {"proxy_ready": os.path.exists(os.path.join(job_dir, "preview.mp4")),
+                "proxy_offset": 0.0}
 
     def _file_version(self) -> int:
         # Resolved here rather than imported from app.main, which imports this

@@ -5,22 +5,45 @@ to plug into exists here (plans, a credit balance, a ledger of debits, a checkou
 endpoint that currently only records intent), so adding Polar/Stripe later means
 implementing one webhook that calls `grant_credits`, not restructuring anything.
 
-Credits are priced per MINUTE OF SOURCE VIDEO rather than per clip. Cost is
-driven by transcription and the analysis passes, both of which scale with how
-long the input is -- a 60-minute podcast costs the same to analyse whether the
-user asks for 1 clip or 10. Charging per clip would let a 3-hour stream be
-processed for the price of one short.
+Credits are priced PER CLIP DELIVERED, not per minute of source video. This is
+a deliberate product position: you pay for output you can post, not for our
+processing time. Every competitor meters upload minutes, so a creator who feeds
+in a three-hour stream and wants two clips is billed for the whole three hours.
+Here that costs 20 credits.
+
+The honest tradeoff: our own cost (transcription, the analysis passes) scales
+with SOURCE LENGTH, while revenue now scales with clip count. A long source
+that yields few clips is our worst case, and a short source that yields many is
+our best. That is a margin question, not a correctness one -- but it is real,
+and MAX_SOURCE_MINUTES exists so it stays bounded.
+
+Charging happens after clip SELECTION and before rendering: by then the real
+number of clips is known, so nobody is billed for clips the analysis could not
+find, and nobody gets the expensive render for free.
 """
 
+from app import env  # noqa: F401  -- ensures .env is loaded before ADMIN_EMAILS
+
+import os
 from datetime import datetime, timezone
 
 from app.db import SessionLocal
 from app.models import CreditLedger, User
 
-# 1 credit == 1 minute of source video, matching how this market prices.
-SECONDS_PER_CREDIT = 60.0
-MIN_CHARGE = 1
-FREE_SIGNUP_CREDITS = 100
+# 10 credits per finished clip. The unit users are billed in is the unit they
+# actually receive, which is the whole point -- see the module docstring.
+CREDITS_PER_CLIP = 10
+
+# The floor for having "any credit at all", used to reject a job before it
+# starts. One clip is the smallest thing anyone can ask for.
+MIN_CHARGE = CREDITS_PER_CLIP
+
+FREE_SIGNUP_CREDITS = 100          # 10 clips to try it with
+
+# Per-clip pricing decouples revenue from source length, so this is what stops
+# a 6-hour upload costing more to transcribe than the clips are worth. Not a
+# quality limit -- purely the point where the economics invert.
+MAX_SOURCE_MINUTES = 240
 
 PLANS = [
     {
@@ -31,7 +54,7 @@ PLANS = [
         "yearly_usd": 0,
         "credits": FREE_SIGNUP_CREDITS,
         "features": [
-            f"{FREE_SIGNUP_CREDITS} credits on signup",
+            f"{FREE_SIGNUP_CREDITS // CREDITS_PER_CLIP} free clips on signup",
             "All templates and ratios",
             "Word-accurate captions",
             "Clip trimming",
@@ -55,7 +78,8 @@ PLANS = [
             {"credits": 3000, "monthly_usd": 48, "yearly_usd": 38},
         ],
         "features": [
-            "≈ 100 clips from hour-long videos",
+            "100 clips a month, any source length",
+            "Multilingual captions (Hindi + English)",
             "Gameplay split-screen",
             "Pause tightening",
             "Trim and extend any clip",
@@ -84,6 +108,82 @@ PLANS = [
     },
 ]
 
+# What a plan actually UNLOCKS, as opposed to the `features` lists above, which
+# are marketing copy and are safe to reword. These strings are load-bearing:
+# they gate real behaviour, so treat them as an API.
+#
+#   multilingual -- transcribe with Deepgram nova-3 (language=multi) instead of
+#                   nova-2. It handles speech that switches language mid
+#                   sentence, and it costs materially more per minute, which is
+#                   the whole reason it is a paid capability rather than the
+#                   default for everyone.
+ENTITLEMENTS = {
+    "free": frozenset(),
+    "creator": frozenset({"multilingual"}),
+    "pro": frozenset({"multilingual"}),
+}
+
+
+# Accounts that get every capability regardless of plan, for testing the paid
+# experience without buying it. Config rather than code so adding a tester is an
+# .env edit and a restart, and so the list cannot be read off a public repo.
+#
+#   ADMIN_EMAILS=me@example.com,qa@example.com
+#
+# This grants FEATURES, not credits. An admin still spends credits at the
+# normal rate, because "does the credit flow feel right" is one of the things
+# worth testing, and an account that never decrements cannot answer it.
+_DOTLESS_DOMAINS = ("gmail.com", "googlemail.com")
+
+
+def _canonical_email(email: str) -> str:
+    """Lowercased, with Gmail's dots removed from the local part.
+
+    Gmail delivers first.last@ and firstlast@ to the same inbox, so someone
+    listed one way and signing up the other way is the same person and would
+    otherwise silently fail to match. Dots ARE significant on other domains, so
+    this deliberately only applies to Gmail.
+    """
+    email = (email or "").strip().lower()
+    local, _, domain = email.partition("@")
+    if domain in _DOTLESS_DOMAINS:
+        local = local.replace(".", "")
+    return f"{local}@{domain}" if domain else local
+
+
+ADMIN_EMAILS = frozenset(
+    _canonical_email(e)
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+)
+
+
+def is_admin(email: str) -> bool:
+    return bool(email) and _canonical_email(email) in ADMIN_EMAILS
+
+
+def entitlements_for(plan_id: str, email: str = None) -> frozenset:
+    """Everything this account can reach.
+
+    One place, so the gate in the API and the list sent to the client can never
+    disagree -- a UI that offers what the server rejects is worse than one that
+    offers nothing.
+    """
+    if is_admin(email):
+        return frozenset().union(*ENTITLEMENTS.values())
+    return ENTITLEMENTS.get(plan_id or "free", ENTITLEMENTS["free"])
+
+
+def allows(plan_id: str, feature: str, email: str = None) -> bool:
+    """Whether an account includes a feature.
+
+    Unknown plans -- and signed-out users, who have no plan at all -- get the
+    free set. Failing closed matters here: an unrecognised plan string must not
+    become a way to reach paid capability.
+    """
+    return feature in entitlements_for(plan_id, email)
+
+
 # Extra credits outside a plan.
 TOPUPS = [
     {"credits": 500, "usd": 12},
@@ -92,12 +192,9 @@ TOPUPS = [
 ]
 
 
-def credits_for(duration_seconds: float) -> int:
-    """Credits a source video of this length costs. Always at least MIN_CHARGE."""
-    if not duration_seconds or duration_seconds <= 0:
-        return MIN_CHARGE
-    import math
-    return max(MIN_CHARGE, math.ceil(duration_seconds / SECONDS_PER_CREDIT))
+def credits_for_clips(n_clips: int) -> int:
+    """What n finished clips cost. Source length does not enter into it."""
+    return max(0, int(n_clips or 0)) * CREDITS_PER_CLIP
 
 
 def get_plan(plan_id: str) -> dict:

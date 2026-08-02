@@ -557,6 +557,23 @@ body::after {
   color: var(--lime);
 }
 
+/* A paid capability the current plan does not include. Deliberately still a
+   button -- it reads as available-but-not-yours and opens the plans, where
+   `disabled` would read as broken and tell the user nothing. */
+.chip.locked {
+  color: var(--ink-faint);
+  border-style: dashed;
+}
+.chip.locked .chip-check {
+  font-size: 11px;
+  filter: grayscale(1);
+  opacity: 0.75;
+}
+.chip.locked:hover {
+  color: var(--ink-soft);
+  border-color: var(--ink-faint);
+}
+
 .chip.static {
   cursor: default;
   color: var(--ink-faint);
@@ -1898,6 +1915,10 @@ body::after {
 .scene-azure   { background: linear-gradient(165deg, #38bdf8, #0c5a8f); }
 .scene-warm    { background: linear-gradient(165deg, #d8c3a8, #8d6e52); }
 .scene-sunset  { background: linear-gradient(165deg, #fb923c, #b45309); }
+/* Darker than the rest, because the podcast frame darkens its own backdrop
+   hard (render.podcast_filter drops brightness to -0.55) so cream captions with
+   no outline stay readable on it. */
+.scene-studio  { background: linear-gradient(165deg, #2f3540, #14181f); }
 
 /* a real rendered clip, when one has been generated */
 .tpl-video {
@@ -1909,8 +1930,34 @@ body::after {
   display: block;
 }
 
-/* "fit" framing: the scene is letterboxed rather than filling the card */
-.scene-black .tpl-scene { inset: 22% 0; }
+/* The card geometry below is computed from render.py for a 16:9 source at 9:16,
+   not chosen by eye. A picker whose tiles do not match the output is worse than
+   no picker: it is what made a real framing change look like nothing had
+   happened. Recompute these if MIN_CONTENT_FRACTION / MAX_ZOOM / the biases move.
+
+   "classic": subject band over a blurred fill of itself -- 55% of the height,
+   vertically centred. */
+.tpl-frame.is-blur .tpl-scene {
+  inset: 22.5% 0 auto 0;
+  height: 55%;
+  background: linear-gradient(165deg, #5c6979, #39424f);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+
+/* "fit" framing: same 55% block as Classic, sat ABOVE centre (top 14.5%) so the
+   lower bar becomes a caption band. The bar is flat colour, not blur -- that is
+   now the whole difference between this and Classic. */
+.scene-black .tpl-scene {
+  inset: 14.5% 0 auto 0;
+  height: 55%;
+}
+
+/* The speaker is sized against its OWN band, so a taller band reads as a closer
+   subject -- which is exactly what the extra zoom buys in Classic. */
+.tpl-frame.is-blur .tpl-head { top: 11%; width: 30%; }
+.tpl-frame.is-blur .tpl-body { top: 46%; width: 62%; height: 54%; }
+.scene-black .tpl-head { top: 11%; width: 30%; }
+.scene-black .tpl-body { top: 46%; width: 62%; height: 54%; }
 
 /* stylised speaker so the framing reads as a person on camera */
 .tpl-scene { position: absolute; inset: 0; }
@@ -1936,6 +1983,26 @@ body::after {
 }
 
 /* split layout: speaker shrinks to the top half, gameplay fills the bottom */
+/* "podcast" framing: a wide uncropped band sat high (the renderer centres it on
+   0.36 of the height), leaving the bottom of the frame free for captions. Two
+   speakers, because keeping both of them is the whole point of the template. */
+/* Not eyeballed: for a 16:9 source at 9:16 these are what render.py produces --
+   band top 20.2%, band height 31.6%, captions 27.9% up. Rounded to the nearest
+   tenth so the card is a measurement of the output, not an impression of it. */
+.tpl-frame.is-podcast .tpl-scene {
+  inset: 20.2% 0 auto 0;
+  height: 31.6%;
+  background: linear-gradient(165deg, #55606e, #333c49);
+}
+.tpl-frame.is-podcast .tpl-head {
+  top: 18%; left: 30%; width: 17%;
+}
+.tpl-frame.is-podcast .tpl-head.two { left: 70%; }
+.tpl-frame.is-podcast .tpl-body {
+  top: 58%; left: 30%; width: 30%; height: 42%;
+}
+.tpl-frame.is-podcast .tpl-body.two { left: 70%; }
+
 .tpl-frame.is-split .tpl-scene { inset: 0 0 50% 0; }
 .tpl-frame.is-split .tpl-head { top: 14%; width: 30%; }
 .tpl-frame.is-split .tpl-body { top: 52%; height: 48%; }
@@ -1988,17 +2055,31 @@ body::after {
 }
 
 /* mirrors the real STYLES table: size, weight, position and box treatment */
+/* 22% up, matching render.caption_margin_v -- these sat at 8% and 16%, well
+   below where anything actually burns in, and under the platform's own UI. */
 .cap-classic {
   font-size: 12px;
   font-weight: 700;
+  bottom: 22%;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+/* The quiet one: cream, no outline, just a soft shadow -- mirrors the
+   `podcast_clean` preset (outline 0, shadow 4). Sits high enough to land in the
+   band under the video rather than down at the platform-UI floor. */
+.cap-podcast {
+  font-size: 11px;
+  font-weight: 600;
+  bottom: 27.9%;
+  letter-spacing: 0.01em;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75);
 }
 
 /* blue chip travels under the spoken word */
 .cap-fitbox {
   font-size: 11px;
   font-weight: 800;
-  bottom: 16%;
+  bottom: 22%;
   text-shadow: none;
 }
 .cap-fitbox .tpl-word {
@@ -3252,6 +3333,80 @@ body::after {
   align-items: start;
 }
 
+/* ---------- section rail ----------
+   Below the working-layout breakpoint the rail is a horizontal strip of tabs;
+   the real column version is set up with the rest of the grid further down. */
+.live-rail {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 12px 28px 0;
+}
+
+.rail-btn {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex: none;
+  padding: 11px 12px;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  color: var(--ink);
+  transition: background .14s ease, border-color .14s ease;
+}
+.rail-btn:hover { background: rgba(0, 0, 0, 0.04); }
+.rail-btn.on {
+  background: var(--surface);
+  border-color: var(--line);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.rail-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--ink-faint);
+  font-size: 14px;
+  line-height: 1;
+}
+.rail-btn.on .rail-icon { background: var(--violet); color: #fff; }
+
+.rail-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rail-text strong { font-size: 13.5px; font-weight: 650; }
+.rail-text em {
+  font-style: normal;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--ink-faint);
+}
+
+/* ---------- inspector section header ---------- */
+.insp-head { padding: 2px 28px 0; }
+.insp-head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.insp-head p {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+}
+
+/* As a horizontal strip the descriptions do not fit and are not needed -- the
+   section header in the inspector repeats them. */
+@media (max-width: 1179px) {
+  .rail-text em { display: none; }
+}
+
 /* stage */
 .live-stage { display: flex; flex-direction: column; gap: 10px; }
 
@@ -3287,9 +3442,21 @@ body::after {
      fill  -- edge to edge, sides cropped        (fill_filter)
      fit   -- whole frame on flat bars           (fit_filter)
      blur  -- centred over a blurred copy        (blur_filter, the default) */
-.stage-frame.frame-fit video { object-fit: contain; }
+/* `fit` now takes the same zoom as `blur`, so its block is positioned the same
+   way -- height and top set inline from the source dimensions, cropping the
+   sides. The bars underneath stay flat colour, which is the remaining
+   difference between the two. This rule is the fallback for the frames before
+   the video has reported its size. */
+.stage-frame.frame-fit .stage-fg {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  object-fit: cover;
+  z-index: 1;
+}
 
-.stage-frame.frame-blur .stage-blur {
+.stage-frame.frame-blur .stage-blur,
+.stage-frame.frame-podcast .stage-blur {
   position: absolute;
   inset: 0;
   object-fit: cover;
@@ -3298,7 +3465,17 @@ body::after {
   pointer-events: none;
   z-index: 0;
 }
-.stage-frame.frame-blur .stage-fg {
+
+/* Podcast knocks its backdrop well down (render.podcast_filter's eq), because
+   most of that frame is backdrop with quiet, outline-less captions sitting on
+   it. Previewing it at Classic's brightness would show readable captions the
+   export cannot produce. */
+.stage-frame.frame-podcast .stage-blur {
+  filter: blur(18px) saturate(0.35) brightness(0.45);
+}
+
+.stage-frame.frame-blur .stage-fg,
+.stage-frame.frame-podcast .stage-fg {
   position: absolute;
   left: 0;
   width: 100%;
@@ -3350,15 +3527,22 @@ body::after {
   box-shadow: 0 0 0 2px rgba(109, 40, 217, 0.22);
 }
 
+/* `bottom` mirrors render.caption_margin_v: PLATFORM_UI_FRACTION (0.17, the
+   band Reels/TikTok/Shorts cover with their own buttons) plus CAPTION_LIFT
+   (0.05, which pulls the caption up toward the video so the two read as one
+   composition). It was 7%, which drew captions well below where any export put
+   them -- under the platform's own UI, in the preview only. */
 .stage-caption {
   position: absolute;
   left: 4%;
   right: 4%;
-  bottom: 7%;
+  bottom: 22%;
   text-align: center;
   pointer-events: none;
   line-height: 1.25;
 }
+/* Podcast sits its captions in the band under a high-biased video. */
+.stage-frame.frame-podcast .stage-caption { bottom: 28%; }
 .stage-caption.mid { bottom: auto; top: 46%; }
 
 .cap-inner {
@@ -4035,9 +4219,24 @@ body::after {
 @media (min-width: 1180px) {
   .live {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(330px, 400px);
+    /* Rail | clip | inspector. The rail is fixed-width because it is
+       navigation, not content -- letting it flex would make the sections move
+       every time the window changed. */
+    grid-template-columns: 196px minmax(0, 1fr) minmax(330px, 400px);
     column-gap: 26px;
     align-items: start;
+  }
+
+  /* The rail stays put next to the clip, which also stays put. */
+  .live-rail {
+    grid-column: 1;
+    grid-row: 2;
+    position: sticky;
+    top: 74px;
+    flex-direction: column;
+    overflow: visible;
+    gap: 4px;
+    padding: 0 0 0 26px;
   }
 
   /* Three rows only: header, the two columns, footer. The clip column is a
@@ -4051,9 +4250,9 @@ body::after {
     display: contents;
   }
 
-  /* Left: the clip and both timelines, moving together and staying put. */
+  /* Middle: the clip and both timelines, moving together and staying put. */
   .live-left {
-    grid-column: 1;
+    grid-column: 2;
     grid-row: 2;
     position: sticky;
     top: 74px;
@@ -4061,7 +4260,8 @@ body::after {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding-left: 26px;
+    /* The rail owns the left edge now, so the clip column starts at the gap. */
+    padding-left: 0;
     background: var(--bg);
   }
   /* The pieces no longer position themselves -- the column does. */
@@ -4072,7 +4272,7 @@ body::after {
   /* Right: one real column, so its contents stack tightly instead of being
      stretched to match the (much taller) stage row. */
   .live-inspector {
-    grid-column: 2;
+    grid-column: 3;
     grid-row: 2;
     align-self: start;
     position: sticky;
@@ -4285,4 +4485,213 @@ body::after {
   background: rgba(20, 20, 24, 0.86);
   border-radius: 5px;
   padding: 2px 6px;
+}
+
+/* ---------------------------------------------------------------------------
+   Caption preset picker
+   ---------------------------------------------------------------------------
+   Every card animates a real sample of its preset. The old picker was a row of
+   chips labelled with internal ids ("classic", "fitbox"), so the only way to
+   find out what a style looked like was to render a clip in it.
+
+   All of the motion here is CSS on a shared cycle: with thirty-odd cards on
+   screen, one JS timer per card would be thirty timers competing with video
+   playback in the same tab. Each word's turn comes from its --i index as an
+   animation-delay, so the browser runs it on the compositor and we run nothing.
+*/
+.cap-picker { width: 100%; }
+
+.cap-tabs {
+  display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.cap-tab {
+  border: 1px solid var(--line); background: transparent;
+  border-radius: 999px; padding: 5px 12px; font-size: 12.5px;
+  font-weight: 600; color: var(--ink-soft); cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.cap-tab:hover { border-color: var(--ink-faint); }
+.cap-tab.on {
+  background: var(--violet); border-color: var(--violet); color: #fff;
+}
+
+.cap-cat-desc {
+  margin: 0 0 10px; font-size: 12px; color: var(--ink-soft);
+}
+
+.cap-grid {
+  display: grid; gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+}
+
+.cap-card {
+  position: relative; padding: 0; overflow: hidden; cursor: pointer;
+  border: 2px solid var(--line); border-radius: 12px;
+  background: #16161c; display: flex; flex-direction: column;
+  transition: border-color .12s, transform .12s;
+}
+.cap-card:hover { transform: translateY(-1px); border-color: var(--ink-faint); }
+.cap-card.on { border-color: var(--violet); }
+.cap-card.on::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  box-shadow: inset 0 0 0 2px var(--violet); border-radius: 10px;
+}
+
+.cap-card-stage {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 72px; padding: 10px 8px; width: 100%;
+  /* A neutral dark stage, because nearly every preset is designed to sit on
+     video and light-on-light would make half of them invisible. */
+  background: linear-gradient(160deg, #23232b, #15151a);
+}
+
+.cap-card-name {
+  font-size: 11px; font-weight: 600; letter-spacing: .01em;
+  color: var(--ink-soft); background: var(--paper);
+  padding: 5px 6px; text-align: center; width: 100%;
+}
+.cap-card.on .cap-card-name { color: var(--violet); }
+
+.cap-sample {
+  /* The gap has to clear the widest a word gets under a scale effect, or the
+     grown word visually swallows the space beside it and the sample reads as
+     one run-on word. */
+  display: flex; flex-wrap: wrap; gap: .42em; justify-content: center;
+  align-items: center; line-height: 1.15; font-weight: 900;
+  font-family: "Archivo Black", Impact, sans-serif;
+  border-radius: 4px; padding: 0 .15em;
+}
+
+.cap-word {
+  position: relative; display: inline-block; transform-origin: center bottom;
+  /* Every effect shares one 2.4s cycle; --i staggers each word's turn so the
+     highlight travels left to right the way the export does. */
+  --cycle: 2.4s;
+  animation-delay: calc(var(--i) * (var(--cycle) / var(--n)));
+}
+.cap-word-rest { display: inline-block; }
+.cap-word-lit {
+  position: absolute; inset: 0; display: inline-block;
+  opacity: 0; white-space: nowrap;
+  animation: capLit var(--cycle) steps(1, end) infinite;
+  animation-delay: inherit;
+}
+/* The stroke the renderer draws as an ASS outline. Four offsets rather than
+   -webkit-text-stroke, which thins glyphs inward instead of growing them. */
+.cap-sample .cap-word-rest,
+.cap-sample .cap-word-lit {
+  text-shadow:
+    var(--stroke) 0 0 #000, calc(-1 * var(--stroke)) 0 0 #000,
+    0 var(--stroke) 0 #000, 0 calc(-1 * var(--stroke)) 0 #000;
+}
+.cap-card.boxed .cap-word-rest,
+.cap-card.boxed .cap-word-lit { text-shadow: none; }
+
+@keyframes capLit {
+  0%, 32% { opacity: 1; }
+  33%, 100% { opacity: 0; }
+}
+
+/* --- per-effect motion, layered on top of the shared opacity cycle -------- */
+
+.fx-scale .cap-word, .fx-pop .cap-word,
+.fx-glow .cap-word, .fx-marker .cap-word,
+.fx-underline .cap-word, .fx-progress .cap-word {
+  animation-name: capNudge;
+  animation-duration: var(--cycle);
+  animation-iteration-count: infinite;
+  animation-delay: calc(var(--i) * (var(--cycle) / var(--n)));
+}
+@keyframes capNudge { 0%, 32% { transform: none; } 33%, 100% { transform: none; } }
+
+.fx-scale .cap-word { animation-name: capScale; }
+@keyframes capScale {
+  0%, 30% { transform: scale(1.14); }
+  32%, 100% { transform: scale(1); }
+}
+
+.fx-pop .cap-word { animation-name: capPop; }
+@keyframes capPop {
+  0%   { transform: scale(.9) translateY(0); }
+  8%   { transform: scale(1.2) translateY(-9%); }
+  18%  { transform: scale(1.04) translateY(0); }
+  32%, 100% { transform: scale(1); }
+}
+
+.fx-underline .cap-word-lit { text-decoration: underline; text-underline-offset: .16em; }
+
+.fx-marker .cap-word-lit { border-radius: 3px; padding: 0 .1em; margin: 0 -.1em; }
+
+/* Fill: the lit copy is clipped from zero width to full, so the word itself
+   fills left to right rather than switching colour all at once. */
+.fx-progress .cap-word-lit {
+  animation-name: capFill;
+  animation-timing-function: linear;
+  clip-path: inset(0 100% 0 0);
+}
+@keyframes capFill {
+  0%   { opacity: 1; clip-path: inset(0 100% 0 0); }
+  30%  { opacity: 1; clip-path: inset(0 0 0 0); }
+  32%  { opacity: 1; clip-path: inset(0 0 0 0); }
+  33%, 100% { opacity: 0; clip-path: inset(0 100% 0 0); }
+}
+
+/* Phrase presets replace the whole chunk instead of tracking a word, so the
+   card animates the block arriving rather than a travelling highlight. */
+.mode-phrase .cap-word-lit { animation: none; opacity: 1; }
+.mode-phrase .cap-word-rest { visibility: hidden; }
+.mode-phrase .cap-sample { animation: capPhrase 2.4s infinite; }
+@keyframes capPhrase {
+  0%   { transform: scale(.86); opacity: 0; }
+  10%  { transform: scale(1.04); opacity: 1; }
+  16%  { transform: scale(1); opacity: 1; }
+  88%  { transform: scale(1); opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
+}
+
+/* Typewriter reveals characters, so the card reveals words on the same cycle
+   and holds the finished line -- the closest honest read at this size. */
+.mode-typewriter .cap-word-lit { animation: none; opacity: 1; }
+.mode-typewriter .cap-word-rest { visibility: hidden; }
+.mode-typewriter .cap-word {
+  animation: capType 2.4s steps(1, end) infinite;
+  animation-delay: calc(var(--i) * (2.4s / var(--n) * .7));
+}
+@keyframes capType { 0% { opacity: 0; } 1%, 100% { opacity: 1; } }
+
+.cap-picker-empty {
+  font-size: 12.5px; color: var(--ink-soft); padding: 10px 0;
+}
+
+/* Motion here is decoration; the labels carry the same information. */
+@media (prefers-reduced-motion: reduce) {
+  .cap-word, .cap-word-lit, .cap-sample { animation: none !important; }
+  .cap-word-lit { opacity: 1; }
+  .cap-word-rest { visibility: hidden; }
+}
+
+/* "No title" reads as a state, not as a typeface sample -- so it is labelled
+   rather than shown as an "Aa" that would imply it draws something. */
+.title-look-off {
+  font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  color: var(--ink-soft); text-transform: uppercase;
+}
+.title-look.on .title-look-off { color: var(--violet); }
+
+/* A control whose body is a full-width block (the preset grid) rather than a
+   row of chips sharing a line with its label. */
+.ctl-block { display: block; width: 100%; }
+.ctl-block > .ctl-label { display: block; margin-bottom: 8px; }
+
+/* A caveat attached to a control -- something the export will do differently
+   from the preview. Amber rather than red: it is a limitation, not an error. */
+.ctl-warn {
+  margin: 6px 0 0; padding: 7px 10px; width: 100%;
+  font-size: 12px; line-height: 1.45; color: #7a5200;
+  background: rgba(245, 178, 40, .12);
+  border: 1px solid rgba(245, 178, 40, .35); border-radius: 8px;
+}
+.ctl-warn code {
+  font-size: 11.5px; background: rgba(0, 0, 0, .07);
+  padding: 1px 4px; border-radius: 4px;
 }

@@ -15,6 +15,10 @@ export default function Pricing({ user, onRequireAuth }) {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
 
+  /* Priced by the server, so the page cannot quote a rate the backend would
+     not actually charge. The fallback only covers the first paint. */
+  const perClip = data?.credits_per_clip ?? 10;
+
   useEffect(() => {
     getPlans()
       .then((d) => {
@@ -57,9 +61,14 @@ export default function Pricing({ user, onRequireAuth }) {
           <h2>
             Pay for what you <span className="serif">actually clip.</span>
           </h2>
+          {/* The differentiator, stated plainly. Everyone else meters the
+              video you upload; a three-hour stream costs three hours whether
+              you keep two clips or none. Here the source is free and you pay
+              only for finished clips. */}
           <p>
-            1 credit = 1 minute of source video. A 40-minute podcast costs 40
-            credits, however many clips you pull from it.
+            {perClip} credits = 1 finished clip. Source length doesn't matter —
+            a three-hour stream costs the same as a ten-minute one. You pay for
+            clips you can post, not for our processing time.
           </p>
 
           <div className="billing-toggle" role="group" aria-label="Billing interval">
@@ -123,12 +132,13 @@ export default function Pricing({ user, onRequireAuth }) {
                       ))}
                     </select>
                     <span className="credit-hint">
-                      ≈ {Math.round(credits / 60)} hours of video
+                      {Math.floor(credits / perClip).toLocaleString()} clips a month
                     </span>
                   </label>
                 ) : (
                   <p className="credit-static">
-                    {plan.credits.toLocaleString()} credits on signup
+                    {Math.floor(plan.credits / perClip).toLocaleString()} free
+                    clips on signup
                   </p>
                 )}
 
@@ -166,8 +176,8 @@ export default function Pricing({ user, onRequireAuth }) {
           <div className="topup-row">
             {data.topups.map((t) => (
               <div className="topup" key={t.credits}>
-                <strong>{t.credits.toLocaleString()}</strong>
-                <span>credits</span>
+                <strong>{Math.floor(t.credits / perClip).toLocaleString()}</strong>
+                <span>clips</span>
                 <em>${t.usd}</em>
               </div>
             ))}

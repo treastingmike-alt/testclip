@@ -49,21 +49,42 @@ def ensure_source(job: Job, job_dir: str, on_progress=None) -> str:
     return downloader.download_video(job.url, path, on_progress=on_progress)
 
 
-def words_from_lines(lines: list) -> list:
-    """Rebuilds word timings from user-edited caption lines.
+def words_from_lines(lines: list, transcript: dict = None) -> list:
+    """Rebuilds word timings from caption lines, keeping real timings where possible.
 
-    A line is {"start", "end", "text"}: the user rewrote the text of a span
-    whose boundaries we know. The original per-word timings cannot survive a
-    rewrite (the words are different), so the new tokens are spread evenly
-    across the span. Karaoke timing on edited lines becomes even rather than
-    exact -- the honest trade for letting text be freely rewritten.
+    A line is {"start", "end", "text", "edited"}. Only a REWRITTEN line loses
+    its per-word timings -- its words are different words, so the new tokens are
+    spread evenly across the span. Karaoke on those lines becomes even rather
+    than exact: the honest trade for letting text be freely rewritten.
+
+    Lines the user did not touch keep the transcript's real word timings. This
+    matters because editing one line used to re-spread EVERY line in the clip,
+    so fixing a single typo quietly degraded the karaoke timing of the whole
+    caption track.
     """
+    original = []
+    if transcript is not None:
+        for utt in transcriber.get_utterances(transcript):
+            original.extend(utt.get("words", []))
+
     words = []
     for line in lines:
         tokens = [t for t in (line.get("text") or "").split() if t]
         if not tokens:
             continue
         span_start, span_end = float(line["start"]), float(line["end"])
+
+        if not line.get("edited", True) and original:
+            # Untouched: take the real words that sit inside this span. Midpoint
+            # containment, matching words_in_range, so a word on the boundary
+            # lands on the side it mostly occupies.
+            real = [w for w in original
+                    if span_start <= (w["start"] + w["end"]) / 2 <= span_end]
+            if real:
+                words.extend(real)
+                continue
+            # No real words found (a re-timed span): fall through and spread.
+
         dt = (span_end - span_start) / len(tokens)
         for k, tok in enumerate(tokens):
             t0 = span_start + k * dt
@@ -73,6 +94,9 @@ def words_from_lines(lines: list) -> list:
                 "start": round(t0, 3),
                 "end": round(t0 + dt * 0.85, 3),
             })
+
+    # Cues are grouped in order downstream, and a mixed track can interleave.
+    words.sort(key=lambda w: w["start"])
     return words
 
 
@@ -133,7 +157,7 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         size_px = caption_size or None
 
         if caption_lines:
-            words = words_from_lines(caption_lines)
+            words = words_from_lines(caption_lines, job.transcript)
         else:
             words = words_in_range(job.transcript, start, end)
 

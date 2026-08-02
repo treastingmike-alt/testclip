@@ -47,6 +47,12 @@ def caption_margin_from_position(out_h: int, position: float) -> int:
 # read by nobody.
 PLATFORM_UI_FRACTION = 0.17
 
+# How far up from the platform-UI floor captions sit. Captions parked at the
+# very bottom of a letterboxed frame read as a separate thing stuck under the
+# video; lifting them toward it makes the two read as one composition, and on a
+# phone they land closer to where the eye already is.
+CAPTION_LIFT = 0.05
+
 
 def caption_margin_v(src_w: int, src_h: int, out_w: int = OUT_W, out_h: int = OUT_H) -> int:
     """Distance from the bottom of the output frame to the caption baseline.
@@ -56,7 +62,7 @@ def caption_margin_v(src_w: int, src_h: int, out_w: int = OUT_W, out_h: int = OU
     wins -- a perfectly placed caption hidden behind an Instagram like button is
     worth nothing.
     """
-    floor = int(out_h * PLATFORM_UI_FRACTION)
+    floor = int(out_h * (PLATFORM_UI_FRACTION + CAPTION_LIFT))
 
     fg_h = content_height(src_w, src_h, out_w, out_h)
     band_height = (out_h - fg_h) / 2
@@ -84,10 +90,33 @@ RATIOS = {
 # sides) buys a lot of content area cheaply, because the subject in talking-head
 # footage is centred and the edges are usually room.
 #
-# The cap matters: past ~1.45x you start guillotining people at the shoulders.
-MIN_CONTENT_FRACTION = 0.44     # aim for the video covering >= 44% of frame height
-MAX_ZOOM = 1.35                 # ~26% off the sides; past this, wide shots lose
-                                # their scenery and people lose their shoulders
+# 0.44 was still too timid: it left 550px bars above and below, so the thing the
+# viewer actually came to watch got 43% of their screen and blurred wallpaper got
+# the rest. These numbers put the video band at ~55% -- the size it was drawn at
+# in the layout this was matched against -- which is where a Reel starts feeling
+# like a video rather than a video in a frame.
+#
+# The cap is the real safety: it bounds how much of the sides can be thrown away
+# for a wide shot, where the edges are scenery rather than room.
+MIN_CONTENT_FRACTION = 0.55     # aim for the video covering >= 55% of frame height
+MAX_ZOOM = 1.75                 # ~43% off the sides. Talking-head footage centres
+                                # the subject, so this is nearly always room -- but
+                                # it is a hard stop so a wide shot cannot lose its
+                                # subject entirely.
+                                #
+                                # This has to be >= the zoom the fraction above
+                                # actually needs, or the cap silently becomes the
+                                # real policy: at 1.50 a 16:9 source reached only
+                                # 47% of frame height and MIN_CONTENT_FRACTION's
+                                # 0.55 was a number the code never honoured.
+
+# "Fit video" promises nothing is cropped, so it gets no zoom at all -- that is
+# the whole reason to choose it over Classic. What it CAN do is stop wasting the
+# bars: they are a design surface, and the caption band belongs in the lower one.
+FIT_CONTENT_BIAS = 0.42         # centre of the video block, as a fraction of
+                                # height. Below 0.5 = sat above centre, which
+                                # leaves a deliberate caption band underneath
+                                # instead of two equal dead margins.
 
 
 def content_height(src_w: int, src_h: int, out_w: int, out_h: int) -> int:
@@ -121,18 +150,166 @@ def blur_filter(width: int, height: int, src_w: int = None, src_h: int = None) -
     return bg + fg + "[bg][fg]overlay=(W-w)/2:(H-h)/2[framed]"
 
 
-def fit_filter(width: int, height: int, background: str = "black") -> str:
-    """Whole frame visible on flat bars -- nothing cropped, nothing blurred.
+def fit_filter(width: int, height: int, background: str = "black",
+               src_w: int = None, src_h: int = None) -> str:
+    """Video block on flat bars -- no blur, and the bars are a real colour.
 
     `background` is any ffmpeg colour ('black', '#1e1e2e', 'white'). The bars are
     a design surface, not dead space: a brand colour there reads as intentional
     where black reads as a mistake.
+
+    The block sits ABOVE centre (FIT_CONTENT_BIAS). Centred, it split the
+    leftover height into two identical dead margins and pushed the captions to
+    the very bottom of the frame, under the platform's own UI. Biased up, the
+    same pixels become a title band above and a caption band below.
+
+    It also takes the SAME zoom as Classic. This mode used to refuse to crop at
+    all, which sounds principled until you see it: a 16:9 source in a 9:16 frame
+    came out 31.6% of the height, and two thirds of the clip was flat colour.
+    The difference from Classic is now the backdrop -- flat and brandable rather
+    than a blurred copy -- not the size of the picture. Callers that pass no
+    source size still get the old uncropped behaviour.
     """
     colour = (background or "black").replace("#", "0x")
+    # y of the block's top edge = centre - half its height, clamped into frame.
+    y = f"max(0\\,min(oh-ih\\,{FIT_CONTENT_BIAS}*oh-ih/2))"
+    if src_w and src_h:
+        fg_h = content_height(src_w, src_h, width, height)
+        scale = (f"[0:v]scale=-2:{fg_h}:force_original_aspect_ratio=increase,"
+                 f"crop={width}:{fg_h},")
+    else:
+        scale = f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+    return f"{scale}pad={width}:{height}:(ow-iw)/2:{y}:{colour}[framed]"
+
+
+# Podcast footage is the one case where the zoom policy is actively wrong. A
+# two-shot puts the guest near one edge and the host near the other, so cropping
+# 43% off the sides to make the picture bigger removes a person from the
+# conversation. This mode therefore never crops -- it buys its screen presence
+# from layout instead, sitting the full-width frame high and giving the space
+# underneath to captions, which is the shape every podcast clip on the platforms
+# already has.
+PODCAST_CONTENT_BIAS = 0.36
+
+
+def podcast_filter(width: int, height: int) -> str:
+    """Uncropped two-shot sat high, over a blurred copy of itself.
+
+    Between the other two: `fit` never crops but spends its bars on flat colour,
+    `blur` fills the frame richly but crops hard to do it. This keeps everyone in
+    shot like `fit` and still fills the frame like `blur`.
+    """
+    half_w, half_h = width // 2, height // 2
+    y = f"max(0\\,min(H-h\\,{PODCAST_CONTENT_BIAS}*H-h/2))"
     return (
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:{colour}[framed]"
+        f"[0:v]scale={half_w}:{half_h}:force_original_aspect_ratio=increase,"
+        f"crop={half_w}:{half_h},gblur=sigma=12,"
+        # Knocked well down, unlike the Classic backdrop. Most of this frame is
+        # backdrop with captions sitting on it, and the podcast styles are quiet
+        # low-contrast faces with no outline -- cream text on a bright blurred
+        # shirt was genuinely unreadable. Darkened, it reads as a deliberate
+        # surface and the captions sit on it cleanly.
+        f"eq=brightness=-0.55:saturation=0.35,"
+        f"scale={width}:{height}[bg];"
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:{y}[framed]"
     )
+
+
+def podcast_caption_margin_v(src_w: int, src_h: int,
+                             out_w: int = OUT_W, out_h: int = OUT_H) -> int:
+    """Caption baseline for the podcast frame.
+
+    The video is biased upward, so the generic margin -- which assumes equal
+    bands and measures from the bottom -- would drop captions into the far
+    corner of a very tall empty band. This centres them in the space actually
+    left under the video, while still clearing the platform's UI.
+    """
+    fg_h = min(int(out_w * src_h / src_w), out_h) if src_w and src_h else out_h // 2
+    top = max(0, min(out_h - fg_h, PODCAST_CONTENT_BIAS * out_h - fg_h / 2))
+    band_top = top + fg_h                      # first free pixel under the video
+    band = max(out_h - band_top, 1)
+    floor = int(out_h * (PLATFORM_UI_FRACTION + CAPTION_LIFT))
+    # Centre of the free band, expressed as a margin from the bottom.
+    return max(floor, int(out_h - (band_top + band * 0.42)))
+
+
+def smart_caption_margin_v(plan: dict, out_h: int = OUT_H) -> int:
+    """Caption baseline for a face-aware frame.
+
+    These layouts have no bars -- that is the point of them -- so captions sit
+    ON the picture and the question becomes which part of the picture they can
+    cover without hiding a face.
+
+    Stacked: the seam between the two tiles. It is the one horizontal band that
+    belongs to neither speaker, it is where every podcast clip on the platforms
+    puts its captions, and text there reads against both tiles at once.
+
+    Single: the lower third, clear of the platform's own UI. Lower would be
+    under the like button; higher would be across the speaker's chest.
+    """
+    if plan and plan.get("mode") == "stacked":
+        # Just below the seam, so the text sits against the lower tile's top
+        # rather than splitting the difference and clipping both.
+        return int(out_h * 0.46)
+    return int(out_h * (PLATFORM_UI_FRACTION + CAPTION_LIFT))
+
+
+def smart_filter(plan: dict, width: int, height: int) -> str:
+    """Composite a reframe plan from `pipeline.reframe` into a vertical canvas.
+
+    Two shapes, because a podcast has two shapes. One speaker gets a single
+    portrait window that follows them; two speakers get a window each, stacked.
+    Both fill the canvas edge to edge -- the whole point of doing the detection
+    work is that no part of the frame ends up as padding.
+    """
+    from app.pipeline import reframe
+
+    win_w, win_h = plan["win"]
+    # Even dimensions: libx264 rejects odd ones on yuv420p.
+    win_w -= win_w % 2
+    win_h -= win_h % 2
+
+    if plan["mode"] == "stacked":
+        tile_h = height // 2
+        tile_h -= tile_h % 2
+        parts = ["[0:v]split=2[a][b];"]
+        for tag, label in (("a", "top"), ("b", "bottom")):
+            keys = plan["windows"][0 if tag == "a" else 1]
+            x = reframe.expr([(t, v) for t, v, _ in keys], 0, 0)
+            y = reframe.expr([(t, v) for t, _, v in keys], 0, 0)
+            # The window is expressed by its CENTRE; crop wants a corner.
+            parts.append(
+                f"[{tag}]crop={win_w}:{win_h}:'({x})-{win_w // 2}':'({y})-{win_h // 2}',"
+                f"scale={width}:{tile_h},setsar=1[{label}];"
+            )
+        parts.append("[top][bottom]vstack=inputs=2[framed]")
+        return "".join(parts)
+
+    keys = plan["windows"][0]
+    x = reframe.expr([(t, v) for t, v, _ in keys], 0, 0)
+    y = reframe.expr([(t, v) for t, _, v in keys], 0, 0)
+    return (
+        f"[0:v]crop={win_w}:{win_h}:'({x})-{win_w // 2}':'({y})-{win_h // 2}',"
+        f"scale={width}:{height},setsar=1[framed]"
+    )
+
+
+def fit_caption_margin_v(src_w: int, src_h: int,
+                         out_w: int = OUT_W, out_h: int = OUT_H) -> int:
+    """Caption baseline for the fit frame.
+
+    Same problem the podcast frame has: `fit` biases its video block upward, so
+    the lower bar is larger than the generic margin's "half the leftover height"
+    assumption. Using that formula put captions well above the middle of the bar
+    they are supposed to sit in.
+    """
+    fg_h = content_height(src_w, src_h, out_w, out_h) if src_w and src_h else out_h
+    top = max(0, min(out_h - fg_h, FIT_CONTENT_BIAS * out_h - fg_h / 2))
+    band_top = top + fg_h
+    band = max(out_h - band_top, 1)
+    floor = int(out_h * (PLATFORM_UI_FRACTION + CAPTION_LIFT))
+    return max(floor, int(out_h - (band_top + band * 0.45)))
 
 
 def fill_filter(width: int, height: int) -> str:
@@ -250,6 +427,7 @@ def render_clip(
     speed: float = None,
     speed_pitched: bool = False,
     background: str = None,
+    reframe_plan: dict = None,
 ) -> str:
     duration = max(end - start, 1)
     width, height = RATIOS.get(ratio, RATIOS["9:16"])
@@ -284,6 +462,14 @@ def render_clip(
         if not want_audio:
             src_a = None
 
+    # The zoom policy needs the real source dimensions; without them the frames
+    # that use it fall back to plain letterboxing. Probed once here because both
+    # `blur` and `fit` want it now.
+    try:
+        sw, sh = probe_dimensions(video_path)
+    except (subprocess.SubprocessError, ValueError, KeyError, IndexError):
+        sw = sh = None
+
     if gameplay_path:
         # -stream_loop -1 loops short gameplay files; the output -t caps length.
         gameplay_input_index = 2 if audio_override_path else 1
@@ -291,16 +477,18 @@ def render_clip(
         cmd_inputs.append(gameplay_path)
         filter_complex = split_filter(width, height, gameplay_input_index)
     elif frame == "fit":
-        filter_complex = fit_filter(width, height, background)
+        filter_complex = fit_filter(width, height, background, sw, sh)
+    elif frame == "podcast" and reframe_plan:
+        # Face-aware crop, which is the whole point of the podcast template.
+        filter_complex = smart_filter(reframe_plan, width, height)
+    elif frame == "podcast":
+        # No plan: detection found nothing trackable (a screen share, a wide
+        # stage shot, b-roll). The fixed letterbox is the honest answer there --
+        # a confident crop of footage with no subject in it is worse.
+        filter_complex = podcast_filter(width, height)
     elif frame == "fill":
         filter_complex = fill_filter(width, height)
     else:
-        # Pass the real source dimensions so the zoom policy can apply -- without
-        # them blur_filter falls back to plain letterboxing.
-        try:
-            sw, sh = probe_dimensions(video_path)
-        except (subprocess.SubprocessError, ValueError, KeyError, IndexError):
-            sw = sh = None
         filter_complex = blur_filter(width, height, sw, sh)
 
     if segments:
@@ -399,13 +587,42 @@ PROXY_WIDTH = 640           # enough to judge framing and read captions
 PROXY_CRF = 30              # small file; quality is irrelevant for a preview
 PROXY_KEYFRAME_SECONDS = 1  # dense keyframes so scrubbing lands where you drop it
 
+# How far either side of a clip the editor lets you scrub. The trim handles are
+# clamped to this window, so nothing outside it is reachable -- and therefore
+# nothing outside it is worth encoding. Must match CONTEXT in LiveEditor.jsx.
+PROXY_CONTEXT_SECONDS = 30
 
-def make_proxy(video_path: str, out_path: str) -> str:
+
+def proxy_window(start: float, end: float, duration: float = None) -> tuple:
+    """The (from, to) span of source the editor can actually reach for a clip."""
+    lo = max(0.0, float(start) - PROXY_CONTEXT_SECONDS)
+    hi = float(end) + PROXY_CONTEXT_SECONDS
+    if duration:
+        hi = min(hi, float(duration))
+    return lo, max(hi, lo + 1.0)
+
+
+def make_proxy(video_path: str, out_path: str,
+               start: float = None, end: float = None) -> str:
     """Writes a small, densely-keyframed preview copy of the source.
 
-    Runs AFTER the clips are delivered, never before -- it is an editing
-    convenience, and nobody should wait on it to see what they paid for.
+    `start`/`end` cut a window out of the source instead of copying all of it,
+    and that is the difference between the editor opening now and opening in
+    several minutes. The proxy used to transcode the whole video: a 16-minute
+    podcast re-encoded end to end so that someone could scrub a 45-second clip.
+    Everything outside the trim window is unreachable in the editor, so encoding
+    it bought nothing and cost all of the wait. The window is ~105s, so this is
+    roughly a tenth of the work and finishes while the clips are still rendering.
+
+    Written to a side file and swapped in atomically. This is not a nicety:
+    ffmpeg fills an mp4 progressively and only writes the moov atom at the very
+    end, so a half-finished preview is a file with a non-zero size that no
+    browser can decode. The editor's readiness check is "does this file exist",
+    so anyone who opened the editor during the encode got a lifted loading veil
+    over a permanently black, unseekable video. With the swap, the file does not
+    exist until it is playable.
     """
+    part_path = out_path + ".part"
     fps_probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", video_path],
@@ -417,17 +634,37 @@ def make_proxy(video_path: str, out_path: str) -> str:
     except (ValueError, ZeroDivisionError):
         fps = 30.0
     gop = max(1, int(round(fps * PROXY_KEYFRAME_SECONDS)))
+
+    # -ss BEFORE -i seeks by index rather than by decoding up to the mark, which
+    # on a 16-minute source is the difference between instant and a minute of
+    # throwaway decoding. Since we re-encode, output timestamps restart at zero:
+    # the proxy's t=0 is source time `start`, and the editor is told that offset.
+    seek = ["-ss", f"{max(0.0, float(start)):.3f}"] if start is not None else []
+    span = (["-t", f"{max(0.1, float(end) - float(start)):.3f}"]
+            if start is not None and end is not None else [])
+
     proc = subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path,
+        ["ffmpeg", "-y", *seek, "-i", video_path, *span,
          "-vf", f"scale={PROXY_WIDTH}:-2",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", str(PROXY_CRF),
          "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
          "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "96k",
          "-movflags", "+faststart",
-         out_path],
+         # Explicit, because the output is named .part: ffmpeg picks the muxer
+         # from the file extension and "Unable to choose an output format for
+         # preview.mp4.part" failed EVERY proxy the moment the atomic swap was
+         # introduced. That is why the editor sat on "Preparing the editor
+         # preview" indefinitely -- there was never a file coming.
+         "-f", "mp4",
+         part_path],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
         raise RuntimeError("proxy render failed:\n" + proc.stderr[-1200:])
+    os.replace(part_path, out_path)
     return out_path

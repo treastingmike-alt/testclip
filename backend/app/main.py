@@ -14,6 +14,7 @@ import os
 import uuid
 import subprocess
 import random
+import threading
 import traceback
 
 from fastapi import (BackgroundTasks, Depends, FastAPI, File, HTTPException,
@@ -29,8 +30,9 @@ from app import auth, billing, editing, workspace
 from app.db import SessionLocal, get_session, init_db
 from app.jobs import create_job, get_job, get_job_transcript, list_jobs, update_job
 from app.models import Clip, User
-from app.pipeline import (analyzer, censor, energy, downloader, pacing, render,
-                          scoring, subtitles, transcriber, voiceover)
+from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
+                          pacing, reframe, render, scoring, subtitles,
+                          transcriber, voiceover)
 
 app = FastAPI(title="Clipper API")
 
@@ -61,6 +63,10 @@ TEMPLATES = {
                  "label": "Business"},
     "gameplay": {"frame": "gameplay", "caption_style": "gameplay",
                  "label": "Gameplay"},
+    # Podcasts are a two-shot problem: the zoom every other template uses to
+    # fill the frame is exactly what crops the second person out of it.
+    "podcast":  {"frame": "podcast",  "caption_style": "podcast_clean",
+                 "label": "Podcast"},
 }
 
 
@@ -101,15 +107,27 @@ def caption_options():
     return {
         "fonts": [
             {"id": k, "label": v["label"], "family": v["family"],
-             "devanagari": v["devanagari"]}
+             "devanagari": v["devanagari"], "emoji": v.get("emoji", False)}
             for k, v in subtitles.FONTS.items()
         ],
+        # Whether an emoji typed into a caption or title will actually burn in.
+        # It reaches the subtitle file either way; libass silently draws nothing
+        # unless a face on the fallback path has the glyph. The editor showed
+        # emoji in the preview regardless, which is how "it was there while
+        # editing and gone after export" happened.
+        "emoji_supported": subtitles.emoji_font() is not None,
         "animations": [{"id": k, **v} for k, v in subtitles.ANIMATIONS.items()],
         "speed": {"min": render.MIN_SPEED, "max": render.MAX_SPEED},
         # Title looks are served rather than duplicated in the editor, for the
         # same reason as fonts: a look added here must not need a matching edit
         # on the frontend to become selectable.
         "title_styles": [
+            # "Off" is a first-class choice, not an absence. Burning a title in
+            # is irreversible, and plenty of people want the cut and the captions
+            # while writing their own hook in the platform's composer.
+            {"id": subtitles.TITLE_LOOK_OFF, "text": None, "edge": None,
+             "boxed": False},
+        ] + [
             {"id": k,
              # Enough for the editor to draw a faithful swatch without knowing
              # anything about ASS colour notation.
@@ -119,6 +137,11 @@ def caption_options():
             for k, v in subtitles.TITLE_LOOKS.items()
         ],
         "default_title_style": subtitles.DEFAULT_TITLE_LOOK,
+        # The caption presets, in browser terms. Served rather than mirrored so
+        # the picker's live previews are generated from the same definitions the
+        # renderer burns in -- the editor used to keep its own copy, and the two
+        # drifted on both colours and sizes.
+        **caption_presets.web_presets(),
     }
 
 
@@ -173,6 +196,9 @@ class JobRequest(BaseModel):
     intent: str = ""                # free-text steer, e.g. "when he talks about pricing"
     tighten_pauses: bool = True     # cut dead air so the clip does not feel merely trimmed
     auto_censor: bool = True        # mute profanity and star it in captions
+    # Transcribe speech that switches language mid-sentence with the model that
+    # can follow it. Off by default and gated on the plan -- see billing.allows.
+    multilingual: bool = False
 
 
 class Credentials(BaseModel):
@@ -242,7 +268,11 @@ def on_startup():
           f"youtube session: {_dl.cookie_source()}")
     removed = workspace.purge_old_jobs(STORAGE_DIR)
     if removed:
-        print(f"[clipper] removed {removed} job folder(s) older than 48h")
+        # The window is configurable (CLIPPER_RETENTION_HOURS) and this line used
+        # to say a hardcoded "48h" regardless -- so the log confidently reported
+        # the wrong number for the one event that destroys a user's clips.
+        print(f"[clipper] removed {removed} job folder(s) older than "
+              f"{workspace.DEFAULT_MAX_AGE_HOURS}h")
 
 
 @app.post("/auth/register")
@@ -281,7 +311,8 @@ def plans():
     return {
         "plans": billing.PLANS,
         "topups": billing.TOPUPS,
-        "seconds_per_credit": billing.SECONDS_PER_CREDIT,
+        "credits_per_clip": billing.CREDITS_PER_CLIP,
+        "max_source_minutes": billing.MAX_SOURCE_MINUTES,
     }
 
 
@@ -290,15 +321,27 @@ def billing_me(user: User = Depends(auth.current_user_required)):
     return {
         "credits": billing.balance(user.id),
         "plan": user.plan,
+        # What this plan unlocks, so the UI can show a locked control with the
+        # reason rather than hiding it -- a feature nobody can see is a feature
+        # nobody upgrades for. Sent as a list so adding one needs no client
+        # change beyond using it.
+        "entitlements": sorted(billing.entitlements_for(user.plan, user.email)),
+        "is_admin": billing.is_admin(user.email),
         "history": billing.history(user.id),
     }
 
 
 @app.post("/billing/estimate")
 def estimate(body: dict):
-    """Credits a video would cost, for showing a price before committing."""
-    seconds = float(body.get("duration_seconds") or 0)
-    return {"credits": billing.credits_for(seconds)}
+    """Credits a run would cost, for showing a price before committing.
+
+    Takes a clip count now rather than a duration. `duration_seconds` is still
+    accepted and ignored so an older client asking the old question gets a
+    correct answer for the default clip count instead of an error.
+    """
+    n_clips = int(body.get("n_clips") or 1)
+    return {"credits": billing.credits_for_clips(n_clips),
+            "credits_per_clip": billing.CREDITS_PER_CLIP}
 
 
 class CheckoutRequest(BaseModel):
@@ -351,7 +394,16 @@ def checkout(body: CheckoutRequest, user: User = Depends(auth.current_user_requi
 
 @app.get("/auth/me")
 def me(user: User = Depends(auth.current_user_required)):
-    return {"id": user.id, "email": user.email, "credits": user.credits}
+    # `entitlements` rides along here rather than only on /billing/me because
+    # this is what the app loads on boot, and the clip-creation form needs to
+    # know what the plan unlocks before it can render its controls correctly.
+    return {"id": user.id, "email": user.email, "credits": user.credits,
+            "plan": user.plan,
+            "entitlements": sorted(billing.entitlements_for(user.plan, user.email)),
+            # So the UI can say WHY a paid control is unlocked on an account
+            # whose plan is free -- otherwise testing the paid experience looks
+            # identical to a billing bug.
+            "is_admin": billing.is_admin(user.email)}
 
 
 @app.get("/jobs")
@@ -363,6 +415,10 @@ class CaptionLine(BaseModel):
     start: float
     end: float
     text: str
+    # Whether the user actually rewrote this line. Only rewritten text loses its
+    # per-word timings; untouched lines keep the real ones. Defaults True so
+    # recipes saved before this field existed behave exactly as they did.
+    edited: bool = True
 
 
 class ClipEdit(BaseModel):
@@ -430,18 +486,27 @@ def job_gameplay(job_id: str):
 
 
 @app.api_route("/jobs/{job_id}/preview", methods=["GET", "HEAD"])
-def job_preview(job_id: str, request: Request):
+def job_preview(job_id: str, request: Request, clip: int = None):
     """Streams the editor proxy with HTTP range support.
 
     Range support is not optional here -- without it a browser cannot seek, and
     the whole point of the proxy is scrubbing.
+
+    `clip` selects that clip's own windowed proxy, which is what current jobs
+    build. Jobs made before windowing fall back to the whole-source preview.mp4,
+    so opening an old job still works; its offset is simply zero.
 
     HEAD is declared explicitly. FastAPI, unlike bare Starlette, does NOT add it
     alongside GET, so the editor's "is the proxy ready yet?" poll was getting 405
     forever and the loading veil never lifted -- over a video that was in fact
     playing underneath it.
     """
-    path = os.path.join(STORAGE_DIR, job_id, "preview.mp4")
+    job_dir = os.path.join(STORAGE_DIR, job_id)
+    path = os.path.join(job_dir, "preview.mp4")
+    if clip is not None:
+        windowed = os.path.join(job_dir, f"preview_{clip}.mp4")
+        if os.path.exists(windowed):
+            path = windowed
     if not os.path.exists(path):
         raise HTTPException(
             status_code=404,
@@ -703,16 +768,39 @@ def submit_job(req: JobRequest, background_tasks: BackgroundTasks,
     # clear message instead of dying mid-pipeline after download+transcription.
     gameplay_loops = _gameplay_loops() if tpl["frame"] == "gameplay" else []
 
-    # The real cost is not known until the video is transcribed, so the gate here
-    # is only "has any credit at all". The exact amount is charged once the true
-    # duration is known, and the job is stopped there if it does not cover it.
-    if user and billing.balance(user.id) < billing.MIN_CHARGE:
+    # Per-clip pricing means the price of what was ASKED for is known up front,
+    # so the gate can be exact instead of "has any credit at all". Charged for
+    # real once the analysis settles the actual clip count, which may be lower.
+    if user:
+        want = billing.credits_for_clips(req.n_clips)
+        have = billing.balance(user.id)
+        if have < want:
+            raise HTTPException(
+                status_code=402,
+                detail=(f"{req.n_clips} clips cost {want} credits and you have "
+                        f"{have}. Ask for fewer clips, top up, or upgrade."),
+            )
+
+    # Paid capability, enforced here rather than trusted from the client. The UI
+    # hides the control for free accounts, but hiding a control is presentation,
+    # not a gate -- the request can still arrive with the flag set.
+    if req.multilingual and not billing.allows(user.plan if user else None,
+                                               "multilingual",
+                                               user.email if user else None):
         raise HTTPException(
             status_code=402,
-            detail="You're out of credits. Top up or upgrade your plan to keep clipping.",
+            detail="Multilingual captions are on the Creator and Pro plans. "
+                   "They transcribe speech that switches between languages "
+                   "mid-sentence, which the standard model transcribes as noise.",
         )
 
-    job_id = create_job(req.url, req.dict(), user_id=user.id if user else None)
+    # The template's frame mode is resolved once, here, and stored with the job.
+    # The editor has to preview the same composition the renderer builds, and it
+    # was inferring that from the template name -- so every template added since
+    # was silently previewed as `blur`, whatever it actually renders as.
+    options = req.dict()
+    options["frame"] = TEMPLATES.get(req.template, TEMPLATES["classic"])["frame"]
+    job_id = create_job(req.url, options, user_id=user.id if user else None)
     background_tasks.add_task(run_pipeline, job_id, req, gameplay_loops,
                               user.id if user else None)
     return {"job_id": job_id}
@@ -732,6 +820,34 @@ def get_clip_file(job_id: str, filename: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Clip not found")
     return FileResponse(path, media_type="video/mp4")
+
+
+def _build_proxies_quietly(job_id: str, video_path: str, job_dir: str,
+                           clips: list, duration: float = None) -> None:
+    """Builds one scrubbing proxy per clip, on a background thread.
+
+    One proxy per clip, not one for the job. The editor only ever exposes a
+    ~105s window around a clip (its trim handles are clamped to it), so a
+    whole-source proxy spent minutes encoding footage nobody could reach --
+    which is why the editor sat on "Preparing the editor preview" long after
+    the clips were done.
+
+    Clips are done in order, so clip 1 -- the one people open first -- is
+    playable within seconds of its own render finishing. A failed proxy costs
+    live editing for that clip and nothing else, so failure is swallowed per
+    clip: this runs unsupervised while the real render is in flight and must
+    never take the deliverable down with it.
+    """
+    for i, clip in enumerate(clips, start=1):
+        lo, hi = render.proxy_window(clip["start"], clip["end"], duration)
+        out_path = os.path.join(job_dir, f"preview_{i}.mp4")
+        try:
+            render.make_proxy(video_path, out_path, start=lo, end=hi)
+            print(f"[clipper] editor preview ready for {job_id} clip {i} "
+                  f"({lo:.0f}s-{hi:.0f}s)")
+        except (RuntimeError, OSError) as e:
+            print(f"[clipper] proxy for {job_id} clip {i} failed (live editing "
+                  f"unavailable for it): {e}")
 
 
 def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
@@ -755,7 +871,17 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
 
         update_job(job_id, status="transcribing",
                    progress_message="Transcribing speech with Deepgram...", percent=0)
-        transcript_json = transcriber.transcribe(audio_path)
+        # The pricier model is asked for, not inferred. Tying it to the podcast
+        # template was the wrong proxy: code-switching is a property of how
+        # people SPEAK, not of the layout picked for them -- a bilingual
+        # commentary video needs it and is not a podcast.
+        # Diarization stays tied to the frame, because only the podcast
+        # reframing reads speaker labels.
+        transcript_json = transcriber.transcribe(
+            audio_path,
+            multilingual=bool(req.multilingual),
+            diarize=tpl["frame"] == "podcast",
+        )
         utterances = transcriber.get_utterances(transcript_json)
         if not utterances:
             raise RuntimeError(
@@ -767,24 +893,18 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         source_seconds = utterances[-1]["end"] if utterances else 0
         update_job(job_id, transcript=transcript_json, source_duration=source_seconds)
 
-        # Metered on source length, since transcription and analysis both scale
-        # with it. Anonymous jobs are free while metering is unenforced.
-        if job_user_id:
-            cost = billing.credits_for(source_seconds)
-            if not billing.charge(job_user_id, cost, job_id=job_id,
-                                  note=f"{source_seconds/60:.0f} min video"):
-                # Stop before rendering -- that is where the real compute is, and
-                # handing over clips that were never paid for is the one failure
-                # mode worth being strict about.
-                have = billing.balance(job_user_id)
-                update_job(
-                    job_id, status="failed",
-                    error=(f"This video needs {cost} credits "
-                           f"({source_seconds/60:.0f} min) and you have {have}. "
-                           f"Top up and run it again -- you were not charged."),
-                )
-                workspace.clear_intermediates(job_dir)
-                return
+        # Source length no longer sets the price, but it still sets OUR cost, so
+        # it is the one thing per-clip pricing has to bound. Rejected here,
+        # after transcription has revealed the true duration.
+        if source_seconds > billing.MAX_SOURCE_MINUTES * 60:
+            update_job(
+                job_id, status="failed",
+                error=(f"This video is {source_seconds/3600:.1f} hours long, over "
+                       f"the {billing.MAX_SOURCE_MINUTES // 60}-hour limit. "
+                       f"Clip a section of it instead -- you were not charged."),
+            )
+            workspace.clear_intermediates(job_dir)
+            return
 
         # Prosody: how lines were delivered, which the transcript cannot show.
         update_job(job_id, status="analyzing",
@@ -815,6 +935,25 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
             )
         resolved_clips = [analyzer.resolve_clip_times(c, utterances) for c in raw_clips]
 
+        # Charged here, not earlier: the price is per clip, and only now is the
+        # real number known. Asking for 5 and being handed 3 costs 3 -- billing
+        # for clips the analysis could not find would make the per-clip promise
+        # a lie. Still ahead of the render, which is where the compute goes.
+        # Anonymous jobs are free while metering is unenforced.
+        if job_user_id:
+            cost = billing.credits_for_clips(len(resolved_clips))
+            if not billing.charge(job_user_id, cost, job_id=job_id,
+                                  note=f"{len(resolved_clips)} clip(s)"):
+                have = billing.balance(job_user_id)
+                update_job(
+                    job_id, status="failed",
+                    error=(f"These {len(resolved_clips)} clips need {cost} credits "
+                           f"and you have {have}. Top up and run it again -- "
+                           f"you were not charged."),
+                )
+                workspace.clear_intermediates(job_dir)
+                return
+
         update_job(job_id, status="rendering",
                    progress_message="Checking disk space...", percent=0)
         workspace.ensure_space(job_dir, downloader.estimate_video_bytes(req.url))
@@ -828,12 +967,34 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
             ),
         )
 
+        # Start the editor proxies NOW, alongside clip rendering, instead of
+        # after it. The trim/caption editor is useless without them, and building
+        # them last meant the editor was dead at exactly the moment people open
+        # it -- when their clips have just appeared. These are 640px veryfast
+        # encodes of ~105s each, so they cost a background core, not the clips'
+        # latency. Nothing waits on this thread: if it loses the race the editor
+        # shows its "preparing" state for that clip, which is the truth.
+        proxy_thread = threading.Thread(
+            target=_build_proxies_quietly,
+            args=(job_id, video_path, job_dir,
+                  [{"start": c["start"], "end": c["end"]} for c in resolved_clips],
+                  source_seconds),
+            daemon=True,
+        )
+        proxy_thread.start()
+
         out_w, out_h = render.RATIOS.get(req.ratio, render.RATIOS["9:16"])
         if gameplay_loops:
             margin_v = render.split_caption_margin_v(out_h)
         else:
             src_w, src_h = render.probe_dimensions(video_path)
-            margin_v = render.caption_margin_v(src_w, src_h, out_w, out_h)
+            # The podcast and fit frames sit their video high, so the generic
+            # margin -- which assumes equal bands -- would strand captions in
+            # the corner of the taller band underneath.
+            place = {"podcast": render.podcast_caption_margin_v,
+                     "fit": render.fit_caption_margin_v}.get(
+                         tpl["frame"], render.caption_margin_v)
+            margin_v = place(src_w, src_h, out_w, out_h)
 
         results = []
         total = len(resolved_clips)
@@ -845,6 +1006,26 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
             )
             subtitle_path = None
             audio_override = None
+
+            # Where the people actually are in THIS clip. Per clip rather than
+            # per job: a podcast cuts between a two-shot and a single, so one
+            # plan for the whole source would frame most of the clips wrongly.
+            # None is a normal answer -- see reframe.plan.
+            clip_plan = None
+            clip_margin_v = margin_v
+            if tpl["frame"] == "podcast":
+                # Broad except on purpose. Reframing is an ENHANCEMENT -- the
+                # template renders without it -- so no failure in detection is
+                # worth losing a job the user has already paid to transcribe.
+                try:
+                    clip_plan = reframe.plan(video_path, clip["start"],
+                                             clip["end"], out_w, out_h)
+                except Exception as exc:
+                    print(f"[clipper] clip {i}: reframing failed ({exc}); "
+                          "falling back to the fixed podcast frame")
+                if clip_plan:
+                    print(f"[clipper] clip {i}: reframing as {clip_plan['mode']}")
+                    clip_margin_v = render.smart_caption_margin_v(clip_plan, out_h)
 
             # Dead air is what makes a clip feel trimmed rather than edited, so
             # this is on by default. Captions must use the remapped timings or
@@ -872,7 +1053,7 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                     subtitle_path = os.path.join(job_dir, f"clip_{i}.ass")
                     subtitles.build_ass(caption_words,
                                         0.0 if segments else clip["start"], subtitle_path,
-                                        margin_v, style=tpl["caption_style"],
+                                        clip_margin_v, style=tpl["caption_style"],
                                         play_res=(out_w, out_h),
                                         title=clip.get("title", ""),
                                         keywords=clip.get("keywords"))
@@ -901,6 +1082,7 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 frame=tpl["frame"],
                 segments=segments,
                 mute_spans=mute_spans,
+                reframe_plan=clip_plan,
             )
 
             # Raw scores rank the clips; these are what gets shown. The mapping
@@ -924,16 +1106,6 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         reclaimed = workspace.clear_intermediates(job_dir)
 
         update_job(job_id, status="done", progress_message="Done", percent=100, clips=results)
-
-        # The editor proxy is built only now, with the job already marked done.
-        # It is an editing convenience: making anyone stare at a progress bar
-        # for it, after their clips already exist, is indefensible.
-        try:
-            render.make_proxy(video_path, os.path.join(job_dir, "preview.mp4"))
-            print(f"[clipper] editor preview ready for {job_id}")
-        except (RuntimeError, OSError) as e:
-            print(f"[clipper] proxy generation failed (live editing unavailable "
-                  f"for this job): {e}")
         print(f"[clipper] job {job_id} done, reclaimed {workspace.human(reclaimed)}")
 
     except Exception as e:

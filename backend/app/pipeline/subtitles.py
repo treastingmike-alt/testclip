@@ -142,6 +142,72 @@ def _has_devanagari(path: str) -> bool:
         return False
 
 
+def _covers(path: str, codepoint: int) -> bool:
+    """Whether this face can actually DRAW a codepoint through libass.
+
+    A cmap entry is not enough, and believing it was is how the editor came to
+    promise emoji that the export dropped. Noto Color Emoji maps U+1F600 and
+    then stores the picture in a COLRv1 table, leaving the base outline empty
+    (`numberOfContours == 0`); the FreeType libass is built against here does not
+    composite COLRv1, so it finds the glyph, draws nothing, and reports no error.
+    Apple Color Emoji fails the same way for a different reason -- `sbix`
+    bitmaps this FreeType will not rasterise.
+
+    So the test is "is there something a rasteriser can put on screen": real
+    outlines (glyf contours or CFF), or a bitmap strike in a format this build
+    does read. A monochrome emoji face such as Noto Emoji passes and burns in.
+    """
+    try:
+        from fontTools.ttLib import TTFont, TTCollection
+        f = (TTCollection(path).fonts[0] if path.lower().endswith(".ttc")
+             else TTFont(path, fontNumber=0, lazy=True))
+        name = None
+        for t in f["cmap"].tables:
+            if t.isUnicode() and codepoint in t.cmap:
+                name = t.cmap[codepoint]
+                break
+        if name is None:
+            return False
+        if "CFF " in f or "CFF2" in f:
+            return True
+        if "CBDT" in f:                     # colour bitmaps FreeType can read
+            return True
+        glyf = f.get("glyf")
+        if glyf is None:
+            return False
+        g = glyf[name]
+        # Composite glyphs report -1 and are perfectly drawable.
+        return g.numberOfContours != 0
+    except Exception:
+        return False
+
+
+# Emoji burn-in is a font problem, not a text problem.
+#
+# The emoji survives everything we do: it reaches the .ass file as a literal
+# character. libass then reports
+#     Glyph 0x1F62D not found ... failed to find any fallback
+# and draws nothing. macOS ships Apple Color Emoji as an `sbix` bitmap font, and
+# the FreeType that libass (and Pillow) are built against here cannot rasterise
+# sbix -- Pillow refuses the same file with "invalid pixel size". So there is no
+# emoji-capable face on the fallback path at all.
+#
+# The fix is a font, not code: drop an emoji TTF that FreeType can read into
+# assets/fonts -- Noto Emoji (plain outlines) always works, Noto Color Emoji
+# (CBDT) works on most builds. This looks for one and reports whether captions
+# can honestly promise emoji, so the editor can stop previewing something the
+# export silently drops.
+EMOJI_PROBE = 0x1F600           # GRINNING FACE, present in every emoji font
+
+
+def emoji_font() -> dict:
+    """The shipped face that can draw emoji, or None if there is none."""
+    for entry in FONTS.values():
+        if entry.get("emoji"):
+            return entry
+    return None
+
+
 def _discover_fonts() -> dict:
     """Every font in assets/fonts, keyed by a slug derived from its filename.
 
@@ -168,6 +234,7 @@ def _discover_fonts() -> dict:
             "label": label,
             "file": name,
             "devanagari": _has_devanagari(path),
+            "emoji": _covers(path, EMOJI_PROBE),
         }
     return found
 
@@ -175,7 +242,7 @@ def _discover_fonts() -> dict:
 FONTS = {
     # The system face the classic style was designed around; not a shipped file.
     "impact": {"family": "Arial Black", "label": "Impact",
-               "file": None, "devanagari": False},
+               "file": None, "devanagari": False, "emoji": False},
 }
 FONTS.update(_discover_fonts())
 
@@ -209,45 +276,14 @@ MIN_WORD_SECONDS = 0.12        # floor so very fast words still register
 # BorderStyle 3 is what makes a box possible at all: it renders the outline as
 # a filled rectangle using OutlineColour, so an alpha-FF outline on the base
 # style plus a per-word override gives a chip behind only the active word.
-STYLES = {
-    "classic": {
-        "font": "Arial Black", "size": 76,
-        "base": "&H00FFFFFF", "active": "&H004EF2D8",       # lime accent
-        "outline": 5, "uppercase": False, "active_scale": 100,
-        "position": "bottom", "box": "none", "keyword": "&H0000A5FF",
-    },
-    "fitbox": {
-        # White text, blue chip travelling under the spoken word.
-        "font": "Arial Black", "size": 66,
-        "base": "&H00FFFFFF", "active": "&H00FFFFFF",
-        "outline": 14, "uppercase": False, "active_scale": 100,
-        "position": "bottom", "box": "word", "box_color": "&H00F66C2B",
-        # amber, deliberately unlike the blue chip so the two signals stay separate
-        "keyword": "&H0000A5FF",
-    },
-    "tech": {
-        # Sits across the middle of the frame, no plate, soft cyan highlight.
-        "font": "Arial Black", "size": 80,
-        "base": "&H00FFFFFF", "active": "&H00FFE9BF",
-        "outline": 4, "uppercase": False, "active_scale": 100,
-        "position": "middle", "box": "none", "keyword": "&H00FFC34F",
-    },
-    "business": {
-        # Dark text on a solid light plate -- the clean corporate look.
-        "font": "Arial Black", "size": 58,
-        "base": "&H00807A72", "active": "&H001E1A1A",
-        "outline": 18, "uppercase": False, "active_scale": 100,
-        "position": "lower", "box": "line", "box_color": "&H00F5F3EF",
-        "keyword": "&H002020C8",
-    },
-    "gameplay": {
-        # Loud caps for split-screen, where the caption competes with motion.
-        "font": "Arial Black", "size": 84,
-        "base": "&H00FFFFFF", "active": "&H003AD43A",
-        "outline": 6, "uppercase": True, "active_scale": 118,
-        "position": "bottom", "box": "none", "keyword": "&H0000D4FF",
-    },
-}
+from app.pipeline import caption_presets
+from app.pipeline.caption_presets import ACTIVE_EFFECTS, PRESETS   # noqa: F401
+
+# The registry moved to caption_presets so the editor can be served the same
+# definitions instead of keeping a hand-written copy. STYLES stays as the name
+# the rest of the pipeline already imports.
+STYLES = PRESETS
+
 
 # Alignment codes: 2 = bottom-centre, 5 = middle-centre.
 POSITIONS = {
@@ -279,12 +315,60 @@ def _escape(text: str) -> str:
     return text.replace("\\", "∖").replace("{", "(").replace("}", ")")
 
 
+# Codepoints that live in an emoji face rather than a text face. Rough on
+# purpose: the cost of a false positive is one glyph drawn from the emoji font,
+# which is where it would have come from anyway.
+def _is_emoji(ch: str) -> bool:
+    o = ord(ch)
+    return (0x1F300 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF
+            or 0x1F000 <= o <= 0x1F2FF or o in (0x2B50, 0x2B55, 0xFE0F))
+
+
+def emoji_spans(text: str) -> str:
+    """Names the emoji face around emoji runs, because fallback will not find it.
+
+    libass only consults `fontsdir` for fonts requested BY NAME. Its fallback
+    search -- the path taken when the styled face lacks a glyph -- goes through
+    fontconfig's system font list, which knows nothing about assets/fonts. So a
+    perfectly good emoji font sitting next to the caption fonts still produced
+    "failed to find any fallback with glyph 0x1F600" and drew nothing.
+
+    Naming the face in an override block puts it on the path libass does honour.
+    With no drawable emoji face installed this is a no-op and the text is left
+    exactly as it was.
+    """
+    face = emoji_font()
+    if not face or not any(_is_emoji(c) for c in text):
+        return text
+    out, run = [], []
+
+    def flush_emoji():
+        if run:
+            out.append("{\\fn%s}%s{\\r}" % (face["family"], "".join(run)))
+            run.clear()
+
+    for ch in text:
+        if _is_emoji(ch):
+            run.append(ch)
+        else:
+            flush_emoji()
+            out.append(ch)
+    flush_emoji()
+    return "".join(out)
+
+
 def _word_text(word: dict) -> str:
     return word.get("punctuated_word") or word.get("word") or ""
 
 
-def group_words(words: list) -> list:
-    """Chunks words into cues, breaking on length, duration, or sentence end."""
+def group_words(words: list, max_words: int = None) -> list:
+    """Chunks words into cues, breaking on length, duration, or sentence end.
+
+    `max_words` comes from the preset: a Hormozi look is defined by showing two
+    or three words at a time, and a podcast look by showing a readable sentence.
+    That is the same axis, so it belongs to the preset rather than to a constant.
+    """
+    limit = max_words or MAX_WORDS_PER_CUE
     cues = []
     current = []
 
@@ -294,13 +378,60 @@ def group_words(words: list) -> list:
         span = current[-1]["end"] - current[0]["start"]
 
         ends_sentence = text.endswith((".", "!", "?"))
-        if len(current) >= MAX_WORDS_PER_CUE or span >= MAX_CUE_SECONDS or ends_sentence:
+        if len(current) >= limit or span >= MAX_CUE_SECONDS or ends_sentence:
             cues.append(current)
             current = []
 
     if current:
         cues.append(current)
     return cues
+
+
+# ---------------------------------------------------------------------------
+# Active-word effects
+# ---------------------------------------------------------------------------
+# Inline ASS overrides applied to the one word currently being spoken. Each
+# event is emitted at the exact moment its word becomes active, so \t timings
+# are relative to that instant and read as a per-word animation.
+#
+# GRADIENT_RAMP exists because ASS has no gradient fill. A per-word colour ramp
+# across the cue is the honest approximation available in libass; it reads as a
+# colour sweep on a 3-4 word cue, which is where the look is used.
+GRADIENT_RAMP = ["&H00F04080", "&H00E060D0", "&H00D080F0", "&H00F0D060"]
+
+
+def _active_override(st: dict, word_index: int = 0) -> str:
+    """The override block that marks the spoken word, minus the braces."""
+    effect = st.get("active_effect", "color")
+    active = st["active"]
+    scale = st.get("active_scale", 100)
+
+    if effect == "gradient":
+        colour = GRADIENT_RAMP[word_index % len(GRADIENT_RAMP)]
+        return f"\\c{colour}&"
+
+    tags = f"\\c{active}&"
+
+    if effect == "scale" or (effect == "color" and scale != 100):
+        s = scale if scale != 100 else 115
+        tags += f"\\fscx{s}\\fscy{s}"
+    elif effect == "pop":
+        # Overshoot then settle. Two \t segments rather than one, because a
+        # single interpolation to the final size reads as a slow grow, not a pop.
+        tags += "\\fscx88\\fscy88\\t(0,70,\\fscx118\\fscy118)\\t(70,150,\\fscx104\\fscy104)"
+    elif effect == "underline":
+        tags += "\\u1"
+    elif effect == "glow":
+        # A blurred outline in the accent colour IS the glow -- libass has no
+        # separate shadow-colour blur. Needs BorderStyle 1, which every glow
+        # preset has (box="none"), or the blur would fill a solid plate instead.
+        tags += f"\\3c{active}&\\3a&H40&\\bord{st.get('outline', 5) + 7}\\blur7"
+    elif effect == "marker":
+        # Turn the transparent base box opaque for this word only.
+        chip = st.get("box_color") or active
+        tags += f"\\3c{chip}&\\3a&H00&"
+
+    return tags
 
 
 def _header(margin_v: int, st: dict, play_res: tuple,
@@ -322,6 +453,17 @@ def _header(margin_v: int, st: dict, play_res: tuple,
         border_style = 3
         outline_colour = st["box_color"] if box == "line" else BOX_TRANSPARENT
 
+    # PrimaryColour is what \k fills TO and SecondaryColour what it fills FROM.
+    # Every other effect wants both to be the resting colour; the progress fill
+    # is the one look where they must differ, because that gap IS the effect.
+    primary = secondary = st["base"]
+    if st.get("active_effect") == "progress":
+        primary, secondary = st["active"], st["base"]
+
+    shadow = st.get("shadow", 0)
+    spacing = st.get("spacing", 0)
+    angle = st.get("rotate", 0)
+
     return f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {res_x}
@@ -331,7 +473,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,{st["font"]},{st["size"]},{st["base"]},{st["base"]},{outline_colour},&H00000000,-1,0,0,0,100,100,0,0,{border_style},{st["outline"]},0,{alignment},60,60,{margin_v},1
+Style: Caption,{st["font"]},{st["size"]},{primary},{secondary},{outline_colour},&H80000000,-1,0,0,0,100,100,{spacing},{angle},{border_style},{st["outline"]},{shadow},{alignment},60,60,{margin_v},1
 Style: Title,{ts["font"]},{ts["size"]},{ts["colour"]},{ts["colour"]},{ts["edge"]},&H00000000,-1,0,0,0,100,100,0,0,{ts["border_style"]},{ts["outline"]},{ts["shadow"]},8,90,90,60,1
 
 [Events]
@@ -404,22 +546,123 @@ def title_look(name: str = None, font: str = None) -> dict:
     }
 
 
-def _title_events(title: str, play_res: tuple) -> str:
+# The title card is a default, not a requirement. Plenty of people want the cut
+# and the captions but intend to write their own hook in the platform's composer,
+# or to title it in their own editor -- and burning one in is irreversible.
+TITLE_LOOK_OFF = "none"
+
+
+def _title_events(title: str, play_res: tuple, title_style: str = None) -> str:
     """A title card pinned near the top for the opening seconds.
 
     Reference clips from finished tools nearly always open with one: it gives
     the viewer the premise before the speaker gets there, which is most of why
     they feel edited rather than merely cut.
     """
-    if not title:
+    if not title or title_style == TITLE_LOOK_OFF:
         return ""
     res_y = play_res[1]
     margin = int(res_y * TITLE_STYLE["top_frac"])
     end = _ass_time(TITLE_STYLE["seconds"])
-    text = _escape(title.strip())
+    # The title is one event with no per-word overrides, so naming the emoji
+    # face inside it cannot disturb anything else. (Caption events carry
+    # karaoke colour overrides that an \r would reset, so they are left alone
+    # until that interaction is worked out.)
+    text = emoji_spans(_escape(title.strip()))
     # \an8 = top-centre, independent of the caption style's own alignment.
     return (f"Dialogue: 0,0:00:00.00,{end},Title,,0,0,{margin},,"
             f"{{\\an8}}{text}\n")
+
+
+def _keyworded(rendered: list, cue: list, key_set: set, st: dict) -> str:
+    """Cue text with the clip's keywords coloured, nothing else marked."""
+    parts = []
+    for j, token in enumerate(rendered):
+        bare = _word_text(cue[j]).strip(".,!?;:।").lower()
+        if bare and bare in key_set:
+            parts.append(f"{{\\c{st.get('keyword', st['active'])}&}}{token}{{\\r}}")
+        else:
+            parts.append(token)
+    return " ".join(parts)
+
+
+def _phrase_event(rendered: list, cue: list, key_set: set, st: dict,
+                  start: float, end: float, entrance: str, cue_ms: int,
+                  play_res: tuple, margin_v: int) -> str:
+    """One Dialogue for a whole chunk -- the Hormozi/MrBeast cadence.
+
+    A phrase preset is defined by replacement, not accumulation: two or three
+    words land together, hold, and are gone. Emitting the usual per-word events
+    here would put a travelling highlight on text the viewer finished reading
+    before the second word was spoken.
+    """
+    text = _keyworded(rendered, cue, key_set, st)
+    if entrance and entrance != "none":
+        tags = animation_tags(entrance, cue_ms, play_res, margin_v)
+        if tags:
+            text = "{" + tags + "}" + text
+    return f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{text}"
+
+
+# A character reveal is one Dialogue per step, so an unbounded step count would
+# put thousands of events in a file for no visible gain. 45ms is around the
+# fastest reveal that still reads as typing rather than as a cut.
+TYPEWRITER_STEP_SECONDS = 0.045
+MAX_TYPEWRITER_STEPS = 64
+
+
+def _typewriter_events(rendered: list, st: dict,
+                       start: float, end: float) -> list:
+    """Characters appearing one at a time across the cue's own span.
+
+    Timed across the cue rather than per word: the reveal has to finish by the
+    time the chunk is replaced, and pinning each character to a word's timing
+    would make the rate lurch with the speaker's pace.
+    """
+    full = " ".join(rendered)
+    span = end - start
+    if span <= 0 or not full:
+        return []
+
+    steps = min(len(full), MAX_TYPEWRITER_STEPS,
+                max(1, int(span / TYPEWRITER_STEP_SECONDS)))
+    events = []
+    for k in range(1, steps + 1):
+        cut = max(1, round(len(full) * k / steps))
+        t0 = start + span * (k - 1) / steps
+        # The final step holds until the cue ends; the rest last one step each.
+        t1 = end if k == steps else start + span * k / steps
+        if t1 <= t0:
+            continue
+        events.append(
+            f"Dialogue: 0,{_ass_time(t0)},{_ass_time(t1)},Caption,,0,0,0,,{full[:cut]}"
+        )
+    return events
+
+
+def _progress_event(rendered: list, cue: list, st: dict, clip_start_time: float,
+                    start: float, end: float, entrance: str, cue_ms: int,
+                    play_res: tuple, margin_v: int) -> str:
+    r"""One Dialogue using \kf, libass's native left-to-right fill.
+
+    \kf durations are centiseconds and are consumed in sequence from the line's
+    own start, so they must be built from the words' real gaps -- a word that
+    starts late needs the preceding one's fill to stretch, or the sweep drifts
+    ahead of the voice within a couple of words.
+    """
+    parts = []
+    for j, token in enumerate(rendered):
+        w_start = cue[j]["start"] - clip_start_time
+        w_end = (cue[j + 1]["start"] - clip_start_time
+                 if j + 1 < len(cue) else end)
+        cs = max(1, int(round((w_end - w_start) * 100)))
+        parts.append(f"{{\\kf{cs}}}{token}")
+    text = " ".join(parts)
+    if entrance and entrance != "none":
+        tags = animation_tags(entrance, cue_ms, play_res, margin_v)
+        if tags:
+            text = "{" + tags + "}" + text
+    return f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{text}"
 
 
 def build_ass(words: list, clip_start_time: float, out_path: str,
@@ -446,17 +689,59 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
     lines = [_header(margin_v, st, play_res, title_style, title_font)]
-    lines.append(_title_events(title, play_res))
+    lines.append(_title_events(title, play_res, title_style))
 
     # Keywords stay coloured for the whole cue, independent of the karaoke
     # highlight. Reference clips from finished tools use this to make the point
     # of a line readable at a glance, even when paused mid-scroll.
     key_set = {k.strip().lower() for k in (keywords or []) if k and k.strip()}
 
-    for cue in group_words(words):
+    cues = list(group_words(words, st.get("max_words")))
+    mode = st.get("mode", "karaoke")
+    effect = st.get("active_effect", "color")
+
+    for ci, cue in enumerate(cues):
         rendered = [_escape(_word_text(w)) for w in cue]
         if st["uppercase"]:
             rendered = [t.upper() for t in rendered]
+
+        # Where the following cue takes over. The last word of this cue must not
+        # outlive it, or two different lines are on screen at once.
+        next_cue_start = (cues[ci + 1][0]["start"] - clip_start_time
+                          if ci + 1 < len(cues) else None)
+
+        cue_start = cue[0]["start"] - clip_start_time
+        cue_end = cue[-1]["end"] - clip_start_time
+        if next_cue_start is not None:
+            cue_end = min(cue_end, next_cue_start)
+        cue_ms = int(max(0.0, cue_end - cue_start) * 1000)
+        entrance = animation or st.get("entrance")
+
+        # -- phrase mode ---------------------------------------------------
+        # The whole chunk appears at once and is replaced by the next one. No
+        # per-word marking: with two or three words on screen the eye has already
+        # read all of them before the second is spoken, so a travelling highlight
+        # adds motion without adding information.
+        if mode == "phrase":
+            lines.append(_phrase_event(rendered, cue, key_set, st, cue_start,
+                                       cue_end, entrance, cue_ms, play_res,
+                                       margin_v))
+            continue
+
+        # -- typewriter mode -----------------------------------------------
+        if mode == "typewriter":
+            lines.extend(_typewriter_events(rendered, st, cue_start, cue_end))
+            continue
+
+        # -- progress fill --------------------------------------------------
+        # \kf is libass's own left-to-right fill and needs one Dialogue per cue
+        # with per-word durations, not one per word. It is the only effect that
+        # cannot be expressed in the per-word event model below.
+        if effect == "progress":
+            lines.append(_progress_event(rendered, cue, st, clip_start_time,
+                                         cue_start, cue_end, entrance, cue_ms,
+                                         play_res, margin_v))
+            continue
 
         for i, word in enumerate(cue):
             start = word["start"] - clip_start_time
@@ -468,7 +753,20 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
                 end = word["end"] - clip_start_time
             end = max(end, start + MIN_WORD_SECONDS)
 
-            if end <= 0:
+            # The floor above is a legibility minimum, but it must never push an
+            # event past the one that follows it. When speech runs faster than
+            # MIN_WORD_SECONDS -- constant in fast Hindi -- an unclamped floor
+            # left two Dialogue lines overlapping, and libass stacks overlapping
+            # lines VERTICALLY: the caption block visibly jumped between two
+            # heights and, mid-cue, drew the same text twice with two different
+            # words highlighted. That is the flicker. A briefly-short highlight
+            # is the correct trade against a doubled, jumping caption.
+            hard_limit = (cue[i + 1]["start"] - clip_start_time
+                          if i + 1 < len(cue) else next_cue_start)
+            if hard_limit is not None:
+                end = min(end, hard_limit)
+
+            if end <= 0 or end <= start:
                 continue
 
             parts = []
@@ -479,13 +777,15 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
                     # Without the trailing &, libass mis-parses the tag and leaks
                     # stray punctuation into the rendered line. \r resets every
                     # override back to the style in one tag.
-                    scale = (f"\\fscx{st['active_scale']}\\fscy{st['active_scale']}"
-                             if st["active_scale"] != 100 else "")
-                    # A "word" box paints the chip by turning the transparent
-                    # base outline opaque for this word only.
-                    chip = (f"\\3c{st['box_color']}&\\3a&H00&"
-                            if st.get("box") == "word" else "")
-                    parts.append(f"{{\\c{st['active']}&{scale}{chip}}}{token}{{\\r}}")
+                    parts.append(f"{{{_active_override(st, j)}}}{token}{{\\r}}")
+                elif effect == "gradient":
+                    # The ramp has to run across the WHOLE cue, not just the word
+                    # being spoken -- colouring one word from a four-colour ramp
+                    # and leaving the rest white reads as alternating text, which
+                    # is the opposite of the effect. libass cannot interpolate
+                    # colour within a glyph, so per-word steps are the ramp.
+                    parts.append(f"{{\\c{GRADIENT_RAMP[j % len(GRADIENT_RAMP)]}&}}"
+                                 f"{token}{{\\r}}")
                 elif bare and bare in key_set:
                     parts.append(f"{{\\c{st.get('keyword', st['active'])}&}}{token}{{\\r}}")
                 else:
@@ -495,9 +795,8 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
             # Animate only the FIRST word event of a cue. Re-triggering the
             # entrance on every word would make the line jitter continuously
             # instead of arriving once.
-            if animation and animation != "none" and i == 0:
-                cue_ms = int(max(0.0, (cue[-1]["end"] - cue[0]["start"])) * 1000)
-                tags = animation_tags(animation, cue_ms, play_res, margin_v)
+            if entrance and entrance != "none" and i == 0:
+                tags = animation_tags(entrance, cue_ms, play_res, margin_v)
                 if tags:
                     text = "{" + tags + "}" + text
 
@@ -540,7 +839,7 @@ def build_ass_lines(caption_lines: list, out_path: str,
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
 
     out = [_header(margin_v, st, play_res, title_style, title_font),
-           _title_events(title, play_res)]
+           _title_events(title, play_res, title_style)]
     for line in caption_lines:
         text = _escape((line.get("text") or "").strip())
         if not text:
@@ -554,9 +853,10 @@ def build_ass_lines(caption_lines: list, out_path: str,
         # One cue per line here (no karaoke), so the entrance animation plays
         # once per sentence rather than once per word -- the same tags, applied
         # at the only granularity a translated line has.
+        entrance = animation or st.get("entrance")
         anim = ""
-        if animation and animation != "none":
-            anim = animation_tags(animation, int((end - start) * 1000),
+        if entrance and entrance != "none":
+            anim = animation_tags(entrance, int((end - start) * 1000),
                                   play_res, margin_v)
         # animation_tags returns BARE tags; unbraced they render as literal
         # text, so colour and animation share one override block.

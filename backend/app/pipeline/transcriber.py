@@ -22,32 +22,84 @@ def _require_key():
         )
 
 
-def transcribe(audio_path: str) -> dict:
+_COMMON = {
+    "smart_format": "true",
+    "utterances": "true",
+    "punctuate": "true",
+}
+
+# The default, unchanged, and what every job still uses unless it asks for
+# something else. Cheap, and correct for single-language footage -- which most
+# footage is.
+_DEFAULT = {"model": "nova-2", "detect_language": "true"}
+
+# Opt-in. `detect_language` picks ONE language for the whole file, which is
+# wrong for the way some footage is actually spoken: an Indian podcast switches
+# between Hindi and English inside a single sentence, and whichever language
+# won the detection transcribed the other one as noise. nova-3's language=multi
+# is built for that.
+#
+# It is NOT the default, because it is a more expensive tier and transcription
+# runs once per job regardless of template -- making it global would raise the
+# price of every clip to fix a problem only some of them have.
+#
+# The nova-2 entry after it is a fallback, not a second opinion: nova-3 is not
+# on every Deepgram plan, and without it a plan lacking nova-3 would fail the
+# whole job -- strictly worse than the model it replaced.
+_MULTILINGUAL = ({"model": "nova-3", "language": "multi"}, _DEFAULT)
+
+
+def transcribe(audio_path: str, multilingual: bool = False,
+               diarize: bool = False) -> dict:
+    """Transcribe with word-level timings.
+
+    `multilingual` opts into the pricier model that handles code-switching.
+    `diarize` asks who is speaking, which only the podcast reframing consumes.
+    Both default off so the common path costs exactly what it did before.
+    """
     _require_key()
     with open(audio_path, "rb") as f:
+        audio = f.read()
+
+    params = dict(_COMMON)
+    if diarize:
+        params["diarize"] = "true"
+    attempts = _MULTILINGUAL if multilingual else (_DEFAULT,)
+
+    last = None
+    for i, choice in enumerate(attempts):
         resp = requests.post(
             "https://api.deepgram.com/v1/listen",
-            params={
-                "model": "nova-2",
-                "smart_format": "true",
-                "utterances": "true",
-                "punctuate": "true",
-                "detect_language": "true",
-            },
+            params={**params, **choice},
             headers={
                 "Authorization": f"Token {DEEPGRAM_API_KEY}",
                 "Content-Type": "audio/mp3",
             },
-            data=f.read(),
+            data=audio,
             timeout=300,
         )
-    if resp.status_code in (401, 403):
-        raise RuntimeError(
-            "Deepgram rejected the API key. Check DEEPGRAM_API_KEY in "
-            "backend/.env (was the key rotated or the project deleted?)."
-        )
-    resp.raise_for_status()
-    return resp.json()
+        if resp.status_code in (401, 403):
+            # A key problem is not a model problem -- retrying the fallback
+            # would just spend another request to be told the same thing.
+            raise RuntimeError(
+                "Deepgram rejected the API key. Check DEEPGRAM_API_KEY in "
+                "backend/.env (was the key rotated or the project deleted?)."
+            )
+        if resp.ok:
+            if i:
+                print(f"[clipper] Deepgram: fell back to {choice['model']}; "
+                      "mixed-language speech will transcribe less accurately.")
+            return resp.json()
+        last = resp
+        # Only a model/plan rejection is worth retrying. A 5xx or a timeout is
+        # about Deepgram, not about which model was asked for.
+        if resp.status_code not in (400, 402, 404):
+            break
+        print(f"[clipper] Deepgram refused {choice['model']} "
+              f"({resp.status_code}), trying the next model...")
+
+    last.raise_for_status()
+    return last.json()
 
 
 def get_utterances(transcript_json: dict) -> list:

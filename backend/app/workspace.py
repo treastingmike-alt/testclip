@@ -95,7 +95,16 @@ def clear_intermediates(job_dir: str) -> int:
             # Guard: the proxy is what makes editing instant. It is small
             # (a few MB) and regenerating it means re-downloading the source,
             # which YouTube increasingly refuses. Always worth keeping.
-            if name == "preview.mp4":
+            # ...and while it is still being written it is called preview.mp4.part,
+            # which the ".part" suffix rule above would otherwise sweep out from
+            # under a live ffmpeg. The proxy now starts as soon as the source
+            # lands, so that encode is very often still running at cleanup time.
+            # ...and they are per-clip now (preview_1.mp4), so match the prefix
+            # rather than the single old name. Missing the `.part` form here
+            # would sweep a live ffmpeg's output out from under it: the proxies
+            # start as soon as the source lands, so those encodes are very often
+            # still running when cleanup fires.
+            if name.startswith("preview"):
                 disposable = False
 
             if disposable:

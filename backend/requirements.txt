@@ -3,3 +3,10 @@ uvicorn[standard]
 requests
 pydantic
 fonttools
+
+# Face-aware reframing for the Podcast template (app/pipeline/reframe.py).
+# opencv carries the YuNet detector; the model file itself is an asset rather
+# than a package -- see assets/models/README.md for the one-line fetch. Both
+# are optional at runtime: with either missing the podcast frame falls back to
+# a fixed letterbox instead of failing.
+opencv-python-headless

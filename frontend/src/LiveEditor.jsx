@@ -7,18 +7,18 @@ import { FontPicker, SizePicker, LanguagePicker, useFonts,
 import { useEditHistory } from "./useEditHistory";
 import { PLATFORMS, platformOverlay, BACKGROUNDS, logoSrc } from "./EditorPresets";
 import TimelineTracks from "./TimelineTracks";
+import CaptionPresetPicker, { useCaptionPresets } from "./CaptionPresets";
 
-/* Caption looks, mirrored from backend subtitles.STYLES so the preview matches
-   the export. The renderer remains the source of truth -- this is a visual
-   approximation whose job is to make choices obvious, not pixel-exact. */
-/* `px` mirrors backend subtitles.STYLES sizes, so the number in the editor is
-   the number written into the subtitle file. */
-const STYLES = {
-  classic:  { color: "#fff", active: "#d8f24e", weight: 900, shadow: true, px: 76 },
-  fitbox:   { color: "#fff", active: "#fff", chip: "#2b6cf6", weight: 800, px: 66 },
-  tech:     { color: "#fff", active: "#7fd4f0", weight: 900, shadow: true, mid: true, px: 80 },
-  business: { color: "#1e1a1a", active: "#1e1a1a", plate: "#efeae2", weight: 700, px: 58 },
-  gameplay: { color: "#fff", active: "#3ad43a", weight: 900, shadow: true, caps: true, px: 84 },
+/* Caption looks come from the server (`/caption-options`), which serves the
+   renderer's own preset registry translated into CSS terms. This file used to
+   keep a hand-written copy of backend subtitles.STYLES; the two drifted on both
+   sizes and colours, so the preview was confidently wrong about the export.
+
+   FALLBACK_STYLE is only what to draw in the frame or two before the fetch
+   lands -- never a second source of truth. */
+const FALLBACK_STYLE = {
+  color: "#fff", active: "#d8f24e", px: 76, box: "none", outline: 5,
+  caps: false, effect: "color", mode: "karaoke", maxWords: 4, position: "bottom",
 };
 
 /* Caption and title sizes are absolute px on the OUTPUT canvas, whose width
@@ -57,13 +57,66 @@ const FONT_FALLBACK = "'Archivo Black', sans-serif";
 
 const RATIOS = { "9:16": 9 / 16, "1:1": 1, "16:9": 16 / 9 };
 
+/* Rough but sufficient: the pictographic blocks plus the variation selector and
+   zero-width joiner that hold sequences together. Used only to warn, never to
+   rewrite what the user typed. */
+const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/u;
+
+/* The renderer draws a stroke around each glyph (ASS Outline). Four offsets
+   approximate it; -webkit-text-stroke thins glyphs inward instead of growing
+   them outward, which is visibly not what burns in. A "line" box preset already
+   has a plate behind it and wants no stroke at all. */
+function strokeShadow(st) {
+  if (st.box === "line") return "none";
+  const w = Math.min(0.09, ((st.outline || 0) / (st.px || 76)) * 0.9);
+  if (!w) return st.shadow ? "0.03em 0.04em 0.05em rgba(0,0,0,.8)" : "none";
+  return `${w}em 0 0 #000, -${w}em 0 0 #000, 0 ${w}em 0 #000, 0 -${w}em 0 #000`;
+}
+
+/* How the spoken word is marked, mirroring subtitles._active_override. This is
+   the one place the editor interprets a preset, and it stays a small function
+   for that reason -- everything it reads was computed by the server. */
+const PREVIEW_RAMP = ["#8040f0", "#d060e0", "#f080d0", "#60d0f0"];
+
+function previewWordStyle(st, i, active) {
+  if (st.effect === "gradient") return { color: PREVIEW_RAMP[i % PREVIEW_RAMP.length] };
+  // Phrase presets replace the whole chunk and mark nothing inside it.
+  if (!active || st.mode === "phrase") return undefined;
+
+  switch (st.effect) {
+    case "marker":
+      return { background: st.boxColor || st.active, color: st.color,
+               padding: "0 .18em", borderRadius: 4 };
+    case "underline":
+      return { color: st.active, textDecoration: "underline",
+               textUnderlineOffset: ".14em" };
+    case "glow":
+      return { color: st.active,
+               textShadow: `0 0 .25em ${st.active}, 0 0 .5em ${st.active}` };
+    case "scale":
+    case "pop":
+      return { color: st.active, display: "inline-block",
+               transform: `scale(${(st.activeScale || 115) / 100})` };
+    default:
+      return { color: st.active };
+  }
+}
+
 /* Mirrors render.MIN_CONTENT_FRACTION / MAX_ZOOM / content_height().
    The renderer's default frame is `blur`: the source centred at a computed
    height over a blurred copy of itself -- NOT edge-to-edge. Previewing it with
    a plain object-fit: cover was showing a crop that never gets exported, which
    is why the editor and the finished clip disagreed about what was on screen. */
-const MIN_CONTENT_FRACTION = 0.44;
-const MAX_ZOOM = 1.35;
+const MIN_CONTENT_FRACTION = 0.55;
+const MAX_ZOOM = 1.75;
+
+/* Mirrors render.FIT_CONTENT_BIAS: in `fit` the video block sits above centre
+   so the leftover height becomes a title band and a caption band instead of two
+   equal dead margins. */
+const FIT_CONTENT_BIAS = 0.42;
+
+/* Mirrors render.PODCAST_CONTENT_BIAS. */
+const PODCAST_CONTENT_BIAS = 0.36;
 
 function contentHeightFrac(srcW, srcH, outW, outH) {
   if (!srcW || !srcH) return 1;
@@ -72,6 +125,21 @@ function contentHeightFrac(srcW, srcH, outW, outH) {
   const zoom = Math.min(Math.max((outH * MIN_CONTENT_FRACTION) / natural, 1), MAX_ZOOM);
   return Math.min((natural * zoom) / outH, 1);
 }
+
+/* The editor's four sections. Grouped by the decision being made rather than by
+   which part of the pipeline implements them -- "how do the captions look" is
+   one decision even though it touches the style registry, the font list and the
+   title renderer. */
+const SECTIONS = [
+  { id: "captions", name: "Captions", icon: "T",
+    desc: "Styles, text and timing" },
+  { id: "layout",   name: "Layout",   icon: "▦",
+    desc: "Ratio, framing and safe areas" },
+  { id: "brand",    name: "Brand",    icon: "◎",
+    desc: "Logo, handle and overlays" },
+  { id: "video",    name: "Video",    icon: "▶",
+    desc: "Speed, audio and more" },
+];
 
 /* Mirrors pipeline/overlays.SAFE_* -- the bands Reels/TikTok/Shorts cover with
    their own buttons. Drawn as guides so nothing important lands under them. */
@@ -87,18 +155,35 @@ function fmt(t) {
 /**
  * Non-destructive clip editor.
  *
- * Plays the job's PROXY (one small copy of the whole source) and draws captions
- * as DOM on top. Trimming, restyling, changing ratio or font are pure state
- * changes -- instant, free, and reversible. An MP4 is only rendered when the
- * user exports, which is the one operation that costs real time.
+ * Plays this clip's PROXY (a small copy of the source WINDOW the trim handles
+ * can reach) and draws captions as DOM on top. Trimming, restyling, changing
+ * ratio or font are pure state changes -- instant, free, and reversible. An MP4
+ * is only rendered when the user exports, which is the one operation that costs
+ * real time.
  */
 export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const [transcript, setTranscript] = useState(null);
   const [loadError, setLoadError] = useState("");
-  /* The proxy is built after the clips, so the editor can open before it
-     exists. Showing a black video in that window looked broken -- especially in
-     split-screen, where only the top half went black. */
-  const [proxyReady, setProxyReady] = useState(job.proxy_ready !== false);
+  /* The proxy builds in parallel with the clips, so the editor can open before
+     it exists. Showing a black video in that window looked broken -- especially
+     in split-screen, where only the top half went black. */
+  const [proxyReady, setProxyReady] = useState(clip.proxy_ready !== false);
+
+  /* The proxy covers [clip.start - CONTEXT, clip.end + CONTEXT], not the whole
+     source, so its t=0 is source time `pOff`. Every time this component holds
+     is a SOURCE time -- transcript timings, trim points, the playhead -- and
+     only the two crossings into and out of a <video> element convert. Keeping
+     the conversion at that boundary is what stops the offset leaking into the
+     caption timing, where it would silently desync every cue. */
+  const pOff = clip.proxy_offset || 0;
+  const toProxy = (t) => Math.max(0, t - pOff);
+  const fromProxy = (t) => t + pOff;
+  const proxySrc = previewUrl(job.id, index);
+
+  /* Which group of controls the inspector is showing. Deliberately NOT in the
+     undo document: undoing your way back through a change should not also drag
+     you to a different panel. */
+  const [section, setSection] = useState("captions");
 
   const initial = clip.edit || {};
 
@@ -134,6 +219,16 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     translateTo, title, titleStyle, titleFont, speed, speedPitched, background,
     overlayList, lineEdits,
   } = doc;
+
+  /* The renderer's own preset registry, fetched once. `st` is the definition of
+     whatever is currently selected, and every piece of the on-video preview
+     below reads from it -- so preview and export cannot disagree about a colour
+     or a size without the server being wrong about its own output. */
+  const presetData = useCaptionPresets();
+  const st = useMemo(
+    () => presetData?.presets?.find((p) => p.id === capStyle) || FALLBACK_STYLE,
+    [presetData, capStyle],
+  );
 
   // Setters keep the rest of this component unchanged. `discrete` marks
   // click-like actions so undo steps over them one at a time, while drags
@@ -180,6 +275,34 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const [showSafe, setShowSafe] = useState(true);
   const [dragOverlay, setDragOverlay] = useState(null);
   const [dragCaption, setDragCaption] = useState(false);
+
+  /* Freeze the page behind the editor for as long as it is open.
+     The editor is `position: fixed`, which should make this unnecessary -- but
+     the marketing page sets `overflow: clip` on <body>, and an element with
+     `overflow: clip` is a containing block for fixed-position descendants. So
+     the editor was positioned against the BODY, not the viewport, and scrolling
+     the page underneath dragged the whole workspace up off the screen with it.
+     Locking the scroll fixes the symptom and is what a full-screen workspace
+     wants regardless: there is nothing behind it worth scrolling to. */
+  useEffect(() => {
+    const html = document.documentElement;
+    const prev = html.style.overflow;
+    const y = window.scrollY;
+    html.style.overflow = "hidden";
+    return () => {
+      html.style.overflow = prev;
+      window.scrollTo(0, y);          // put them back where they were
+    };
+  }, []);
+
+  /* Selecting an overlay -- on the video or on the layer strip -- takes you to
+     the section that can edit it. Those two surfaces live outside the inspector
+     and are visible from every section, so without this you could click a
+     handle from Captions, see it highlight, and find no controls anywhere. */
+  function selectOverlay(i) {
+    setSelected(i);
+    if (i !== null) setSection("brand");
+  }
 
   /* Templates that composite something on top of the source have to be shown
      composited, or the editor is previewing a different video than it exports.
@@ -229,7 +352,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   }, [speed, speedPitched, transcript]);
 
   function onMeta(e) {
-    e.target.currentTime = start;
+    e.target.currentTime = toProxy(start);
     setSrcDims({ w: e.target.videoWidth, h: e.target.videoHeight });
   }
 
@@ -237,8 +360,23 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
      renderer's zoom policy exactly. */
   const [outW, outH] = ratio === "1:1" ? [1080, 1080]
     : ratio === "16:9" ? [1920, 1080] : [1080, 1920];
-  const fgHeight = frameMode === "blur"
-    ? contentHeightFrac(srcDims?.w, srcDims?.h, outW, outH) : 1;
+  /* `fit` takes the same zoom as `blur` now -- the two differ in what fills the
+     leftover height (flat colour vs a blurred copy), not in how big the picture
+     is. It used to be the letterboxed height with no zoom at all. */
+  const fgHeight = frameMode === "blur" || frameMode === "fit"
+    ? contentHeightFrac(srcDims?.w, srcDims?.h, outW, outH)
+    /* Podcast never zooms -- cropping a two-shot removes a speaker -- so the
+       block is exactly the letterboxed height, sat high. */
+    : frameMode === "podcast"
+    ? Math.min((outW * (srcDims?.h || 9)) / ((srcDims?.w || 16) * outH), 1)
+    : 1;
+
+  /* Top edge of the video block as a fraction of frame height, for the frames
+     that sit their block off-centre. Mirrors the clamp in fit_filter and
+     podcast_filter: centre the block on `bias`, then keep it inside the frame. */
+  function blockTop(bias) {
+    return Math.min(Math.max(bias - fgHeight / 2, 0), 1 - fgHeight);
+  }
 
   /* The blurred backdrop is a second decode of the same file, so it has to be
      told where the playhead is. Exact frame-lock is unnecessary -- it is
@@ -255,12 +393,12 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     if (proxyReady) return;
     const t = setInterval(async () => {
       try {
-        const r = await fetch(previewUrl(job.id), { method: "HEAD" });
+        const r = await fetch(proxySrc, { method: "HEAD" });
         if (r.ok) { setProxyReady(true); clearInterval(t); }
       } catch { /* keep waiting */ }
     }, 1500);
     return () => clearInterval(t);
-  }, [proxyReady, job.id]);
+  }, [proxyReady, proxySrc]);
 
   /* Playback is confined to [start, end] without touching the file: seek in,
      and loop back when the playhead runs past the out-point. */
@@ -268,9 +406,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     const v = videoRef.current;
     if (!v) return;
     function onTime() {
-      setNow(v.currentTime);
-      if (v.currentTime >= end) {
-        v.currentTime = start;
+      setNow(fromProxy(v.currentTime));
+      if (fromProxy(v.currentTime) >= end) {
+        v.currentTime = toProxy(start);
         if (!playing) v.pause();
       }
     }
@@ -290,6 +428,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
           start: Math.max(u.start, start),
           end: Math.min(u.end, end),
           text: lineEdits[u.i] ?? u.text,
+          // Only rewritten lines give up their real per-word timings. Sending
+          // every line as "edited" made one typo fix re-time the whole clip.
+          edited: lineEdits[u.i] !== undefined,
         }));
       saveClipEdit(job.id, index, {
         start, end, ratio,
@@ -361,7 +502,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       type: "text", text: "@yourhandle",
       x: 0.5, y: 0.9, size: 0.045, color: "#ffffff", font: "anton", opacity: 1,
     }]);
-    setSelected(overlayList.length);
+    selectOverlay(overlayList.length);
   }
 
   async function addLogo(file) {
@@ -372,7 +513,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       setOverlayList((l) => [...l, {
         type: "image", file: name, x: 0.86, y: 0.09, size: 0.12, opacity: 1,
       }]);
-      setSelected(overlayList.length);
+      selectOverlay(overlayList.length);
       setStatus("Logo added");
     } catch (e) { setStatus(e.message); }
   }
@@ -401,7 +542,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       if (dragging === "start") {
         const v = Math.min(t, end - MIN_CLIP);
         setStart(v);
-        if (videoRef.current) videoRef.current.currentTime = v;
+        if (videoRef.current) videoRef.current.currentTime = toProxy(v);
       } else if (dragging === "end") {
         setEnd(Math.max(t, start + MIN_CLIP));
       } else {
@@ -422,6 +563,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   /* The cue under the playhead, chunked exactly as the renderer will chunk it. */
   const cue = useMemo(() => {
     if (!transcript?.utterances) return null;
+    // The preset decides how many words share a cue -- that is most of what
+    // makes a Hormozi look a Hormozi look -- so it overrides the server's
+    // generic rule rather than the other way round.
     const rules = transcript.cue_rules || { max_words: 4, max_seconds: 1.8 };
 
     const u = transcript.utterances.find((x) => now >= x.start && now <= x.end);
@@ -438,7 +582,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       words = toks.map((w, k) => ({ t: u.start + k * dt, e: u.start + (k + 1) * dt, w }));
     }
 
-    const cues = groupWords(words, rules.max_words, rules.max_seconds);
+    const cues = groupWords(words, st.maxWords || rules.max_words,
+                            rules.max_seconds);
     const active = cues.find((c) => now >= c[0].t && now <= c[c.length - 1].e)
       || cues.find((c) => now < c[0].t)
       || cues[cues.length - 1];
@@ -447,7 +592,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     let activeIndex = active.findIndex((w) => now >= w.t && now <= w.e);
     if (activeIndex < 0) activeIndex = now > active[active.length - 1].e ? active.length - 1 : 0;
     return { words: active.map((w) => w.w), activeIndex };
-  }, [transcript, now, lineEdits]);
+  }, [transcript, now, lineEdits, st]);
 
   /* One place that moves the playhead, so scrubbing from the trim bar, the
      layer strip or the transcript all behave identically -- including keeping
@@ -455,9 +600,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   function seek(t) {
     const v = videoRef.current;
     if (!v) return;
-    v.currentTime = t;
+    v.currentTime = toProxy(t);
     setNow(t);
-    if (blurRef.current) blurRef.current.currentTime = t;
+    if (blurRef.current) blurRef.current.currentTime = toProxy(t);
   }
 
   function togglePlay() {
@@ -465,7 +610,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     if (!v) return;
     const g = gameplayRef.current;
     if (v.paused) {
-      if (v.currentTime < start || v.currentTime >= end) v.currentTime = start;
+      const at = fromProxy(v.currentTime);
+      if (at < start || at >= end) v.currentTime = toProxy(start);
       v.play(); g?.play().catch(() => {});
       setPlaying(true);
     } else {
@@ -492,7 +638,6 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     }
   }
 
-  const st = STYLES[capStyle] || STYLES.classic;
   const duration = end - start;
 
   return createPortal(
@@ -585,6 +730,31 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </header>
 
         <div className="live-body">
+          {/* Section rail. Every control used to be stacked in one column, so
+              choosing a caption style meant scrolling past speed, overlays and
+              handles to find it, and nothing indicated where anything lived.
+              Four sections, one visible at a time: the controls are the same
+              controls, but you are only ever looking at the ones that belong to
+              the decision you are making. */}
+          <nav className="live-rail" aria-label="Editor sections">
+            {SECTIONS.map((s) => (
+              <button key={s.id} type="button"
+                      className={`rail-btn ${section === s.id ? "on" : ""}`}
+                      aria-current={section === s.id}
+                      /* The label is built from two nested spans, one of which
+                         is hidden at narrow widths, so the accessible name is
+                         stated rather than inferred from whatever is visible. */
+                      aria-label={`${s.name} — ${s.desc}`}
+                      onClick={() => setSection(s.id)}>
+                <span className="rail-icon" aria-hidden="true">{s.icon}</span>
+                <span className="rail-text">
+                  <strong>{s.name}</strong>
+                  <em>{s.desc}</em>
+                </span>
+              </button>
+            ))}
+          </nav>
+
           {/* The clip and the two timelines that describe it are ONE column and
               scroll as one. Previously they were three separate grid items, one
               of which collided with the footer's row -- which is how the trim
@@ -603,7 +773,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                 <div className="split-stage">
                   <video
                     ref={videoRef}
-                    src={previewUrl(job.id)}
+                    src={proxySrc}
                     playsInline
                     preload="auto"
                     onClick={togglePlay}
@@ -624,24 +794,35 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   {/* The default frame is a blurred copy of the source behind
                       the source itself. Drawing only the sharp layer left the
                       preview with black bars the export does not have. */}
-                  {frameMode === "blur" && (
+                  {(frameMode === "blur" || frameMode === "podcast") && (
                     <video
                       ref={blurRef}
                       className="stage-blur"
-                      src={previewUrl(job.id)}
+                      src={proxySrc}
                       playsInline muted preload="auto" aria-hidden="true"
                     />
                   )}
                   <video
                     ref={videoRef}
                     className="stage-fg"
-                    src={previewUrl(job.id)}
+                    src={proxySrc}
                     playsInline
                     preload="auto"
                     onClick={togglePlay}
                     onLoadedMetadata={onMeta}
                     style={frameMode === "blur"
                       ? { height: `${fgHeight * 100}%`, top: `${(1 - fgHeight) * 50}%` }
+                      /* Podcast: same layer, but sat at its own bias rather
+                         than centred, matching podcast_filter's overlay y. */
+                      : frameMode === "podcast"
+                      ? { height: `${fgHeight * 100}%`,
+                          top: `${blockTop(PODCAST_CONTENT_BIAS) * 100}%`,
+                          objectFit: "contain" }
+                      /* Fit: the same zoomed block as blur, sat at its own bias
+                         so the taller bar underneath is the caption band. */
+                      : frameMode === "fit"
+                      ? { height: `${fgHeight * 100}%`,
+                          top: `${blockTop(FIT_CONTENT_BIAS) * 100}%` }
                       : undefined}
                   />
                 </>
@@ -657,7 +838,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   (subtitles.TITLE_STYLE: top 7%, first 4.5s). Editing the title
                   or its look now shows up here instead of only after an
                   export. */}
-              {title.trim() && (now - start) < TITLE_SECONDS && (
+              {title.trim() && titleStyle !== "none" && (now - start) < TITLE_SECONDS && (
                 <div className="stage-title" style={{ top: `${TITLE_TOP * 100}%` }}>
                   <span style={{
                     fontFamily: fontCss(titleFont),
@@ -671,7 +852,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
 
               {cue && (
                 <div
-                  className={`stage-caption draggable ${st.mid && capPos === null ? "mid" : ""}`}
+                  className={`stage-caption draggable ${st.position === "middle" && capPos === null ? "mid" : ""}`}
                   style={capPos !== null
                     ? { top: `${capPos * 100}%`, bottom: "auto", transform: "translateY(-50%)" }
                     : undefined}
@@ -683,24 +864,21 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                     style={{
                       fontFamily: fontCss(capFont),
                       fontSize: `${((capSize ?? st.px) / outW) * 100}cqw`,
-                      fontWeight: st.weight,
+                      fontWeight: 900,
                       color: st.color,
-                      background: st.plate || "transparent",
-                      textShadow: st.shadow ? "0 2px 0 #000, 0 0 12px rgba(0,0,0,.7)" : "none",
+                      letterSpacing: st.spacing ? `${st.spacing * 0.02}em` : undefined,
+                      transform: st.rotate ? `rotate(${-st.rotate}deg)` : undefined,
+                      background: st.box === "line" ? st.boxColor : "transparent",
+                      /* The renderer's outline is a stroke around the glyphs, so
+                         preview it as one. A blanket drop shadow made every
+                         preset look identically "shadowed" regardless of the
+                         outline width it actually exports with. */
+                      textShadow: strokeShadow(st),
                       textTransform: st.caps ? "uppercase" : "none",
                     }}
                   >
                     {cue.words.map((w, i) => (
-                      <span
-                        key={i}
-                        style={
-                          i === cue.activeIndex
-                            ? st.chip
-                              ? { background: st.chip, color: "#fff", padding: "0 .18em", borderRadius: 4 }
-                              : { color: st.active }
-                            : undefined
-                        }
-                      >
+                      <span key={i} style={previewWordStyle(st, i, i === cue.activeIndex)}>
                         {w}{" "}
                       </span>
                     ))}
@@ -732,7 +910,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   className={`ov ${selected === i ? "sel" : ""} ${on ? "" : "ghost"}`}
                   style={{ left: `${o.x * 100}%`, top: `${o.y * 100}%`,
                            opacity: on ? (o.opacity ?? 1) : 0.28 }}
-                  onMouseDown={(e) => { e.stopPropagation(); setSelected(i); setDragOverlay(i); }}
+                  onMouseDown={(e) => { e.stopPropagation(); selectOverlay(i); setDragOverlay(i); }}
                 >
                   {o.type === "image" ? (
                     <img src={overlayImageUrl(job.id, o.file)} alt=""
@@ -823,15 +1001,23 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
           now={Math.min(Math.max(now - start, 0), end - start)}
           overlays={overlayList}
           selected={selected}
-          onSelect={setSelected}
-          onSeek={(t) => { if (videoRef.current) videoRef.current.currentTime = start + t; }}
+          onSelect={selectOverlay}
+          onSeek={(t) => seek(start + t)}
           onChange={(i, patch) => patchOverlay(i, patch)}
         />
           </div>
 
-          {/* Transcript and every control share one scrolling inspector column,
-             so the clip on the left is never pushed off screen by them. */}
+          {/* The inspector shows ONE section at a time, chosen on the rail. */}
           <div className="live-inspector">
+          <div className="insp-head">
+            <h2>{SECTIONS.find((s) => s.id === section)?.name}</h2>
+            <p>{SECTIONS.find((s) => s.id === section)?.desc}</p>
+          </div>
+
+          {/* The transcript belongs to Captions: it is where caption TEXT is
+              edited, and it doubles as a scrubber. Showing it under Brand or
+              Video was just noise between you and the control you came for. */}
+          {section === "captions" && (
           <div className="live-transcript">
             {loadError && <div className="editor-error">{loadError}</div>}
             {!transcript && !loadError && <div className="editor-loading">Loading…</div>}
@@ -842,7 +1028,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                 <div
                   key={i}
                   className={`tx-line ${inClip ? "in" : ""} ${active ? "playing" : ""}`}
-                  onClick={() => { if (videoRef.current) videoRef.current.currentTime = u.start; }}
+                  onClick={() => seek(Math.min(Math.max(u.start, start), end))}
                 >
                   <span className="tx-time">{fmt(u.start)}</span>
                   <span
@@ -860,9 +1046,10 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
               );
             })}
           </div>
-
+          )}
 
         {/* Controls — every one of these is instant */}
+        {section === "layout" && (
         <div className="live-controls">
           <div className="ctl">
             <span className="ctl-label">Ratio</span>
@@ -870,17 +1057,23 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
               <button key={r} className={`chip-btn ${ratio === r ? "on" : ""}`} onClick={() => setRatio(r)}>{r}</button>
             ))}
           </div>
-          <div className="ctl">
-            <span className="ctl-label">Captions</span>
-            {Object.keys(STYLES).map((k) => (
-              <button key={k} className={`chip-btn ${capStyle === k ? "on" : ""}`} onClick={() => setCapStyle(k)}>{k}</button>
-            ))}
+        </div>
+        )}
+
+        {section === "captions" && (
+        <div className="live-controls">
+          <div className="ctl ctl-block">
+            <span className="ctl-label">Caption style</span>
+            <CaptionPresetPicker value={capStyle} onChange={setCapStyle}
+                                 data={presetData} />
           </div>
         </div>
+        )}
 
         {/* The title is its own design decision, not a second caption -- a
             white plate is right for a talking-head clip and wrong for a gaming
             one, so the look and the typeface are both choices here. */}
+        {section === "captions" && (
         <div className="live-controls">
           <div className="ctl">
             <span className="ctl-label">Title look</span>
@@ -889,19 +1082,44 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                 <button key={l.id}
                         className={`title-look ${titleStyle === l.id ? "on" : ""}`}
                         onClick={() => setTitleStyle(l.id)}
-                        title={l.id}>
-                  <span style={titleLookCss(l)}>Aa</span>
+                        title={l.id === "none" ? "No title burned in" : l.id}>
+                  {/* "Off" is a look like any other: it is where you go when you
+                      want the cut and the captions but intend to write the hook
+                      yourself. Burning one in cannot be undone after export. */}
+                  {l.id === "none"
+                    ? <span className="title-look-off">Off</span>
+                    : <span style={titleLookCss(l)}>Aa</span>}
                 </button>
               ))}
             </div>
           </div>
+          {/* The export silently drops emoji unless a font on libass's fallback
+              path has the glyph, and the preview drew them regardless -- so they
+              looked fine in the editor and were simply missing afterwards. Say
+              so where the text is, instead of letting the render be the first
+              time anyone finds out. */}
+          {presetData && presetData.emoji_supported === false
+            && EMOJI_RE.test(title) && (
+            <p className="ctl-warn">
+              Emoji won’t burn into the video. The renderer has no emoji face it
+              can actually draw — colour fonts like <em>Noto Color Emoji</em> and
+              Apple Color Emoji store the picture in a format this build of
+              libass doesn’t rasterise, so they map the character and then draw
+              nothing. Drop the <strong>monochrome</strong> <em>Noto Emoji</em>
+              (<code>NotoEmoji-Regular.ttf</code>) into{" "}
+              <code>backend/assets/fonts</code> and it starts working with no
+              other change.
+            </p>
+          )}
           <div className="ctl">
             <span className="ctl-label">Title font</span>
             <FontPicker value={titleFont} onChange={setTitleFont}
                         needsDevanagari={/[ऀ-ॿ]/.test(title)} />
           </div>
         </div>
+        )}
 
+        {section === "captions" && (
         <div className="live-controls type-bar">
           <div className="ctl">
             <span className="ctl-label">Font</span>
@@ -927,23 +1145,14 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
             )}
           </div>
         </div>
+        )}
 
-        <div className="live-controls">
-          <div className="ctl">
-            <span className="ctl-label">Animation</span>
-            <div className="anim-row">
-              {["none","fade","pop","riseup","punch","bounce"].map((a) => (
-                <button key={a}
-                        className={`anim-chip ${capAnim === a ? "on" : ""}`}
-                        onClick={() => setCapAnim(a)}>
-                  <span className={`anim-demo anim-${a}`}>Aa</span>
-                  <em>{a === "riseup" ? "rise" : a}</em>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+        {/* The standalone Animation control is gone. Entrance is part of what a
+            preset IS -- "Hormozi Punch" names a specific arrival as much as a
+            specific colour -- and offering the two as orthogonal menus mostly
+            produced combinations nobody wanted. Each preset carries its own. */}
 
+        {section === "video" && (
         <div className="live-controls">
           <div className="ctl">
             <span className="ctl-label">Speed</span>
@@ -961,8 +1170,13 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
               {speedPitched ? "Pitch: meme" : "Pitch: natural"}
             </button>
           </div>
+        </div>
+        )}
 
-          {ratio && (
+        {/* The bars are part of how the frame is composed, not how the video
+            plays, so they live with Ratio rather than with Speed. */}
+        {section === "layout" && (
+          <div className="live-controls">
             <div className="ctl">
               <span className="ctl-label">Bars</span>
               <div className="bg-row">
@@ -975,9 +1189,18 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                 ))}
               </div>
             </div>
-          )}
-        </div>
+            <div className="ctl">
+              <span className="ctl-label">Safe areas</span>
+              <button className={`chip-btn ${showSafe ? "on" : ""}`}
+                      onClick={() => setShowSafe((v) => !v)}>
+                {showSafe ? "On" : "Off"}
+              </button>
+              <span className="ctl-hint">the bands the platforms cover</span>
+            </div>
+          </div>
+        )}
 
+        {section === "brand" && (
         <div className="live-controls ov-panel">
           <div className="ctl">
             <span className="ctl-label">Overlays</span>
@@ -987,10 +1210,6 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
               <input type="file" accept="image/png,image/jpeg,image/webp" hidden
                      onChange={(e) => addLogo(e.target.files?.[0])} />
             </label>
-            <button className={`chip-btn ${showSafe ? "on" : ""}`}
-                    onClick={() => setShowSafe((v) => !v)}>
-              Safe areas
-            </button>
           </div>
 
           <div className="ctl">
@@ -1005,7 +1224,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                         setOverlayList((l) => [...l,
                           { ...platformOverlay(pf, ""), t_start: 0, t_end: end - start }],
                           { discrete: true });
-                        setSelected(overlayList.length);
+                        selectOverlay(overlayList.length);
                       }}>
                 <img className="pf-logo" src={logoSrc(pf.id)} alt="" />
                 <span>{pf.name}</span>
@@ -1056,6 +1275,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
             </div>
           )}
         </div>
+        )}
 
         </div>
         </div>

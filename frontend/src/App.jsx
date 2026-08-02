@@ -321,7 +321,7 @@ const TEMPLATES = [
   {
     id: "fitvideo", name: "Fit video", frame: "fit", scene: "scene-black",
     words: ["Here", "is", "your"], color: "#ffffff", chip: "#2b6cf6",
-    capClass: "cap-fitbox", note: "Whole frame on black · blue chip",
+    capClass: "cap-fitbox", note: "Flat colour bars · blue chip",
   },
   {
     id: "tech", name: "Tech", frame: "fill", scene: "scene-azure",
@@ -338,6 +338,11 @@ const TEMPLATES = [
     words: ["HERE", "IS", "YOUR"], color: "#3ad43a", capClass: "cap-gameplay",
     pop: true, note: "Half video · half gameplay",
   },
+  {
+    id: "podcast", name: "Podcast", frame: "podcast", scene: "scene-studio",
+    words: ["Here", "is", "your"], color: "#e8f0f5", capClass: "cap-podcast",
+    note: "Two-shot uncropped · room for captions",
+  },
 ];
 
 /** Miniature of the rendered clip: framing, caption style, and highlight timing.
@@ -348,6 +353,15 @@ const TEMPLATES = [
  * fresh checkout with no footage installed. */
 function TemplatePreview({ template, variants }) {
   const isSplit = template.frame === "gameplay";
+  /* A podcast is a two-shot -- that IS the reason this template exists, since
+     every other one zooms in far enough to lose the second person. A card
+     showing one speaker would be advertising the wrong thing. */
+  const isPodcast = template.frame === "podcast";
+  /* Classic composites a subject band over a blurred copy of itself. The card
+     used to draw one flat scene edge to edge, so it showed neither the blur nor
+     the band -- which meant changing how much of the frame the video gets
+     changed nothing visible here. */
+  const isBlur = template.frame === "blur";
   const [hasVideo, setHasVideo] = useState(true);
   const [variant, setVariant] = useState(0);
 
@@ -368,7 +382,7 @@ function TemplatePreview({ template, variants }) {
   }, [sources.length]);
 
   return (
-    <span className={`tpl-frame ${isSplit ? "is-split" : ""} ${template.scene}`}>
+    <span className={`tpl-frame ${isSplit ? "is-split" : ""} ${isPodcast ? "is-podcast" : ""} ${isBlur ? "is-blur" : ""} ${template.scene}`}>
       {showVideo && (
         <video
           className="tpl-video"
@@ -388,6 +402,8 @@ function TemplatePreview({ template, variants }) {
           <span className="tpl-scene" aria-hidden="true">
             <span className="tpl-head" />
             <span className="tpl-body" />
+            {isPodcast && <><span className="tpl-head two" />
+                           <span className="tpl-body two" /></>}
           </span>
           {isSplit && (
             <span className="tpl-game" aria-hidden="true">
@@ -452,6 +468,7 @@ export default function App() {
   const [nClips, setNClips] = useState(3);
   const [burnSubtitles, setBurnSubtitles] = useState(true);
   const [autoCensor, setAutoCensor] = useState(true);
+  const [multilingual, setMultilingual] = useState(false);
   const [template, setTemplate] = useState("classic");
   const [ratio, setRatio] = useState("9:16");
   const [lengthPref, setLengthPref] = useState("any");
@@ -486,6 +503,11 @@ export default function App() {
 
   // Restores the session from a stored token; clears it if the token expired.
   useEffect(() => { fetchMe().then(setUser).catch(() => {}); }, []);
+
+  /* Signed out means no plan, which means the free entitlement set. Read from
+     the server's list rather than comparing plan names here, so adding a tier
+     is a backend-only change. */
+  const canMultilingual = !!user?.entitlements?.includes("multilingual");
 
   // Persistence makes a job reachable again after the tab is closed, so ?job=<id>
   // reopens one. Also how a shared or bookmarked result gets back on screen.
@@ -566,6 +588,9 @@ export default function App() {
         mode: "original",
         burnSubtitles,
         autoCensor,
+        // Never send it on a plan that does not include it: the server would
+        // reject the whole job rather than quietly downgrade it.
+        multilingual: multilingual && canMultilingual,
         voice: "onyx",
         language: "English",
         template,
@@ -1050,6 +1075,30 @@ export default function App() {
                 >
                   <span className="chip-check" aria-hidden="true">{autoCensor ? "✓" : ""}</span>
                   Auto-censor
+                </button>
+                {/* Shown to everyone, locked for plans that do not include it.
+                    Hiding it entirely would mean the people most likely to
+                    want it -- creators whose footage is bilingual -- never
+                    learn it exists. The backend gates this independently;
+                    `canMultilingual` is presentation only. */}
+                <button
+                  type="button"
+                  className={`chip ${multilingual ? "active" : ""} ${canMultilingual ? "" : "locked"}`}
+                  onClick={() => canMultilingual
+                    ? setMultilingual((v) => !v)
+                    : document.getElementById("pricing")
+                        ?.scrollIntoView({ behavior: "smooth" })}
+                  disabled={jobActive}
+                  title={canMultilingual
+                    ? (user?.is_admin
+                        ? "Unlocked by your admin account — transcribes speech that switches language mid-sentence"
+                        : "Transcribes speech that switches language mid-sentence, like Hindi and English in one line")
+                    : "Creator and Pro plans — for speech that switches language mid-sentence"}
+                >
+                  <span className="chip-check" aria-hidden="true">
+                    {canMultilingual ? (multilingual ? "✓" : "") : "🔒"}
+                  </span>
+                  Mixed language
                 </button>
                 <label className="chip">
                   Ratio

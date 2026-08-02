@@ -103,6 +103,10 @@ export const MAX_PX = 160;
 const LANGUAGES = [
   { code: "en", name: "English", native: "English" },
   { code: "hi", name: "Hindi", native: "हिंदी" },
+  /* Latin script, so it sits next to Hindi but escapes the Devanagari-glyph
+     warning below -- any font can draw it, which is half the reason creators
+     caption this way in the first place. */
+  { code: "hi-latn", name: "Hinglish", native: "Hinglish" },
   { code: "es", name: "Spanish", native: "Español" },
   { code: "pt", name: "Portuguese", native: "Português" },
   { code: "fr", name: "French", native: "Français" },
