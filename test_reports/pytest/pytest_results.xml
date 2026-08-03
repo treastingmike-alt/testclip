@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="6" time="18.488" timestamp="2026-08-03T21:53:17.973223+00:00" hostname="agent-env-a989d36b-21b6-46b5-b93f-14b7756c1853"><testcase classname="backend.tests.test_editor_backend" name="test_caption_options_categories_and_count" time="0.205" /><testcase classname="backend.tests.test_editor_backend" name="test_job_exists" time="0.091" /><testcase classname="backend.tests.test_editor_backend" name="test_edit_accepts_new_fields" time="0.097" /><testcase classname="backend.tests.test_editor_backend" name="test_export_captions_on_recolours_ass" time="8.685" /><testcase classname="backend.tests.test_editor_backend" name="test_export_captions_off_writes_no_ass" time="9.008" /><testcase classname="backend.tests.test_editor_backend" name="test_register_user" time="0.335"><failure message="AssertionError: assert 'test_8ad3b71a@example.com' == 'TEST_8ad3b71a@example.com'&#10;  &#10;  - TEST_8ad3b71a@example.com&#10;  ? ^^^^&#10;  + test_8ad3b71a@example.com&#10;  ? ^^^^">backend/tests/test_editor_backend.py:129: in test_register_user
+    assert data["user"]["email"] == email
+E   AssertionError: assert 'test_8ad3b71a@example.com' == 'TEST_8ad3b71a@example.com'
+E     
+E     - TEST_8ad3b71a@example.com
+E     ? ^^^^
+E     + test_8ad3b71a@example.com
+E     ? ^^^^</failure></testcase></testsuite></testsuites>

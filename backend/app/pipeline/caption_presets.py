@@ -72,6 +72,12 @@ CATEGORIES = [
     {"id": "cinematic", "name": "Cinematic", "desc": "Film subtitles, wide and calm"},
     {"id": "neon",      "name": "Neon",      "desc": "Gradient and glow, for gaming"},
     {"id": "story",     "name": "Story",     "desc": "Typewriter reveals for narration"},
+    # Added because every family above starts from white text and only differs
+    # in how the spoken word is marked -- so the picker read as one caption in
+    # nine palettes. These change the BASE colour, which is the first thing
+    # anyone actually notices.
+    {"id": "vibrant",   "name": "Vibrant",   "desc": "Coloured text, not just white"},
+    {"id": "clean",     "name": "Clean",     "desc": "Plates and soft type, easy to read"},
 ]
 
 # Shared palette, written once in ASS order.
@@ -252,6 +258,44 @@ _LIST = [
     _p("story_terminal", "Terminal", "story",
        size=58, base=GREEN, active=GREEN, outline=0, shadow=2, spacing=2,
        mode="typewriter", entrance="none", max_words=6, position="lower"),
+
+    # -- vibrant: the base text carries the colour ---------------------------
+    _p("vibrant_sunset", "Sunset", "vibrant",
+       size=86, uppercase=True, base=ORANGE, active=W, outline=7,
+       active_effect="scale", active_scale=114, entrance="pop", keyword=YELLOW),
+    _p("vibrant_mint", "Mint", "vibrant",
+       size=82, base=LIME, active=W, outline=6,
+       active_effect="color", entrance="fade", keyword=W),
+    _p("vibrant_bubblegum", "Bubblegum", "vibrant",
+       size=84, uppercase=True, base=MAGENTA, active=YELLOW, outline=7,
+       active_effect="pop", entrance="pop", keyword=W),
+    _p("vibrant_ice", "Ice", "vibrant",
+       size=82, base=CYAN, active=W, outline=6,
+       active_effect="glow", entrance="fade", keyword=W),
+    _p("vibrant_gold", "Gold", "vibrant",
+       size=88, uppercase=True, base=YELLOW, active=W, outline=8,
+       active_effect="scale", active_scale=112, entrance="fade", keyword=W),
+    _p("vibrant_crimson", "Crimson", "vibrant",
+       size=88, uppercase=True, base=RED, active=W, outline=8,
+       active_effect="pop", entrance="punch", keyword=YELLOW),
+    _p("vibrant_royal", "Royal", "vibrant",
+       size=84, base=PURPLE, active=CYAN, outline=7,
+       active_effect="glow", entrance="fade", keyword=W),
+
+    # -- clean: plates and quiet type ---------------------------------------
+    _p("clean_plate", "White Plate", "clean",
+       size=62, base=INK, active=INK, outline=16, box="line", box_color=W,
+       active_effect="underline", entrance="fade", max_words=6, position="lower"),
+    _p("clean_dark", "Dark Plate", "clean",
+       size=62, base=W, active=LIME, outline=16, box="line",
+       box_color="&H00181414", active_effect="color", entrance="fade",
+       max_words=6, position="lower"),
+    _p("clean_soft", "Soft", "clean",
+       size=66, base=CREAM, active=W, outline=0, shadow=4,
+       active_effect="color", entrance="fade", max_words=6, position="lower"),
+    _p("clean_editorial", "Editorial", "clean",
+       size=58, base=W, active=YELLOW, outline=3, shadow=3, spacing=2,
+       active_effect="underline", entrance="fade", max_words=7, position="lower"),
 ]
 
 PRESETS = {p["id"]: p for p in _LIST}
@@ -284,6 +328,26 @@ def ass_to_css(colour: str) -> str:
     h = colour.replace("&H", "").replace("&", "")
     h = h.rjust(8, "0")[-6:]        # BBGGRR
     return f"#{h[4:6]}{h[2:4]}{h[0:2]}"
+
+
+def css_to_ass(colour: str) -> str:
+    """#RRGGBB -> &H00BBGGRR. The inverse of ass_to_css.
+
+    Lets the editor hand back a plain CSS colour from a colour input without
+    knowing anything about ASS byte order.
+    """
+    if not colour:
+        return W
+    h = str(colour).strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return W
+    try:
+        int(h, 16)
+    except ValueError:
+        return W
+    return f"&H00{h[4:6]}{h[2:4]}{h[0:2]}".upper()
 
 
 def web_presets() -> dict:

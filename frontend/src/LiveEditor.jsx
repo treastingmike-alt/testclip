@@ -282,6 +282,40 @@ function buildTimelineMap(transcript, start, end, lineEdits, tighten) {
   };
 }
 
+/* A short, opinionated palette plus a native picker. A free colour input alone
+   is a bad default here -- most people want one of a handful of colours that
+   survive compression and stay legible burned over video, and nine of ten
+   custom picks are a low-contrast disaster. */
+const CAPTION_SWATCHES = [
+  "#ffffff", "#101010", "#d8f24e", "#ffd900", "#ff9000", "#f04040",
+  "#3ad43a", "#60d0f0", "#d060e0", "#e8f0f5",
+];
+
+function ColourRow({ value, fallback, onChange, testid }) {
+  const current = value || fallback;
+  return (
+    <span className="colour-row" data-testid={testid}>
+      {CAPTION_SWATCHES.map((c) => (
+        <button key={c} type="button"
+                className={`swatch ${current?.toLowerCase() === c ? "on" : ""}`}
+                style={{ background: c }}
+                onClick={() => onChange(c)}
+                title={c} aria-label={`Use ${c}`} />
+      ))}
+      <span className="swatch swatch-custom" title="Custom colour">
+        <input type="color" value={current || "#ffffff"}
+               onChange={(e) => onChange(e.target.value)}
+               aria-label="Custom colour" />
+      </span>
+      {value && (
+        <button type="button" className="colour-reset" onClick={() => onChange(null)}>
+          Reset
+        </button>
+      )}
+    </span>
+  );
+}
+
 /**
  * Non-destructive clip editor.
  *
@@ -331,6 +365,15 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     capSize: initial.caption_size ?? null,       // null = the style's own size
     capPos: initial.caption_pos ?? null,         // null = automatic placement
     capAnim: initial.caption_anim || "none",
+    /* Colour overrides on top of the preset. Every preset ships white text, so
+       picking a "style" only ever changed how the spoken word was marked --
+       this is the axis people reach for first. null = keep the preset's own. */
+    capColor: initial.caption_color ?? null,
+    capActive: initial.caption_active_color ?? null,
+    /* Captions off is a real editing decision, not an absence: plenty of clips
+       are posted with the platform's own captions or none at all, and until now
+       the only way to get one was to re-run the whole job. */
+    capOn: initial.captions_on !== false,
     translateTo: initial.translate_to ?? null,
     title: clip.title || "",
     titleStyle: initial.title_style || "plate",
@@ -346,6 +389,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const doc = history.state;
   const {
     start, end, ratio, capStyle, capFont, capSize, capPos, capAnim,
+    capColor, capActive, capOn,
     translateTo, title, titleStyle, titleFont, speed, speedPitched, background,
     overlayList, lineEdits,
   } = doc;
@@ -355,10 +399,19 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
      below reads from it -- so preview and export cannot disagree about a colour
      or a size without the server being wrong about its own output. */
   const presetData = useCaptionPresets();
-  const st = useMemo(
-    () => presetData?.presets?.find((p) => p.id === capStyle) || FALLBACK_STYLE,
-    [presetData, capStyle],
-  );
+  const st = useMemo(() => {
+    const base = presetData?.presets?.find((p) => p.id === capStyle) || FALLBACK_STYLE;
+    if (!capColor && !capActive) return base;
+    return {
+      ...base,
+      color: capColor || base.color,
+      // The keyword colour is an orange designed against white text; on a
+      // recoloured base it reads as a second highlight nobody asked for. The
+      // renderer makes the same substitution (subtitles._recolour).
+      keyword: capColor || base.keyword,
+      active: capActive || base.active,
+    };
+  }, [presetData, capStyle, capColor, capActive]);
 
   // Setters keep the rest of this component unchanged. `discrete` marks
   // click-like actions so undo steps over them one at a time, while drags
@@ -372,6 +425,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const setCapSize = (v) => history.apply({ capSize: v });
   const setCapPos = set("capPos");
   const setCapAnim = (v) => history.apply({ capAnim: v }, { discrete: true });
+  const setCapColor = (v) => history.apply({ capColor: v }, { discrete: true });
+  const setCapActive = (v) => history.apply({ capActive: v }, { discrete: true });
+  const setCapOn = (v) => history.apply({ capOn: v }, { discrete: true });
   const setTranslateTo = (v) => history.apply({ translateTo: v }, { discrete: true });
   const setTitle = (v) => history.apply({ title: v });
   const setTitleStyle = (v) => history.apply({ titleStyle: v }, { discrete: true });
@@ -849,8 +905,37 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     }
   }
 
-  async function doExport() {
-    setExporting(true);
+  /* Keyboard shortcuts. An editor you have to mouse to for every play/pause is
+     an editor nobody scrubs carefully in -- and scrubbing carefully is the
+     whole job here. Text fields are excluded so typing a caption still types. */
+  useEffect(() => {
+    function onKey(e) {
+      const el = document.activeElement;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA"
+                 || el.isContentEditable)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const step = e.shiftKey ? 2 : 0.5;
+      if (e.code === "Space") {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        seek(Math.max(start, now - step));
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        seek(Math.min(end, now + step));
+      } else if (e.key.toLowerCase() === "c") {
+        setCapOn(!capOn);
+      } else if (e.key === "Escape") {
+        onClose();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [now, start, end, capOn, playing, clipMap]);
+
+  async function doExport() {    setExporting(true);
     setStatus("");
     setExportError("");
     try {
@@ -952,7 +1037,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
           <div className="live-head-right">
             {exportError && <span className="live-status err">{exportError}</span>}
             {!exportError && status && <span className="live-status">{status}</span>}
-            <button className="btn btn-primary btn-sm" onClick={doExport} disabled={exporting}>
+            <button className="btn btn-primary btn-sm" onClick={doExport} disabled={exporting}
+                    data-testid="export-clip-btn">
               {exporting ? "Rendering…" : "Export clip"}
             </button>
           </div>
@@ -1123,7 +1209,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                 </div>
               )}
 
-              {cue && (
+              {capOn && cue && (
                 <div
                   className={`stage-caption draggable cap-enter-${st.entrance || "none"} ${st.position === "middle" && capPos === null ? "mid" : ""}`}
                   style={capPos !== null
@@ -1336,11 +1422,60 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         {section === "captions" && (
         <div className="live-controls">
           <div className="ctl ctl-block">
+            <div className="cap-onoff">
+              <span className="cap-onoff-copy">
+                <strong>Burn captions in</strong>
+                <span>{capOn
+                  ? "Word-timed captions are rendered into the file."
+                  : "This clip exports clean — no captions in the video."}</span>
+              </span>
+              <button
+                className="switch"
+                role="switch"
+                aria-checked={capOn}
+                aria-label="Burn captions into the video"
+                data-testid="captions-toggle"
+                onClick={() => setCapOn(!capOn)}
+              />
+            </div>
+          </div>
+        </div>
+        )}
+
+        {section === "captions" && capOn && (
+        <div className="live-controls">
+          <div className="ctl ctl-block">
             <span className="ctl-label">Caption style</span>
             <CaptionPresetPicker value={capStyle} onChange={setCapStyle}
                                  data={presetData} />
           </div>
         </div>
+        )}
+
+        {/* Colour is separate from the preset on purpose: a preset is a whole
+            design (size, casing, cadence, how the spoken word is marked), and
+            people want that design in their own colours rather than a new
+            preset per palette. */}
+        {section === "captions" && capOn && (
+        <div className="live-controls">
+          <div className="ctl">
+            <span className="ctl-label">Text colour</span>
+            <ColourRow value={capColor} fallback={st.color} onChange={setCapColor}
+                       testid="cap-text-colour" />
+          </div>
+          <div className="ctl">
+            <span className="ctl-label">Spoken word</span>
+            <ColourRow value={capActive} fallback={st.active} onChange={setCapActive}
+                       testid="cap-active-colour" />
+          </div>
+        </div>
+        )}
+
+        {section === "captions" && !capOn && (
+          <p className="captions-off-note">
+            Caption styling is hidden while captions are off. The transcript
+            above still drives the cut, so trims stay word-accurate.
+          </p>
         )}
 
         {/* The title is its own design decision, not a second caption -- a
@@ -1392,7 +1527,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </div>
         )}
 
-        {section === "captions" && (
+        {section === "captions" && capOn && (
         <div className="live-controls type-bar">
           <div className="ctl">
             <span className="ctl-label">Font</span>
@@ -1558,6 +1693,12 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
             {clip.rendered === false
               ? "Unsaved changes — export to update the downloadable file"
               : "Export is up to date"}
+          </span>
+          <span className="live-keys">
+            <kbd>Space</kbd> play
+            <kbd>←</kbd><kbd>→</kbd> scrub
+            <kbd>C</kbd> captions
+            <kbd>⌘Z</kbd> undo
           </span>
         </footer>
       </div>

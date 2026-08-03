@@ -665,12 +665,31 @@ def _progress_event(rendered: list, cue: list, st: dict, clip_start_time: float,
     return f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{text}"
 
 
+def _recolour(st: dict, color: str = None, active_color: str = None) -> dict:
+    """A preset with its base and/or highlight colour replaced.
+
+    Colours arrive from the editor as CSS hex. Every preset used to ship white
+    text, so "pick a caption style" only ever changed how the spoken word was
+    marked -- this is the axis people reach for first.
+    """
+    patch = {}
+    if color:
+        patch["base"] = caption_presets.css_to_ass(color)
+        # `keyword` defaults to orange on top of white; on a recoloured base it
+        # reads as a second, unasked-for highlight.
+        patch["keyword"] = patch["base"]
+    if active_color:
+        patch["active"] = caption_presets.css_to_ass(active_color)
+    return {**st, **patch} if patch else st
+
+
 def build_ass(words: list, clip_start_time: float, out_path: str,
               margin_v: int = 150, style: str = "classic",
               play_res: tuple = (PLAY_RES_X, PLAY_RES_Y),
               title: str = "", keywords: list = None,
               font: str = None, size_px: int = None,
               animation: str = None,
+              color: str = None, active_color: str = None,
               title_style: str = None, title_font: str = None) -> str:
     """Writes an ASS file whose timings are relative to the clip's own start.
 
@@ -688,6 +707,7 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
     # this caption style was designed at", which is what most people want.
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
+    st = _recolour(st, color, active_color)
     lines = [_header(margin_v, st, play_res, title_style, title_font)]
     lines.append(_title_events(title, play_res, title_style))
 
@@ -823,6 +843,7 @@ def build_ass_lines(caption_lines: list, out_path: str,
                     play_res: tuple = (PLAY_RES_X, PLAY_RES_Y),
                     title: str = "", font: str = None, size_px: int = None,
                     animation: str = None,
+                    color: str = None, active_color: str = None,
                     title_style: str = None, title_font: str = None) -> str:
     """Whole-line captions with no karaoke, for translated subtitles.
 
@@ -837,6 +858,7 @@ def build_ass_lines(caption_lines: list, out_path: str,
         st = {**st, "font": family}
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
+    st = _recolour(st, color, active_color)
 
     out = [_header(margin_v, st, play_res, title_style, title_font),
            _title_events(title, play_res, title_style)]

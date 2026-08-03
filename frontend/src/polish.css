@@ -1,0 +1,628 @@
+/* =========================================================================
+   polish.css — refinement layer, loaded after styles.css.
+
+   Three jobs, and nothing else:
+     1. the dark theme, expressed as variable overrides plus the handful of
+        surfaces styles.css hardcodes in white
+     2. fixing the inconsistent controls (the source toggle, disabled buttons,
+        the rainbow halo behind the URL bar)
+     3. the new UI this refinement adds: toasts, a real drop zone, and the
+        caption colour / on-off controls in the editor
+   ========================================================================= */
+
+:root {
+  --glow-1: 139, 92, 246;
+  --glow-2: 79, 70, 229;
+  --focus-ring: rgba(109, 40, 217, 0.28);
+  --elev-1: 0 2px 8px -4px rgba(16, 16, 20, 0.18);
+  --elev-2: 0 18px 45px -24px rgba(16, 16, 20, 0.34);
+  --track: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+/* ---------------- dark theme ---------------- */
+html[data-theme="dark"] {
+  --bg: #0d0d10;
+  --surface: #16161c;
+  --ink: #f2f1ee;
+  --ink-soft: #a6a6b2;
+  --ink-faint: #6f6f7c;
+  --line: #26262f;
+  --violet: #a78bfa;
+  --indigo: #818cf8;
+  --grad-accent: linear-gradient(100deg, #a78bfa 0%, #818cf8 60%, #6366f1 100%);
+  --success: #34d399;
+  --danger: #f87171;
+  --focus-ring: rgba(167, 139, 250, 0.3);
+  --elev-1: 0 2px 10px -4px rgba(0, 0, 0, 0.6);
+  --elev-2: 0 22px 50px -26px rgba(0, 0, 0, 0.8);
+  --track: rgba(255, 255, 255, 0.07);
+  color-scheme: dark;
+}
+
+/* Grain reads as dust on a dark surface, so it gets quieter rather than
+   disappearing -- the texture is what keeps flat panels from looking cheap. */
+html[data-theme="dark"] body::after { opacity: 0.035; }
+
+/* The surfaces styles.css writes as literal white. Each is a panel, so each
+   becomes --surface rather than a new colour invented here. */
+html[data-theme="dark"] .btn-white { background: var(--surface); color: var(--ink); }
+html[data-theme="dark"] .nav-pill {
+  background: rgba(22, 22, 28, 0.72);
+  border-color: rgba(255, 255, 255, 0.07);
+}
+html[data-theme="dark"] .source-preview { background: rgba(255, 255, 255, 0.035); }
+html[data-theme="dark"] .fan-play { background: rgba(255, 255, 255, 0.16); }
+html[data-theme="dark"] .intent-field input,
+html[data-theme="dark"] .auth-field input,
+html[data-theme="dark"] .ov-text,
+html[data-theme="dark"] .tx-input:focus,
+html[data-theme="dark"] .live-transcript .tx-text:focus,
+html[data-theme="dark"] .plan,
+html[data-theme="dark"] .billing-toggle button.on,
+html[data-theme="dark"] .tl-handle::after {
+  background: var(--surface);
+  color: var(--ink);
+}
+html[data-theme="dark"] .hero-badge { background: rgba(255, 255, 255, 0.04); }
+html[data-theme="dark"] .btn-primary { background: var(--ink); color: #14141a; }
+html[data-theme="dark"] .btn-primary:hover { color: #fff; }
+html[data-theme="dark"] .source-tabs { background: rgba(255, 255, 255, 0.045); }
+html[data-theme="dark"] .source-tabs .tab-thumb { background: var(--ink); }
+html[data-theme="dark"] .source-tabs button.on { color: #14141a; }
+html[data-theme="dark"] .blob.b1 {
+  background: radial-gradient(circle, rgba(139, 92, 246, 0.32), transparent 70%);
+}
+html[data-theme="dark"] .blob.b2 {
+  background: radial-gradient(circle, rgba(129, 140, 248, 0.3), transparent 70%);
+}
+html[data-theme="dark"] .urlbar {
+  background: var(--surface);
+  box-shadow: 0 30px 70px -34px rgba(0, 0, 0, 0.9),
+              inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* The remaining cream literals: every one of them is a recessed surface, so
+   each becomes the same translucent white wash rather than ten new colours. */
+html[data-theme="dark"] .topup,
+html[data-theme="dark"] .billing-toggle,
+html[data-theme="dark"] .tl-track,
+html[data-theme="dark"] .lang-warn,
+html[data-theme="dark"] .font-flag {
+  background: rgba(255, 255, 255, 0.06);
+}
+html[data-theme="dark"] .account-menu button:hover,
+html[data-theme="dark"] .picker-menu button:hover,
+html[data-theme="dark"] .size-step:hover,
+html[data-theme="dark"] .lang-row:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+html[data-theme="dark"] .error-box {
+  background: rgba(248, 113, 113, 0.12);
+  color: #fca5a5;
+}
+html[data-theme="dark"] .picker-menu,
+html[data-theme="dark"] .lang-panel,
+html[data-theme="dark"] .account-menu,
+html[data-theme="dark"] .auth-card,
+html[data-theme="dark"] .export-card,
+html[data-theme="dark"] .toast {
+  background: var(--surface);
+  border-color: var(--line);
+}
+/* Native form controls inherit the page's colour-scheme, but their own
+   background is set on the element, so a select in a dark panel stayed white. */
+html[data-theme="dark"] select,
+html[data-theme="dark"] .chip select {
+  background: transparent;
+  color: var(--ink);
+}
+html[data-theme="dark"] select option { background: var(--surface); color: var(--ink); }
+/* Enough opacity that the pill stays a pill when backdrop-filter is
+   unavailable -- at 0.72 the page ran straight through it. */
+html[data-theme="dark"] .nav-wrap.scrolled .nav-pill { background: rgba(19, 19, 24, 0.92); }
+/* The editor's own chrome, written against the cream page. */
+html[data-theme="dark"] .live-head { background: rgba(13, 13, 16, 0.92); }
+html[data-theme="dark"] .export-veil { background: rgba(13, 13, 16, 0.84); }
+
+/* ---------------- editor chrome ----------------
+   Back / title / undo / reset / status / export all share one row, and the
+   sub-label wrapped to two lines the moment a title was long enough to matter,
+   pushing the whole bar taller. */
+.live-head .editor-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* Theme switches are the one place a full-page transition is worth it: every
+   surface changes at once, and an instant swap reads as a flash. */
+html.theme-anim,
+html.theme-anim body,
+html.theme-anim .nav-pill,
+html.theme-anim .urlbar,
+html.theme-anim .live,
+html.theme-anim .live-page {
+  transition: background-color 0.28s ease, color 0.28s ease,
+              border-color 0.28s ease;
+}
+
+/* The studio and the dashboard are workspaces, not sections of the marketing
+   page -- the floating nav pill was painting straight over the studio's own
+   header and its "Exit studio" button. */
+.nav-wrap.stowed {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-140%);
+  /* The nav's entrance keyframes animate transform and opacity with
+     `fill-mode: both`, and a filled animation beats a plain declaration -- so
+     the class alone left the pill sitting over the workspace. */
+  animation: none;
+  transition: opacity 0.25s var(--ease-out), transform 0.35s var(--ease-out);
+}
+.nav-wrap.scrolled .nav-pill { background: rgba(255, 255, 255, 0.94); }
+
+/* ---------------- theme switch ---------------- */
+.theme-btn {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: color 0.18s, border-color 0.18s, transform 0.25s var(--ease-spring);
+}
+.theme-btn:hover {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+  transform: rotate(-14deg);
+}
+.theme-btn svg { display: block; }
+
+/* ---------------- source toggle: a real segmented control ----------------
+   It used to be two buttons where the inactive one only changed text colour on
+   hover, so hovering the selected side did nothing and hovering the other side
+   looked like a broken selection. Now one thumb slides between two labels: the
+   selection is a position, and hover is a separate, quieter signal. */
+.source-tabs {
+  position: relative;
+  gap: 0;
+  padding: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--track);
+  border-color: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 8%, transparent);
+  isolation: isolate;
+}
+.source-tabs .tab-thumb {
+  position: absolute;
+  z-index: 0;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc(50% - 4px);
+  border-radius: var(--radius-pill);
+  background: var(--ink);
+  box-shadow: var(--elev-1);
+  transition: transform 0.32s var(--ease-spring);
+}
+.source-tabs[data-active="upload"] .tab-thumb { transform: translateX(100%); }
+.source-tabs button {
+  position: relative;
+  z-index: 1;
+  flex: 1 0 76px;
+  border-radius: var(--radius-pill);
+  padding: 5px 14px;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+  color: var(--ink-soft);
+  transition: color 0.24s ease;
+}
+.source-tabs button.on { background: transparent; color: var(--surface); }
+.source-tabs button:not(.on):hover { color: var(--ink); background: transparent; }
+.source-tabs button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ---------------- the halo behind the URL bar ----------------
+   Was a spinning four-stop conic gradient (violet, lime, indigo) at blur 14px,
+   which put a moving olive-and-purple smear behind a cream page and bled onto
+   the toggle sitting above it. Replaced with one still, wide, single-family
+   aura: present at rest so the bar reads as the focal point, brighter on focus
+   so typing is acknowledged, and never a second colour story. */
+.urlbar-glow {
+  inset: -18px -10px -22px;
+  border-radius: 60px;
+  background:
+    radial-gradient(60% 120% at 30% 50%, rgba(var(--glow-1), 0.32), transparent 70%),
+    radial-gradient(60% 120% at 72% 50%, rgba(var(--glow-2), 0.28), transparent 72%);
+  filter: blur(26px);
+  opacity: 0.5;
+  transition: opacity 0.4s var(--ease-out), transform 0.4s var(--ease-out);
+}
+.urlbar-wrap:hover .urlbar-glow { opacity: 0.7; animation: none; }
+.urlbar-wrap:focus-within .urlbar-glow {
+  opacity: 1;
+  transform: scale(1.02);
+  animation: none;
+}
+html[data-theme="dark"] .urlbar-glow { filter: blur(34px); opacity: 0.42; }
+
+.urlbar {
+  box-shadow: 0 30px 70px -34px rgba(16, 16, 20, 0.4),
+              inset 0 0 0 1px color-mix(in srgb, var(--ink) 7%, transparent);
+}
+.urlbar:focus-within {
+  box-shadow: 0 34px 80px -34px rgba(16, 16, 20, 0.45),
+              inset 0 0 0 1.5px color-mix(in srgb, var(--violet) 45%, transparent);
+}
+
+/* ---------------- disabled buttons ----------------
+   `opacity: .45` on near-black gave the muddy mid-grey "Continue" pill. A
+   disabled control should read as an empty slot waiting to be filled, not as a
+   faded version of an active one. */
+.btn:disabled,
+.btn[disabled] {
+  opacity: 1;
+  cursor: not-allowed;
+  background: var(--track);
+  color: var(--ink-faint);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 10%, transparent);
+}
+.btn:disabled::before { display: none; }
+.btn:disabled:hover { background: var(--track); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 10%, transparent); }
+html[data-theme="dark"] .btn:disabled { color: var(--ink-faint); }
+
+/* Keyboard users get the same affordance mouse users do. */
+.btn:focus-visible,
+.chip:focus-visible,
+.chip-btn:focus-visible,
+.rail-btn:focus-visible,
+.cap-card:focus-visible,
+.template-card:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
+/* Hover lift, applied once instead of per-button. */
+.btn-primary:not(:disabled):hover,
+.btn-white:not(:disabled):hover { transform: translateY(-1px); }
+
+/* ---------------- upload: a drop zone, not a disguised text field ----------
+   Upload mode reused the URL bar's single row, so a file picker was pretending
+   to be an input and there was nowhere to drop a file. */
+.dropzone {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 30px 24px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1.5px var(--line);
+  cursor: pointer;
+  text-align: center;
+  transition: box-shadow 0.2s, background 0.2s, transform 0.2s var(--ease-out);
+}
+.dropzone input { display: none; }
+.dropzone:hover { box-shadow: inset 0 0 0 1.5px var(--ink-faint); }
+.dropzone.over {
+  transform: scale(1.01);
+  box-shadow: inset 0 0 0 2px var(--violet);
+  background: color-mix(in srgb, var(--violet) 6%, var(--surface));
+}
+.dropzone-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--track);
+  color: var(--ink-soft);
+  margin-bottom: 4px;
+}
+.dropzone strong { font-size: 15.5px; font-weight: 700; }
+.dropzone strong em {
+  font-style: normal;
+  background: var(--grad-accent);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.dropzone span { font-size: 12.5px; color: var(--ink-faint); }
+.dropzone .dz-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.dropzone-actions { margin-top: 10px; display: flex; gap: 8px; }
+
+/* ---------------- toasts ----------------
+   Errors used to appear as a red block wherever the failing control happened
+   to be, so a failure while scrolled away was invisible. */
+.toast-stack {
+  position: fixed;
+  z-index: 400;
+  right: 22px;
+  bottom: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+  max-width: min(380px, calc(100vw - 44px));
+}
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px 15px;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--elev-2), inset 0 0 0 1px var(--line);
+  animation: toastIn 0.4s var(--ease-spring) both;
+}
+.toast.out { animation: toastOut 0.28s var(--ease-out) both; }
+.toast-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+.toast.success .toast-dot { background: var(--success); }
+.toast.error .toast-dot { background: var(--danger); }
+.toast-body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.toast-body strong { font-size: 14px; line-height: 1.3; }
+.toast-body span { font-size: 12.5px; color: var(--ink-soft); line-height: 1.4; }
+.toast-x {
+  flex: none;
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--ink-faint);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+.toast-x:hover { color: var(--ink); background: var(--track); }
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes toastOut {
+  to { opacity: 0; transform: translateX(24px); }
+}
+
+/* ---------------- editor: captions on/off + colour ---------------- */
+.cap-onoff {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  padding: 11px 14px;
+  border-radius: var(--radius-md);
+  background: var(--track);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.cap-onoff-copy { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.cap-onoff-copy strong { font-size: 13.5px; }
+.cap-onoff-copy span { font-size: 11.5px; color: var(--ink-faint); line-height: 1.35; }
+
+/* A switch, because this is one binary state -- the old pattern for these was
+   a chip whose label read "On"/"Off", which is a button that tells you what it
+   currently is instead of what pressing it does. */
+.switch {
+  position: relative;
+  flex: none;
+  width: 46px;
+  height: 26px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+  cursor: pointer;
+  transition: background 0.24s ease;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 2px 6px -1px rgba(0, 0, 0, 0.4);
+  transition: transform 0.28s var(--ease-spring);
+}
+.switch[aria-checked="true"] { background: var(--success); }
+.switch[aria-checked="true"]::after { transform: translateX(20px); }
+.switch:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+
+.captions-off-note {  margin: 10px 0 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-faint);
+}
+
+.colour-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.swatch {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  /* A neutral ring reads on both a cream panel and a near-black one, which a
+     black ring does not -- the #101010 swatch simply vanished in dark. */
+  box-shadow: inset 0 0 0 1px rgba(140, 140, 150, 0.5);
+  transition: transform 0.2s var(--ease-spring), box-shadow 0.2s;
+}
+.swatch:hover { transform: translateY(-2px) scale(1.08); }
+.swatch.on {
+  box-shadow: inset 0 0 0 1px rgba(140, 140, 150, 0.5),
+              0 0 0 2.5px var(--ink);
+}
+.swatch-custom {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: conic-gradient(#f87171, #fbbf24, #34d399, #60a5fa, #a78bfa, #f87171);
+}
+.swatch-custom input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  border: 0;
+  padding: 0;
+}
+.colour-reset {
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  border: 0;
+  background: transparent;
+  color: var(--ink-faint);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.colour-reset:hover { color: var(--ink); background: var(--track); }
+
+/* Shortcut legend. Discoverability is the entire point -- a shortcut nobody
+   knows about is a shortcut nobody uses. */
+.live-keys {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.live-foot { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.live-keys kbd {
+  font: inherit;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--track);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--ink-soft);
+}
+.live-keys kbd + kbd { margin-left: -2px; }
+
+/* ---------------- option chips ----------------
+   Booleans and dropdowns were the same pill, so "Captions" and "Ratio" looked
+   like the same kind of control -- and an active boolean went solid black,
+   which read heavier than the primary action next to it. A boolean now carries
+   a small track, and its on state is a tint rather than a slab. */
+.chip.toggle .chip-switch {
+  position: relative;
+  width: 26px;
+  height: 15px;
+  flex: none;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+  transition: background 0.22s ease;
+}
+.chip.toggle .chip-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform 0.24s var(--ease-spring);
+}
+.chip.toggle.active {
+  background: color-mix(in srgb, var(--violet) 10%, var(--surface));
+  border-color: color-mix(in srgb, var(--violet) 55%, transparent);
+  color: var(--ink);
+}
+.chip.toggle.active .chip-switch { background: var(--violet); }
+.chip.toggle.active .chip-switch::after { transform: translateX(11px); }
+.chip.locked .chip-lock { opacity: 0.7; }
+/* A locked capability still has to be readable -- faint grey on cream made the
+   one control that should sell an upgrade the hardest one to notice. */
+.chip.locked {
+  color: var(--ink-soft);
+  background: var(--track);
+  border-color: color-mix(in srgb, var(--ink) 16%, transparent);
+}
+.chip.locked:hover {
+  color: var(--ink);
+  border-color: var(--violet);
+  background: color-mix(in srgb, var(--violet) 8%, var(--surface));
+}
+.chip:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+/* Dropdown chips get the affordance instead: a caret and a value. */
+.chip:has(select) { padding-right: 14px; }
+.chip select { padding-right: 2px; }
+
+/* ---------------- caption preset picker ----------------
+   The category tabs scrolled off with no indication there was more, and cards
+   gave no hover feedback at all. */
+.cap-tabs {
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+.cap-tabs::-webkit-scrollbar { display: none; }
+.cap-tab { transition: color 0.16s, background 0.16s, box-shadow 0.16s; }
+.cap-card {
+  transition: transform 0.2s var(--ease-out), box-shadow 0.2s;
+}
+.cap-card:hover { transform: translateY(-2px); }
+
+/* ---------------- clip cards ---------------- */
+.clip-card { transition: transform 0.28s var(--ease-out), box-shadow 0.28s; }
+.clip-card:hover { transform: translateY(-3px); }
+
+/* ---------------- misc consistency ---------------- */
+/* Selection colour was the browser default blue on a cream/violet page. */
+::selection { background: color-mix(in srgb, var(--violet) 26%, transparent); }
+
+/* Scrollbars inside the editor's panels, so a dark workspace does not get a
+   bright system scrollbar down the middle of it. */
+.live-transcript,
+.cap-grid,
+.live-inspector {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 22%, transparent) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

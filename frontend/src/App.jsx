@@ -5,6 +5,8 @@ import Dashboard from "./Dashboard";
 import Pricing from "./Pricing";
 import AuthModal from "./AuthModal";
 import { fetchMe, logout } from "./api";
+import ThemeToggle, { useTheme } from "./ThemeToggle";
+import { useToast } from "./Toast";
 
 const STAGES = [
   { key: "downloading", label: "Fetching audio", blurb: "Pulling just the audio track — it's a fraction of the video." },
@@ -463,6 +465,77 @@ const HEADLINE = [
   { text: "viral.", cls: "serif grad" },
 ];
 
+/* Segmented control. The thumb is a sibling of the labels rather than a
+   background on the selected one, so the selection can slide -- and hovering
+   the unselected side tints text instead of painting a second selection. */
+function SourceTabs({ value, onChange, className = "" }) {
+  return (
+    <div className={`source-tabs ${className}`} data-active={value}
+         role="tablist" aria-label="Video source" data-testid="source-tabs">
+      <span className="tab-thumb" aria-hidden="true" />
+      {[["link", "Link"], ["upload", "Upload"]].map(([id, label]) => (
+        <button key={id} type="button" role="tab" aria-selected={value === id}
+                className={value === id ? "on" : ""}
+                data-testid={`source-tab-${id}`}
+                onClick={() => onChange(id)}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* A file field needs somewhere to drop a file. Upload mode used to reuse the
+   URL bar's single row, so the only way in was a "Browse" button that looked
+   like part of a text input. */
+function DropZone({ file, onFile, disabled }) {
+  const [over, setOver] = useState(false);
+  const inputRef = useRef(null);
+
+  function take(list) {
+    const f = Array.from(list || []).find((x) => x.type.startsWith("video/"));
+    if (f) onFile(f);
+  }
+
+  return (
+    <label
+      className={`dropzone ${over ? "over" : ""}`}
+      data-testid="dropzone"
+      onDragOver={(e) => { e.preventDefault(); if (!disabled) setOver(true); }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setOver(false);
+        if (!disabled) take(e.dataTransfer.files);
+      }}
+    >
+      <input ref={inputRef} type="file" disabled={disabled}
+             accept="video/mp4,video/quicktime,video/x-m4v,video/webm,video/x-matroska"
+             onChange={(e) => take(e.target.files)} data-testid="dropzone-input" />
+      <span className="dropzone-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none">
+          <path d="M12 16V4m0 0 4.5 4.5M12 4 7.5 8.5M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"
+                stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+                strokeLinejoin="round" />
+        </svg>
+      </span>
+      {file ? (
+        <>
+          <strong>{file.name}</strong>
+          <span className="dz-file">
+            {Math.max(1, Math.round(file.size / (1024 * 1024)))} MB · click to replace
+          </span>
+        </>
+      ) : (
+        <>
+          <strong>Drop a video here, or <em>browse</em></strong>
+          <span>MP4, MOV, WebM or MKV · up to 1 GB</span>
+        </>
+      )}
+    </label>
+  );
+}
+
 function SourcePreview({ preview, loading, error, uploadUrl, uploadFile }) {
   if (uploadUrl && uploadFile) {
     return (
@@ -533,6 +606,8 @@ export default function App() {
   }, [accountOpen]);
   const [user, setUser] = useState(null);
   const [authOpen, setAuthOpen] = useState(false);
+  const [theme, toggleTheme] = useTheme();
+  const toast = useToast();
 
   // Restores the session from a stored token; clears it if the token expired.
   useEffect(() => { fetchMe().then(setUser).catch(() => {}); }, []);
@@ -638,6 +713,11 @@ export default function App() {
   useEffect(() => {
     if (job?.status === "done" && resultsRef.current) {
       resultsRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+      toast(`${job.clips?.length || 0} clip${job.clips?.length === 1 ? "" : "s"} ready`, {
+        detail: "Preview, trim, or download them below.", tone: "success" });
+    }
+    if (job?.status === "failed") {
+      toast("That video couldn't be clipped", { detail: job.error, tone: "error" });
     }
   }, [job?.status]);
 
@@ -684,6 +764,7 @@ export default function App() {
       setJob(fresh);
     } catch (e) {
       setSubmitError(e.message);
+      toast("Couldn't start that job", { detail: e.message, tone: "error" });
     } finally {
       setSubmitting(false);
     }
@@ -694,12 +775,41 @@ export default function App() {
     setTimeout(() => urlbarRef.current?.querySelector("input")?.focus(), 450);
   }
 
+  /* One entry point into the studio, so the hero, the CTA and Enter in the URL
+     field all behave the same -- they used to disagree about whether Enter
+     submitted a job immediately or opened the settings step. */
+  function openStudio() {
+    setStudioOpen(true);
+    // A job already running means this is a way back to its progress, not a new
+    // run -- leaving it disabled stranded anyone who closed the studio mid-job.
+    if (!jobActive) { setStage("setup"); setOptionsOpen(true); }
+  }
+
+  const continueBtn = (
+    <button
+      className="btn btn-primary btn-shine"
+      onClick={openStudio}
+      disabled={submitting || (!jobActive && !sourceReady)}
+      title={!jobActive && !sourceReady
+        ? (sourceMode === "upload" ? "Choose a video file first" : "Paste a video link first")
+        : undefined}
+      data-testid="hero-continue-btn"
+    >
+      {submitting ? "Starting..." : jobActive ? "View progress" : "Continue"}
+      {!submitting && !jobActive && (
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+          <path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      )}
+    </button>
+  );
+
   return (
     <>
       <div className="scroll-progress" style={{ transform: `scaleX(${progress})` }} aria-hidden="true" />
 
       {/* ---------- Nav ---------- */}
-      <header className={`nav-wrap ${scrolled ? "scrolled" : ""}`}>
+      <header className={`nav-wrap ${scrolled ? "scrolled" : ""} ${studioOpen || showDash ? "stowed" : ""}`}>
         <nav className="nav-pill">
           <a className="logo" href="#top">
             <span className="logo-mark" aria-hidden="true">
@@ -715,6 +825,8 @@ export default function App() {
             <a href="#faq">FAQ</a>
           </div>
           <div className="nav-cta">
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+
             {user ? (
               /* Signed in: balance stays visible because it is the one number
                  that changes what you can do next. Everything else folds into
@@ -816,54 +928,32 @@ export default function App() {
             {/* The working element: URL bar */}
             <div className="urlbar-wrap rise r5" ref={urlbarRef}>
               <div className="urlbar-glow" aria-hidden="true" />
-              <div className="source-tabs" role="tablist" aria-label="Video source">
-                <button type="button" role="tab" aria-selected={sourceMode === "link"}
-                        className={sourceMode === "link" ? "on" : ""}
-                        onClick={() => setSourceMode("link")}>Link</button>
-                <button type="button" role="tab" aria-selected={sourceMode === "upload"}
-                        className={sourceMode === "upload" ? "on" : ""}
-                        onClick={() => setSourceMode("upload")}>Upload</button>
-              </div>
-              <div className="urlbar">
-                {sourceMode === "link" ? <>
+              <SourceTabs value={sourceMode} onChange={setSourceMode} />
+              {sourceMode === "link" ? (
+                <div className="urlbar">
                   <svg className="urlbar-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" aria-hidden="true">
                     <path d="M10.6 13.4a4.5 4.5 0 0 0 6.36 0l3-3a4.5 4.5 0 1 0-6.36-6.36l-1.5 1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                     <path d="M13.4 10.6a4.5 4.5 0 0 0-6.36 0l-3 3a4.5 4.5 0 1 0 6.36 6.36l1.5-1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                   </svg>
-                  <input type="url" placeholder="Paste a video link..." value={url}
+                  <input type="url" placeholder="Paste a YouTube, X or TikTok link..." value={url}
                          onChange={(e) => setUrl(e.target.value)}
-                         onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-                         disabled={jobActive} aria-label="Public video URL" />
-                </> : (
-                  <label className="source-file">
-                    <input type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/webm,video/x-matroska"
-                           onChange={(e) => setUploadFile(e.target.files?.[0] || null)} disabled={jobActive} />
-                    <span className="source-file-name">{uploadFile?.name || "Choose a video file"}</span>
-                    <span className="source-file-action">Browse</span>
-                  </label>
-                )}
-                <button
-                  className="btn btn-primary btn-shine"
-                  onClick={() => {
-                    setStudioOpen(true);
-                    // A job already running means this is a way back to its
-                    // progress, not a new run -- leaving it disabled stranded
-                    // anyone who closed the studio mid-job.
-                    if (!jobActive) { setStage("setup"); setOptionsOpen(true); }
-                  }}
-                  disabled={submitting || (!jobActive && !sourceReady)}
-                >
-                  {submitting ? "Starting..." : jobActive ? "View progress" : "Continue"}
-                  {!submitting && !jobActive && (
-                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
-                      <path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  )}
-                </button>
-              </div>
-              <SourcePreview preview={linkPreview} loading={previewLoading} error={previewError}
-                             uploadUrl={sourceMode === "upload" ? uploadPreviewUrl : ""}
-                             uploadFile={sourceMode === "upload" ? uploadFile : null} />
+                         onKeyDown={(e) => e.key === "Enter" && sourceReady && openStudio()}
+                         disabled={jobActive} aria-label="Public video URL"
+                         data-testid="hero-url-input" />
+                  {continueBtn}
+                </div>
+              ) : (
+                <>
+                  <DropZone file={uploadFile} onFile={setUploadFile} disabled={jobActive} />
+                  <div className="dropzone-actions" style={{ justifyContent: "center" }}>
+                    {continueBtn}
+                  </div>
+                </>
+              )}
+              {sourceMode === "link" && (
+                <SourcePreview preview={linkPreview} loading={previewLoading}
+                               error={previewError} uploadUrl="" uploadFile={null} />
+              )}
 
             </div>
 
@@ -1096,42 +1186,48 @@ export default function App() {
 
             {!job && (
               <div className="workspace-compose">
-                <div className="source-tabs workspace-source-tabs" role="tablist" aria-label="Video source">
-                  <button type="button" role="tab" aria-selected={sourceMode === "link"}
-                          className={sourceMode === "link" ? "on" : ""}
-                          onClick={() => setSourceMode("link")}>Link</button>
-                  <button type="button" role="tab" aria-selected={sourceMode === "upload"}
-                          className={sourceMode === "upload" ? "on" : ""}
-                          onClick={() => setSourceMode("upload")}>Upload</button>
-                </div>
-                <div className="workspace-urlrow">
-                  {sourceMode === "link" ? (
+                <SourceTabs value={sourceMode} onChange={setSourceMode}
+                            className="workspace-source-tabs" />
+                {sourceMode === "link" ? (
+                  <div className="workspace-urlrow">
                     <input type="url" placeholder="Paste a public video link..." value={url}
                            onChange={(e) => setUrl(e.target.value)}
+                           data-testid="studio-url-input"
                            onKeyDown={(e) => {
                              if (e.key === "Enter" && url.trim()) { setStage("setup"); setOptionsOpen(true); }
                            }} aria-label="Public video URL" />
-                  ) : (
-                    <label className="source-file">
-                      <input type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/webm,video/x-matroska"
-                             onChange={(e) => setUploadFile(e.target.files?.[0] || null)} />
-                      <span className="source-file-name">{uploadFile?.name || "Choose a video file"}</span>
-                      <span className="source-file-action">Browse</span>
-                    </label>
-                  )}
-                  {stage !== "setup" && (
-                    <button
-                      className="btn btn-primary btn-sm btn-shine"
-                      disabled={!sourceReady}
-                      onClick={() => { setStage("setup"); setOptionsOpen(true); }}
-                    >
-                      Continue
-                    </button>
-                  )}
-                </div>
-                <SourcePreview preview={linkPreview} loading={previewLoading} error={previewError}
-                               uploadUrl={sourceMode === "upload" ? uploadPreviewUrl : ""}
-                               uploadFile={sourceMode === "upload" ? uploadFile : null} />
+                    {stage !== "setup" && (
+                      <button
+                        className="btn btn-primary btn-sm btn-shine"
+                        disabled={!sourceReady}
+                        data-testid="studio-continue-btn"
+                        onClick={() => { setStage("setup"); setOptionsOpen(true); }}
+                      >
+                        Continue
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    <DropZone file={uploadFile} onFile={setUploadFile} />
+                    {stage !== "setup" && (
+                      <div className="dropzone-actions">
+                        <button
+                          className="btn btn-primary btn-sm btn-shine"
+                          disabled={!sourceReady}
+                          data-testid="studio-continue-btn"
+                          onClick={() => { setStage("setup"); setOptionsOpen(true); }}
+                        >
+                          Continue
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+                {sourceMode === "link" && (
+                  <SourcePreview preview={linkPreview} loading={previewLoading}
+                                 error={previewError} uploadUrl="" uploadFile={null} />
+                )}
               </div>
             )}
 
@@ -1171,21 +1267,27 @@ export default function App() {
                 </label>
                 <button
                   type="button"
-                  className={`chip ${burnSubtitles ? "active" : ""}`}
+                  className={`chip toggle ${burnSubtitles ? "active" : ""}`}
                   onClick={() => setBurnSubtitles((v) => !v)}
                   disabled={jobActive}
+                  role="switch"
+                  aria-checked={burnSubtitles}
+                  data-testid="opt-captions"
                 >
-                  <span className="chip-check" aria-hidden="true">{burnSubtitles ? "✓" : ""}</span>
+                  <span className="chip-switch" aria-hidden="true" />
                   Captions
                 </button>
                 <button
                   type="button"
-                  className={`chip ${autoCensor ? "active" : ""}`}
+                  className={`chip toggle ${autoCensor ? "active" : ""}`}
                   onClick={() => setAutoCensor((v) => !v)}
                   disabled={jobActive}
+                  role="switch"
+                  aria-checked={autoCensor}
+                  data-testid="opt-censor"
                   title="Mutes profanity and stars it in captions, so clips stay monetisable"
                 >
-                  <span className="chip-check" aria-hidden="true">{autoCensor ? "✓" : ""}</span>
+                  <span className="chip-switch" aria-hidden="true" />
                   Auto-censor
                 </button>
                 {/* Shown to everyone, locked for plans that do not include it.
@@ -1195,21 +1297,30 @@ export default function App() {
                     `canMultilingual` is presentation only. */}
                 <button
                   type="button"
-                  className={`chip ${multilingual ? "active" : ""} ${canMultilingual ? "" : "locked"}`}
+                  className={`chip toggle ${multilingual ? "active" : ""} ${canMultilingual ? "" : "locked"}`}
                   onClick={() => canMultilingual
                     ? setMultilingual((v) => !v)
                     : document.getElementById("pricing")
                         ?.scrollIntoView({ behavior: "smooth" })}
                   disabled={jobActive}
+                  role={canMultilingual ? "switch" : undefined}
+                  aria-checked={canMultilingual ? multilingual : undefined}
+                  data-testid="opt-multilingual"
                   title={canMultilingual
                     ? (user?.is_admin
                         ? "Unlocked by your admin account — transcribes speech that switches language mid-sentence"
                         : "Transcribes speech that switches language mid-sentence, like Hindi and English in one line")
                     : "Creator and Pro plans — for speech that switches language mid-sentence"}
                 >
-                  <span className="chip-check" aria-hidden="true">
-                    {canMultilingual ? (multilingual ? "✓" : "") : "🔒"}
-                  </span>
+                  {canMultilingual ? (
+                    <span className="chip-switch" aria-hidden="true" />
+                  ) : (
+                    <svg className="chip-lock" viewBox="0 0 24 24" width="13" height="13"
+                         fill="none" aria-hidden="true">
+                      <rect x="5" y="11" width="14" height="9" rx="2.2" stroke="currentColor" strokeWidth="2" />
+                      <path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                    </svg>
+                  )}
                   Mixed language
                 </button>
                 <label className="chip">
@@ -1397,6 +1508,7 @@ export default function App() {
                         className="btn btn-ghost btn-sm clip-edit"
                         onClick={() => setEditing({ clip, index: i })}
                         title="Trim or extend this clip"
+                        data-testid={`clip-trim-${i}`}
                       >
                         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" aria-hidden="true">
                           <path d="M4 8h16M4 16h16M9 5v6M15 13v6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
@@ -1407,6 +1519,7 @@ export default function App() {
                         className="btn btn-primary btn-shine clip-download"
                         href={clipUrl(job.id, clip.file, clip.version)}
                         download={downloadName(clip.title, i)}
+                        data-testid={`clip-download-${i}`}
                       >
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
                           <path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />

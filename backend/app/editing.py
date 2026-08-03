@@ -130,6 +130,8 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                   caption_size: int = None, caption_pos: float = None,
                   caption_anim: str = None, speed: float = None,
                   speed_pitched: bool = False, background: str = None,
+                  caption_color: str = None, caption_active_color: str = None,
+                  captions_on: bool = True,
                   title_style: str = None, title_font: str = None):
     """Re-cuts clip `index` of `job_id` to [start, end]. Returns the updated clip.
 
@@ -239,7 +241,8 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                                      else (words, None))
 
         subtitle_path = None
-        if options.get("burn_subtitles", True) and caption_words:
+        if (captions_on and options.get("burn_subtitles", True)
+                and caption_words):
             subtitle_path = os.path.join(job_dir, f"clip_{index + 1}.ass")
             if translate_to:
                 # Translated subtitles: whole lines on the original utterance
@@ -261,12 +264,16 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                                           style=style, play_res=(out_w, out_h),
                                           title=clip.title or "", font=caption_font,
                                           size_px=size_px, animation=caption_anim,
+                                          color=caption_color,
+                                          active_color=caption_active_color,
                                           title_style=title_style, title_font=title_font)
             else:
                 subtitles.build_ass(caption_words, caption_offset, subtitle_path, margin_v,
                                     style=style, play_res=(out_w, out_h),
                                     title=clip.title or "", keywords=clip.keywords,
                                     font=caption_font, size_px=size_px, animation=caption_anim,
+                                    color=caption_color,
+                                    active_color=caption_active_color,
                                     title_style=title_style, title_font=title_font)
 
         out_name = f"clip_{index + 1}.mp4"

@@ -656,6 +656,12 @@ class ClipRecipe(BaseModel):
     caption_size: Optional[int] = None      # px on the 1080x1920 reference canvas
     caption_pos: Optional[float] = None     # 0..1 down the frame, centre of the block
     caption_anim: Optional[str] = None      # entrance animation preset
+    # Overriding the preset's colours is the change people reach for first --
+    # every preset ships white text, so the style picker alone only ever changed
+    # how the spoken word was marked.
+    caption_color: Optional[str] = None     # CSS hex for the resting text
+    caption_active_color: Optional[str] = None   # CSS hex for the spoken word
+    captions_on: Optional[bool] = None      # False = export with no captions
     speed: Optional[float] = None           # 0.5 - 3.0 playback speed
     speed_pitched: Optional[bool] = None    # True = pitch rides with speed (meme)
     background: Optional[str] = None        # bar colour for the fit/pad frame
@@ -787,6 +793,9 @@ def export_clip(job_id: str, index: int):
             caption_size=recipe.get("caption_size"),
             caption_pos=recipe.get("caption_pos"),
             caption_anim=recipe.get("caption_anim"),
+            caption_color=recipe.get("caption_color"),
+            caption_active_color=recipe.get("caption_active_color"),
+            captions_on=recipe.get("captions_on", True),
             speed=recipe.get("speed"),
             speed_pitched=bool(recipe.get("speed_pitched")),
             background=recipe.get("background"),

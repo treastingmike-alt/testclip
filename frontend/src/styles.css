@@ -342,7 +342,7 @@ body::after {
   top: -160px;
   right: 50%;
   margin-right: -600px;
-  background: radial-gradient(circle, rgba(216, 242, 78, 0.55), transparent 70%);
+  background: radial-gradient(circle, rgba(99, 102, 241, 0.5), transparent 70%);
   animation-delay: -7s;
 }
 
