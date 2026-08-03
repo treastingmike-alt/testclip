@@ -148,9 +148,138 @@ const SAFE = { top: 0.06, bottom: 0.12, right: 0.10 };
 const MIN_CLIP = 3;
 const CONTEXT = 30;
 
+// Mirrors backend pipeline/pacing.py. The editor cannot honestly preview a
+// clip with pauses removed unless it uses the same speech map the renderer uses.
+const TIGHTEN_MAX_PAUSE = 0.35;
+const TIGHTEN_HEAD_PAD = 0.08;
+const TIGHTEN_TAIL_PAD = 0.12;
+const TIGHTEN_MIN_SEGMENT = 0.20;
+const TIGHTEN_MIN_REMOVED = 0.4;
+
 function fmt(t) {
   const s = Math.max(0, t);
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}.${String(Math.floor((s % 1) * 10))}`;
+}
+
+function wordsForRange(utterances, start, end, lineEdits = {}) {
+  const out = [];
+  for (const [i, u] of (utterances || []).entries()) {
+    if (u.end <= start || u.start >= end) continue;
+
+    const edited = lineEdits[i] !== undefined;
+    if (edited) {
+      const spanStart = Math.max(u.start, start);
+      const spanEnd = Math.min(u.end, end);
+      const toks = String(lineEdits[i] ?? u.text ?? "").split(/\s+/).filter(Boolean);
+      const dt = (spanEnd - spanStart) / Math.max(toks.length, 1);
+      toks.forEach((w, k) => {
+        const t = spanStart + k * dt;
+        out.push({ start: t, end: Math.min(spanEnd, t + dt * 0.85), text: w });
+      });
+      continue;
+    }
+
+    for (const w of u.words || []) {
+      const ws = Number(w.t ?? w.start);
+      const we = Number(w.e ?? w.end);
+      const mid = (ws + we) / 2;
+      if (start <= mid && mid <= end) {
+        out.push({ start: ws, end: we, text: w.w ?? w.word ?? "" });
+      }
+    }
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+
+function planTightSegments(words, clipStart, clipEnd) {
+  if (!words.length) return [];
+
+  const raw = [];
+  let segStart = words[0].start - TIGHTEN_HEAD_PAD;
+  let prevEnd = words[0].end;
+
+  for (const word of words.slice(1)) {
+    if (word.start - prevEnd > TIGHTEN_MAX_PAUSE) {
+      raw.push([Math.max(0, segStart), prevEnd + TIGHTEN_TAIL_PAD]);
+      segStart = word.start - TIGHTEN_HEAD_PAD;
+    }
+    prevEnd = word.end;
+  }
+  raw.push([Math.max(0, segStart), prevEnd + TIGHTEN_TAIL_PAD]);
+
+  const merged = [];
+  for (const [rawStart, rawEnd] of raw) {
+    const s = Math.max(rawStart, clipStart);
+    const e = Math.min(rawEnd, clipEnd);
+    if (e - s < TIGHTEN_MIN_SEGMENT) continue;
+    if (merged.length && s <= merged[merged.length - 1][1]) {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+    } else {
+      merged.push([s, e]);
+    }
+  }
+  return merged;
+}
+
+function buildTimelineMap(transcript, start, end, lineEdits, tighten) {
+  const sourceDuration = Math.max(end - start, 0.001);
+  const base = {
+    active: false,
+    duration: sourceDuration,
+    words: wordsForRange(transcript?.utterances || [], start, end, lineEdits),
+    segments: [{ start, end, outStart: 0, outEnd: sourceDuration }],
+    sourceToOutput: (t) => Math.min(Math.max(t - start, 0), sourceDuration),
+    outputToSource: (t) => start + Math.min(Math.max(t, 0), sourceDuration),
+    nextSource: (t) => (t < start ? start : t <= end ? t : null),
+  };
+  if (!tighten || !transcript?.utterances?.length || !base.words.length) return base;
+
+  const planned = planTightSegments(base.words, start, end);
+  const kept = planned.reduce((sum, [s, e]) => sum + e - s, 0);
+  const removed = Math.max(0, sourceDuration - kept);
+  if (!planned.length || removed < TIGHTEN_MIN_REMOVED) return base;
+
+  let elapsed = 0;
+  const segments = planned.map(([s, e]) => {
+    const seg = { start: s, end: e, outStart: elapsed, outEnd: elapsed + e - s };
+    elapsed += e - s;
+    return seg;
+  });
+
+  function sourceToOutput(t) {
+    const clamped = Math.min(Math.max(t, start), end);
+    for (const seg of segments) {
+      if (clamped < seg.start) return seg.outStart;
+      if (clamped <= seg.end) return seg.outStart + (clamped - seg.start);
+    }
+    return elapsed;
+  }
+
+  function outputToSource(t) {
+    const clamped = Math.min(Math.max(t, 0), elapsed);
+    for (const seg of segments) {
+      if (clamped <= seg.outEnd) return seg.start + Math.max(0, clamped - seg.outStart);
+    }
+    return segments[segments.length - 1].end;
+  }
+
+  function nextSource(t) {
+    for (const seg of segments) {
+      if (t < seg.start) return seg.start;
+      if (t <= seg.end) return t;
+    }
+    return null;
+  }
+
+  return {
+    active: true,
+    duration: Math.max(elapsed, 0.001),
+    words: base.words,
+    segments,
+    sourceToOutput,
+    outputToSource,
+    nextSource,
+  };
 }
 
 /**
@@ -250,9 +379,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const setSpeed = (v) => history.apply({ speed: v }, { discrete: true });
   const setSpeedPitched = (v) => history.apply({ speedPitched: v }, { discrete: true });
   const setBackground = (v) => history.apply({ background: v }, { discrete: true });
-  const setLineEdits = (v) =>
+  const setLineEdits = (v, opts = { discrete: true }) =>
     history.apply((p) => ({ ...p, lineEdits: typeof v === "function" ? v(p.lineEdits) : v }),
-                  { discrete: true });
+                  opts);
   const setOverlayList = (v, opts) =>
     history.apply((p) => ({ ...p, overlayList: typeof v === "function" ? v(p.overlayList) : v }),
                   opts);
@@ -353,7 +482,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   }, [speed, speedPitched, transcript]);
 
   function onMeta(e) {
-    e.target.currentTime = toProxy(start);
+    e.target.currentTime = toProxy(clipMap.outputToSource(0));
     setSrcDims({ w: e.target.videoWidth, h: e.target.videoHeight });
   }
 
@@ -461,21 +590,50 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     return () => clearInterval(t);
   }, [proxyReady, proxySrc]);
 
-  /* Playback is confined to [start, end] without touching the file: seek in,
-     and loop back when the playhead runs past the out-point. */
+  const view = useMemo(() => {
+    const total = transcript?.duration ?? clip.end + CONTEXT;
+    return { from: Math.max(0, clip.start - CONTEXT), to: Math.min(total, clip.end + CONTEXT) };
+  }, [transcript, clip.start, clip.end]);
+
+  const tightenPauses = job.options?.tighten_pauses !== false;
+  const viewMap = useMemo(
+    () => buildTimelineMap(transcript, view.from, view.to, lineEdits, tightenPauses),
+    [transcript, view.from, view.to, lineEdits, tightenPauses],
+  );
+  const clipMap = useMemo(
+    () => buildTimelineMap(transcript, start, end, lineEdits, tightenPauses),
+    [transcript, start, end, lineEdits, tightenPauses],
+  );
+  const span = Math.max(viewMap.duration, 0.001);
+  const pct = (t) => (viewMap.sourceToOutput(t) / span) * 100;
+  const clipNow = clipMap.sourceToOutput(now);
+  const clipDuration = Math.max(clipMap.duration, 0.1);
+
+  /* Playback is confined to the tightened clip without touching the file:
+     the proxy still contains source video, so the player jumps over the same
+     dead-air gaps ffmpeg will remove during export. */
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     function onTime() {
-      setNow(fromProxy(v.currentTime));
-      if (fromProxy(v.currentTime) >= end) {
-        v.currentTime = toProxy(start);
+      const sourceTime = fromProxy(v.currentTime);
+      const next = clipMap.nextSource(sourceTime);
+      if (sourceTime >= end || next === null) {
+        v.currentTime = toProxy(clipMap.outputToSource(0));
         if (!playing) v.pause();
+        setNow(clipMap.outputToSource(0));
+        return;
       }
+      if (Math.abs(next - sourceTime) > 0.03) {
+        v.currentTime = toProxy(next);
+        setNow(next);
+        return;
+      }
+      setNow(sourceTime);
     }
     v.addEventListener("timeupdate", onTime);
     return () => v.removeEventListener("timeupdate", onTime);
-  }, [start, end, playing]);
+  }, [end, playing, clipMap]);
 
   // Persist the recipe, debounced. Cheap (no render), so it can be automatic.
   useEffect(() => {
@@ -586,20 +744,23 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     setSelected(null);
   };
 
-  const view = useMemo(() => {
-    const total = transcript?.duration ?? clip.end + CONTEXT;
-    return { from: Math.max(0, clip.start - CONTEXT), to: Math.min(total, clip.end + CONTEXT) };
-  }, [transcript, clip.start, clip.end]);
-
-  const span = Math.max(view.to - view.from, 0.001);
-  const pct = (t) => ((t - view.from) / span) * 100;
+  function updateLineEdit(i, text, original) {
+    setLineEdits((prev) => {
+      const next = { ...prev };
+      const cleaned = text.trim();
+      if (!cleaned || cleaned === original) delete next[i];
+      else next[i] = text;
+      return next;
+    }, { discrete: false });
+  }
 
   useEffect(() => {
     if (!dragging) return;
     function onMove(e) {
       const rect = trackRef.current.getBoundingClientRect();
       const x = e.clientX ?? e.touches?.[0]?.clientX;
-      const t = view.from + Math.min(Math.max((x - rect.left) / rect.width, 0), 1) * span;
+      const outT = Math.min(Math.max((x - rect.left) / rect.width, 0), 1) * span;
+      const t = viewMap.outputToSource(outT);
       if (dragging === "start") {
         const v = Math.min(t, end - MIN_CLIP);
         setStart(v);
@@ -619,7 +780,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", stop);
     };
-  }, [dragging, start, end, view.from, span]);
+  }, [dragging, start, end, span, viewMap]);
 
   /* The cue under the playhead, chunked exactly as the renderer will chunk it. */
   const cue = useMemo(() => {
@@ -666,13 +827,20 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     if (blurRef.current) blurRef.current.currentTime = toProxy(t);
   }
 
+  function seekClipTime(t) {
+    seek(clipMap.outputToSource(t));
+  }
+
   function togglePlay() {
     const v = videoRef.current;
     if (!v) return;
     const g = gameplayRef.current;
     if (v.paused) {
       const at = fromProxy(v.currentTime);
-      if (at < start || at >= end) v.currentTime = toProxy(start);
+      if (at < start || at >= end || clipMap.nextSource(at) === null) {
+        v.currentTime = toProxy(clipMap.outputToSource(0));
+        setNow(clipMap.outputToSource(0));
+      }
       v.play(); g?.play().catch(() => {});
       setPlaying(true);
     } else {
@@ -699,7 +867,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     }
   }
 
-  const duration = end - start;
+  const duration = clipDuration;
 
   return createPortal(
     <div className="live-page">
@@ -823,7 +991,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
           <div className="live-left">
           {/* Stage: the proxy, framed exactly as the renderer frames it */}
           <div className="live-stage">
-            <div className={`stage-frame frame-${frameMode}`}
+            <div className={`stage-frame frame-${frameMode} ratio-${ratio.replace(":", "-")}`}
                  style={{ aspectRatio: String(RATIOS[ratio] ?? 9 / 16),
                           background: frameMode === "fit"
                             ? (background === "black" ? "#000" : background)
@@ -943,7 +1111,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   (subtitles.TITLE_STYLE: top 7%, first 4.5s). Editing the title
                   or its look now shows up here instead of only after an
                   export. */}
-              {title.trim() && titleStyle !== "none" && (now - start) < TITLE_SECONDS && (
+              {title.trim() && titleStyle !== "none" && clipNow < TITLE_SECONDS && (
                 <div className="stage-title" style={{ top: `${TITLE_TOP * 100}%` }}>
                   <span style={{
                     fontFamily: fontCss(titleFont),
@@ -957,7 +1125,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
 
               {cue && (
                 <div
-                  className={`stage-caption draggable ${st.position === "middle" && capPos === null ? "mid" : ""}`}
+                  className={`stage-caption draggable cap-enter-${st.entrance || "none"} ${st.position === "middle" && capPos === null ? "mid" : ""}`}
                   style={capPos !== null
                     ? { top: `${capPos * 100}%`, bottom: "auto", transform: "translateY(-50%)" }
                     : undefined}
@@ -965,6 +1133,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   title="Drag to move captions"
                 >
                   <span
+                    key={cue.words.join(" ")}
                     className="cap-inner"
                     style={{
                       fontFamily: fontCss(capFont),
@@ -1001,10 +1170,10 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
               )}
 
               {overlayList.map((o, i) => {
-                /* `now` is source time; overlay windows are clip-relative, which
-                   is the same basis the renderer uses after trimming. */
-                const rel = now - start;
-                const on = rel >= (o.t_start ?? 0) && rel <= (o.t_end ?? (end - start));
+                /* Overlay windows are clip-output-relative, after the same
+                   pause tightening the renderer applies. */
+                const rel = clipNow;
+                const on = rel >= (o.t_start ?? 0) && rel <= (o.t_end ?? clipDuration);
                 // Outside its window an overlay is GONE from the export. A
                 // selected one is still drawn, faint, so it can be positioned --
                 // but never at full strength, which would claim it is on screen.
@@ -1063,7 +1232,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                 {playing ? "❚❚" : "▶"}
               </button>
               <span className="stage-time">
-                {fmt(Math.max(0, now - start))} / {duration.toFixed(1)}s
+                {fmt(clipNow)} / {duration.toFixed(1)}s
               </span>
             </div>
           </div>
@@ -1076,14 +1245,14 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                  // Clicking the bar scrubs. Handles stop propagation, so
                  // grabbing an in/out point still trims rather than seeks.
                  const r = trackRef.current.getBoundingClientRect();
-                 const t = view.from
-                   + Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1) * span;
+                 const t = viewMap.outputToSource(
+                   Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1) * span);
                  seek(Math.min(Math.max(t, start), end));
                  setDragging("scrub");
                }}>
-            {transcript?.utterances?.map((u, i) => (
+            {viewMap.words.map((w, i) => (
               <span key={i} className="tl-tick"
-                    style={{ left: `${pct(u.start)}%`, width: `${Math.max(pct(u.end) - pct(u.start), 0.3)}%` }} />
+                    style={{ left: `${pct(w.start)}%`, width: `${Math.max(pct(w.end) - pct(w.start), 0.3)}%` }} />
             ))}
             <span className="tl-selection" style={{ left: `${pct(start)}%`, width: `${pct(end) - pct(start)}%` }} />
             {/* Grabbable, so you can step back through a moment instead of
@@ -1098,16 +1267,19 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   onMouseDown={(e) => { e.stopPropagation(); setDragging("end"); }}
                   role="slider" aria-label="Clip end" />
           </div>
-          <div className="tl-scale"><span>{fmt(view.from)}</span><span>{fmt(view.to)}</span></div>
+          <div className="tl-scale">
+            <span>{fmt(0)}</span>
+            <span>{fmt(viewMap.duration)}</span>
+          </div>
         </div>
 
         <TimelineTracks
-          clipDuration={Math.max(end - start, 0.1)}
-          now={Math.min(Math.max(now - start, 0), end - start)}
+          clipDuration={clipDuration}
+          now={Math.min(Math.max(clipNow, 0), clipDuration)}
           overlays={overlayList}
           selected={selected}
           onSelect={selectOverlay}
-          onSeek={(t) => seek(start + t)}
+          onSeek={seekClipTime}
           onChange={(i, patch) => patchOverlay(i, patch)}
         />
           </div>
@@ -1136,17 +1308,13 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   onClick={() => seek(Math.min(Math.max(u.start, start), end))}
                 >
                   <span className="tx-time">{fmt(u.start)}</span>
-                  <span
-                    className="tx-text"
-                    contentEditable
-                    suppressContentEditableWarning
-                    onBlur={(e) => {
-                      const t = e.target.textContent.trim();
-                      if (t && t !== u.text) setLineEdits({ ...lineEdits, [i]: t });
-                    }}
-                  >
-                    {lineEdits[i] ?? u.text}
-                  </span>
+                  <input
+                    className="tx-text tx-input live-cap-input"
+                    value={lineEdits[i] ?? u.text}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => updateLineEdit(i, e.target.value, u.text)}
+                    aria-label={`Caption at ${fmt(u.start)}`}
+                  />
                 </div>
               );
             })}
@@ -1327,7 +1495,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                       title={`Add ${pf.name} handle`}
                       onClick={() => {
                         setOverlayList((l) => [...l,
-                          { ...platformOverlay(pf, ""), t_start: 0, t_end: end - start }],
+                          { ...platformOverlay(pf, ""), t_start: 0, t_end: clipDuration }],
                           { discrete: true });
                         selectOverlay(overlayList.length);
                       }}>

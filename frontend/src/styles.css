@@ -447,6 +447,113 @@ body::after {
   max-width: 740px;
 }
 
+/* One quiet, explicit choice before the source field. Link and upload are two
+   genuinely different intake flows, so tabs prevent the file picker from
+   masquerading as a URL field. */
+.source-tabs {
+  display: inline-flex;
+  gap: 3px;
+  margin: 0 0 9px 12px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+}
+.source-tabs button {
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-faint);
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.source-tabs button.on { background: var(--ink); color: #fff; }
+.source-tabs button:not(.on):hover { color: var(--ink); }
+
+.source-file {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.source-file input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+.source-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-soft);
+  font-size: 16px;
+}
+.source-file-action {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 9px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+.source-file:hover .source-file-action,
+.source-file:focus-within .source-file-action { border-color: var(--violet); color: var(--violet); }
+
+/* A source must be recognisable before it becomes a paid/background job. */
+.source-preview {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 72px;
+  margin: 10px 12px 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255,255,255,.78);
+  text-align: left;
+}
+.source-preview img,
+.source-preview video,
+.source-preview-fallback {
+  width: 92px;
+  height: 54px;
+  flex: none;
+  object-fit: cover;
+  border-radius: 5px;
+  background: #17171d;
+}
+.source-preview-fallback {
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+.source-preview-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.source-preview-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.25;
+}
+.source-preview-copy span { color: var(--ink-faint); font-size: 11.5px; line-height: 1.25; }
+.source-preview.loading { color: var(--ink-faint); font-size: 13px; padding-left: 14px; }
+.source-preview.problem { color: var(--danger); font-size: 12.5px; line-height: 1.35; }
+
 /* rotating gradient halo behind the bar */
 .urlbar-glow {
   position: absolute;
@@ -3234,6 +3341,8 @@ body::after {
 
 .workspace-compose { margin-bottom: 34px; }
 
+.workspace-source-tabs { margin-left: 0; }
+
 .workspace-urlrow {
   display: flex;
   gap: 10px;
@@ -3255,6 +3364,8 @@ body::after {
 }
 
 .workspace-urlrow input:focus { outline: none; }
+.workspace-urlrow .source-file { min-height: 42px; }
+.workspace-compose > .source-preview { margin-left: 0; margin-right: 0; }
 
 /* the moved settings block sits directly on the workspace background */
 .workspace .composer-options { margin-top: 0; }
@@ -3418,9 +3529,11 @@ body::after {
    aspect-ratio derive the width makes the frame genuinely portrait. */
 .stage-frame {
   position: relative;
-  height: min(62vh, 720px);
-  width: auto;
-  max-width: 100%;
+  /* The canvas must retain its real export geometry. A fixed height plus only
+     max-width made wide canvases squeeze horizontally while keeping a portrait
+     height, so choosing 16:9 produced a stage that was not 16:9 at all. */
+  width: min(100%, 405px);
+  height: auto;
   margin: 0 auto;
   background: #000;
   border-radius: 14px;
@@ -3429,6 +3542,13 @@ body::after {
      stage the way burned-in captions scale with the output canvas */
   container-type: size;
 }
+
+/* Width-first sizing lets aspect-ratio derive the matching height. The viewport
+   limits preserve a comfortably large portrait preview without letting a 16:9
+   canvas spill below the editor controls. */
+.stage-frame.ratio-9-16 { width: min(100%, 36vh, 427px); }
+.stage-frame.ratio-1-1 { width: min(100%, 64vh, 760px); }
+.stage-frame.ratio-16-9 { width: min(100%, 113.78vh, 1351px); }
 
 .stage-frame video {
   width: 100%;
@@ -3555,6 +3675,10 @@ body::after {
   text-align: center;
   pointer-events: none;
   line-height: 1.25;
+  /* Foreground video layers deliberately sit at z-index 1. Captions are an
+     editor overlay, so they must explicitly clear those layers or they render
+     correctly but invisibly behind the preview video. */
+  z-index: 3;
 }
 /* Podcast sits its captions in the band under a high-biased video. */
 .stage-frame.frame-podcast .stage-caption { bottom: 28%; }
@@ -3568,6 +3692,37 @@ body::after {
   padding: 2px 8px;
   border-radius: 6px;
   overflow-wrap: break-word;
+}
+
+/* Matches the short ASS entrance applied to the first event of each cue. The
+   key on .cap-inner restarts this only when a new cue appears, not every time
+   the active word advances. */
+.cap-enter-fade .cap-inner { animation: stage-cap-fade 160ms ease-out both; }
+.cap-enter-pop .cap-inner { animation: stage-cap-pop 160ms ease-out both; }
+.cap-enter-punch .cap-inner { animation: stage-cap-punch 140ms ease-out both; }
+.cap-enter-bounce .cap-inner { animation: stage-cap-bounce 180ms ease-out both; }
+.cap-enter-riseup .cap-inner { animation: stage-cap-riseup 180ms ease-out both; }
+
+@keyframes stage-cap-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes stage-cap-pop {
+  from { opacity: 0; transform: scale(.6); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes stage-cap-punch {
+  from { opacity: 0; transform: scale(1.3); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes stage-cap-bounce {
+  0% { opacity: 0; transform: scale(.7); }
+  55% { opacity: 1; transform: scale(1.12); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes stage-cap-riseup {
+  from { opacity: 0; transform: translateY(1.2em); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .stage-controls { display: flex; align-items: center; gap: 12px; }
@@ -3677,7 +3832,9 @@ body::after {
 
 @media (max-width: 1000px) {
   .live-body { grid-template-columns: 1fr; padding: 18px; }
-  .stage-frame { height: min(46vh, 420px); }
+  .stage-frame.ratio-9-16 { width: min(100%, 25.875vh, 236px); }
+  .stage-frame.ratio-1-1 { width: min(100%, 46vh, 420px); }
+  .stage-frame.ratio-16-9 { width: min(100%, 81.78vh, 747px); }
   .live-transcript { max-height: 34vh; }
   .live-head-mid { display: none; }
 }
@@ -4319,8 +4476,10 @@ body::after {
     align-items: center;
   }
 
-  /* The stage can now take real height, since nothing sits under it. */
-  .stage-frame { height: min(64vh, 760px); }
+  /* Ratio-specific width keeps the actual canvas proportional in its column. */
+  .stage-frame.ratio-9-16 { width: min(100%, 36vh, 427px); }
+  .stage-frame.ratio-1-1 { width: min(100%, 64vh, 760px); }
+  .stage-frame.ratio-16-9 { width: min(100%, 113.78vh, 1351px); }
 }
 
 /* Wide screens: give the inspector a little more room for the pickers. */

@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 requests
 pydantic
+python-multipart
 fonttools
 
 # Face-aware reframing for the Podcast template (app/pipeline/reframe.py).

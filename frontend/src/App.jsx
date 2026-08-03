@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { submitJob, getJob, clipUrl } from "./api";
+import { submitJob, uploadJob, getSourcePreview, getJob, clipUrl } from "./api";
 import LiveEditor from "./LiveEditor";
 import Dashboard from "./Dashboard";
 import Pricing from "./Pricing";
@@ -463,8 +463,41 @@ const HEADLINE = [
   { text: "viral.", cls: "serif grad" },
 ];
 
+function SourcePreview({ preview, loading, error, uploadUrl, uploadFile }) {
+  if (uploadUrl && uploadFile) {
+    return (
+      <div className="source-preview" aria-label="Selected upload preview">
+        <video src={uploadUrl} muted playsInline preload="metadata" />
+        <div className="source-preview-copy">
+          <strong>{uploadFile.name}</strong>
+          <span>{Math.max(1, Math.round(uploadFile.size / (1024 * 1024)))} MB · Local upload</span>
+        </div>
+      </div>
+    );
+  }
+  if (loading) return <div className="source-preview loading">Checking video…</div>;
+  if (error) return <div className="source-preview problem">{error}</div>;
+  if (!preview) return null;
+  return (
+    <div className="source-preview" aria-label="Link preview">
+      {preview.thumbnail ? <img src={preview.thumbnail} alt="" /> : <span className="source-preview-fallback">Video</span>}
+      <div className="source-preview-copy">
+        <strong>{preview.title}</strong>
+        <span>{[preview.creator, preview.duration != null ? fmtDuration(preview.duration) : null, preview.platform]
+          .filter(Boolean).join(" · ")}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [url, setUrl] = useState("");
+  const [sourceMode, setSourceMode] = useState("link");
+  const [uploadFile, setUploadFile] = useState(null);
+  const [linkPreview, setLinkPreview] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [uploadPreviewUrl, setUploadPreviewUrl] = useState("");
   const [nClips, setNClips] = useState(3);
   const [burnSubtitles, setBurnSubtitles] = useState(true);
   const [autoCensor, setAutoCensor] = useState(true);
@@ -538,6 +571,39 @@ export default function App() {
   const urlbarRef = useRef(null);
 
   const jobActive = job && !["done", "failed"].includes(job.status);
+  const sourceReady = sourceMode === "upload" ? Boolean(uploadFile) : Boolean(url.trim());
+
+  useEffect(() => {
+    if (!uploadFile) { setUploadPreviewUrl(""); return undefined; }
+    const objectUrl = URL.createObjectURL(uploadFile);
+    setUploadPreviewUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [uploadFile]);
+
+  useEffect(() => {
+    const link = url.trim();
+    if (sourceMode !== "link" || !/^https?:\/\//i.test(link)) {
+      setLinkPreview(null);
+      setPreviewLoading(false);
+      setPreviewError("");
+      return undefined;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      setPreviewLoading(true);
+      setPreviewError("");
+      getSourcePreview(link, controller.signal)
+        .then((data) => setLinkPreview(data))
+        .catch((err) => {
+          if (err.name !== "AbortError") {
+            setLinkPreview(null);
+            setPreviewError(err.message);
+          }
+        })
+        .finally(() => { if (!controller.signal.aborted) setPreviewLoading(false); });
+    }, 650);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [url, sourceMode]);
 
   useReveal();
 
@@ -576,14 +642,13 @@ export default function App() {
   }, [job?.status]);
 
   async function handleSubmit() {
-    if (!url.trim() || submitting) return;
+    if (!sourceReady || submitting) return;
     setSubmitting(true);
     setSubmitError(null);
     setJob(null);
     setStartedAt(Date.now());
     try {
-      const { job_id } = await submitJob({
-        url: url.trim(),
+      const options = {
         nClips,
         mode: "original",
         burnSubtitles,
@@ -597,7 +662,24 @@ export default function App() {
         ratio,
         lengthPref,
         intent: intent.trim(),
-      });
+      };
+      const result = sourceMode === "upload"
+        ? await uploadJob(uploadFile, {
+            url: "upload://local-video",
+            n_clips: options.nClips,
+            mode: options.mode,
+            burn_subtitles: options.burnSubtitles,
+            auto_censor: options.autoCensor,
+            multilingual: options.multilingual,
+            voice: options.voice,
+            language: options.language,
+            template: options.template,
+            ratio: options.ratio,
+            length_pref: options.lengthPref,
+            intent: options.intent,
+          })
+        : await submitJob({ url: url.trim(), ...options });
+      const { job_id } = result;
       const fresh = await getJob(job_id);
       setJob(fresh);
     } catch (e) {
@@ -727,27 +809,39 @@ export default function App() {
             </h1>
 
             <p className="sub rise r4">
-              Paste a YouTube link. Clipper finds the strongest moments, cuts on real
+              Paste a public video link or upload a file. Clipper finds the strongest moments, cuts on real
               speech boundaries, and renders vertical clips with word-accurate captions.
             </p>
 
             {/* The working element: URL bar */}
             <div className="urlbar-wrap rise r5" ref={urlbarRef}>
               <div className="urlbar-glow" aria-hidden="true" />
+              <div className="source-tabs" role="tablist" aria-label="Video source">
+                <button type="button" role="tab" aria-selected={sourceMode === "link"}
+                        className={sourceMode === "link" ? "on" : ""}
+                        onClick={() => setSourceMode("link")}>Link</button>
+                <button type="button" role="tab" aria-selected={sourceMode === "upload"}
+                        className={sourceMode === "upload" ? "on" : ""}
+                        onClick={() => setSourceMode("upload")}>Upload</button>
+              </div>
               <div className="urlbar">
-                <svg className="urlbar-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" aria-hidden="true">
-                  <path d="M10.6 13.4a4.5 4.5 0 0 0 6.36 0l3-3a4.5 4.5 0 1 0-6.36-6.36l-1.5 1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                  <path d="M13.4 10.6a4.5 4.5 0 0 0-6.36 0l-3 3a4.5 4.5 0 1 0 6.36 6.36l1.5-1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                </svg>
-                <input
-                  type="url"
-                  placeholder="Paste a YouTube link..."
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-                  disabled={jobActive}
-                  aria-label="YouTube video URL"
-                />
+                {sourceMode === "link" ? <>
+                  <svg className="urlbar-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" aria-hidden="true">
+                    <path d="M10.6 13.4a4.5 4.5 0 0 0 6.36 0l3-3a4.5 4.5 0 1 0-6.36-6.36l-1.5 1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                    <path d="M13.4 10.6a4.5 4.5 0 0 0-6.36 0l-3 3a4.5 4.5 0 1 0 6.36 6.36l1.5-1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                  <input type="url" placeholder="Paste a video link..." value={url}
+                         onChange={(e) => setUrl(e.target.value)}
+                         onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+                         disabled={jobActive} aria-label="Public video URL" />
+                </> : (
+                  <label className="source-file">
+                    <input type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/webm,video/x-matroska"
+                           onChange={(e) => setUploadFile(e.target.files?.[0] || null)} disabled={jobActive} />
+                    <span className="source-file-name">{uploadFile?.name || "Choose a video file"}</span>
+                    <span className="source-file-action">Browse</span>
+                  </label>
+                )}
                 <button
                   className="btn btn-primary btn-shine"
                   onClick={() => {
@@ -757,7 +851,7 @@ export default function App() {
                     // anyone who closed the studio mid-job.
                     if (!jobActive) { setStage("setup"); setOptionsOpen(true); }
                   }}
-                  disabled={submitting || (!jobActive && !url.trim())}
+                  disabled={submitting || (!jobActive && !sourceReady)}
                 >
                   {submitting ? "Starting..." : jobActive ? "View progress" : "Continue"}
                   {!submitting && !jobActive && (
@@ -767,6 +861,9 @@ export default function App() {
                   )}
                 </button>
               </div>
+              <SourcePreview preview={linkPreview} loading={previewLoading} error={previewError}
+                             uploadUrl={sourceMode === "upload" ? uploadPreviewUrl : ""}
+                             uploadFile={sourceMode === "upload" ? uploadFile : null} />
 
             </div>
 
@@ -912,7 +1009,7 @@ export default function App() {
             {[
               {
                 q: "What do I need to get started?",
-                a: "Just a YouTube link. Paste it, pick how many clips you want, and hit Generate.",
+                a: "Paste a public video link or upload a file, pick how many clips you want, and hit Generate.",
               },
               {
                 q: "Does it work on any video?",
@@ -990,7 +1087,7 @@ export default function App() {
             <header className="dash-head">
               <div>
                 <h2>Studio</h2>
-                <p className="dash-sub">Paste a link. Everything else happens here.</p>
+                <p className="dash-sub">Paste a public link or upload your video.</p>
               </div>
               <button className="btn btn-ghost btn-sm" onClick={() => setStudioOpen(false)}>
                 Exit studio
@@ -999,27 +1096,42 @@ export default function App() {
 
             {!job && (
               <div className="workspace-compose">
+                <div className="source-tabs workspace-source-tabs" role="tablist" aria-label="Video source">
+                  <button type="button" role="tab" aria-selected={sourceMode === "link"}
+                          className={sourceMode === "link" ? "on" : ""}
+                          onClick={() => setSourceMode("link")}>Link</button>
+                  <button type="button" role="tab" aria-selected={sourceMode === "upload"}
+                          className={sourceMode === "upload" ? "on" : ""}
+                          onClick={() => setSourceMode("upload")}>Upload</button>
+                </div>
                 <div className="workspace-urlrow">
-                  <input
-                    type="url"
-                    placeholder="Paste a YouTube link..."
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && url.trim()) { setStage("setup"); setOptionsOpen(true); }
-                    }}
-                    aria-label="YouTube video URL"
-                  />
+                  {sourceMode === "link" ? (
+                    <input type="url" placeholder="Paste a public video link..." value={url}
+                           onChange={(e) => setUrl(e.target.value)}
+                           onKeyDown={(e) => {
+                             if (e.key === "Enter" && url.trim()) { setStage("setup"); setOptionsOpen(true); }
+                           }} aria-label="Public video URL" />
+                  ) : (
+                    <label className="source-file">
+                      <input type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/webm,video/x-matroska"
+                             onChange={(e) => setUploadFile(e.target.files?.[0] || null)} />
+                      <span className="source-file-name">{uploadFile?.name || "Choose a video file"}</span>
+                      <span className="source-file-action">Browse</span>
+                    </label>
+                  )}
                   {stage !== "setup" && (
                     <button
                       className="btn btn-primary btn-sm btn-shine"
-                      disabled={!url.trim()}
+                      disabled={!sourceReady}
                       onClick={() => { setStage("setup"); setOptionsOpen(true); }}
                     >
                       Continue
                     </button>
                   )}
                 </div>
+                <SourcePreview preview={linkPreview} loading={previewLoading} error={previewError}
+                               uploadUrl={sourceMode === "upload" ? uploadPreviewUrl : ""}
+                               uploadFile={sourceMode === "upload" ? uploadFile : null} />
               </div>
             )}
 
@@ -1233,7 +1345,9 @@ export default function App() {
                       }}
                     />
                     <span className="clip-index">#{i + 1}</span>
-                    <span className="clip-duration">{fmtDuration(clip.end - clip.start)}</span>
+                    <span className="clip-duration">
+                      {fmtDuration(clip.duration || (clip.end - clip.start))}
+                    </span>
                   </div>
                   <div className="clip-meta">
                     {/* The score is why you would pick this clip, so it sits

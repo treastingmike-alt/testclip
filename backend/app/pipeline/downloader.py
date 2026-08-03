@@ -252,6 +252,37 @@ def estimate_video_bytes(url: str) -> int:
         return 0
 
 
+def inspect_url(url: str) -> dict:
+    """Read public video metadata without downloading its media streams."""
+    try:
+        proc = subprocess.run(
+            ["yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
+             "--no-warnings", *_cookie_args(), url],
+            capture_output=True, text=True, timeout=45,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError("Could not check that video link. Try again or upload the file.") from exc
+
+    if proc.returncode != 0:
+        raise RuntimeError(_friendly_error(proc.stderr + proc.stdout)
+                           or "Could not read that video link. Check that it is public.")
+    try:
+        info = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("The video site did not return usable preview data.") from exc
+
+    thumbs = info.get("thumbnails") or []
+    thumb = info.get("thumbnail") or next(
+        (item.get("url") for item in reversed(thumbs) if item.get("url")), None)
+    return {
+        "title": info.get("title") or "Untitled video",
+        "creator": info.get("uploader") or info.get("channel") or info.get("extractor_key"),
+        "duration": info.get("duration"),
+        "thumbnail": thumb,
+        "platform": info.get("extractor_key"),
+    }
+
+
 def download_audio(url: str, out_path: str, on_progress=None) -> str:
     """Grabs the audio stream only and transcodes it to 16kHz mono mp3 for Deepgram."""
     raw_path = out_path + ".src"

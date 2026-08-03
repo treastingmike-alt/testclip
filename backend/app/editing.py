@@ -101,6 +101,27 @@ def words_from_lines(lines: list, transcript: dict = None) -> list:
     return words
 
 
+def tightened_duration(transcript: dict, start: float, end: float,
+                       caption_lines: list = None, tighten_pauses: bool = True,
+                       speed: float = None) -> float:
+    """Experienced output duration for an edit recipe.
+
+    `start`/`end` are source bounds. If pause tightening is enabled, the exported
+    MP4 is the sum of kept speech segments, not the raw source span. The editor
+    stores this value so cards and timelines do not keep advertising the dead
+    air that export will remove.
+    """
+    duration = max(end - start, 0.0)
+    if transcript and tighten_pauses:
+        words = (words_from_lines(caption_lines, transcript)
+                 if caption_lines else words_in_range(transcript, start, end))
+        if words:
+            segments, _, removed = pacing.tighten(words, start, end)
+            if segments and removed >= 0.4:
+                duration = sum(e - s for s, e in segments)
+    return round(duration / max(speed or 1.0, 0.001), 1)
+
+
 def rerender_clip(job_id: str, index: int, start: float, end: float,
                   storage_dir: str, templates: dict, gameplay_loops: list = None,
                   caption_style: str = None, caption_lines: list = None,
@@ -198,12 +219,14 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         # written against the original timings would drift by the removed
         # seconds, further out with every pause.
         segments = None
+        render_duration = duration
         if options.get("tighten_pauses", True) and words:
             tightened, remapped, removed = pacing.tighten(words, start, end)
             # The same floor the pipeline uses: under this, a re-cut buys
             # nothing and costs a seam.
             if tightened and removed >= 0.4:
                 segments, words = tightened, remapped
+                render_duration = sum(e - s for s, e in segments)
 
         style = caption_style or (job.options or {}).get("caption_style_override",
                                                          tpl["caption_style"])
@@ -274,10 +297,20 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         )
         os.replace(tmp_path, final_path)
 
+        # The editor proxy is windowed around the committed clip bounds. Once an
+        # export changes those bounds, refresh that low-res proxy so reopening
+        # the editor keeps the source/proxy offset correct.
+        try:
+            lo, hi = render.proxy_window(start, end, job.source_duration)
+            render.make_proxy(source, os.path.join(job_dir, f"preview_{index + 1}.mp4"),
+                              start=lo, end=hi)
+        except Exception as exc:
+            print(f"[clipper] edit: proxy refresh failed ({exc}); export kept")
+
         clip.start = start
         clip.end = end
         # Duration is what the viewer experiences, so a speed change changes it.
-        clip.duration = round(duration / max(speed or 1.0, 0.001), 1)
+        clip.duration = round(render_duration / max(speed or 1.0, 0.001), 1)
         clip.words = words
         session.commit()
         return clip.to_dict()

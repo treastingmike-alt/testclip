@@ -37,6 +37,33 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
   return resp.json(); // { job_id }
 }
 
+/** Uploads a local source video, then starts the exact same clipping pipeline.
+    The options travel as JSON in multipart form so the video never needs to be
+    held in browser memory or encoded as base64. */
+export async function uploadJob(file, options) {
+  const body = new FormData();
+  body.append("file", file);
+  body.append("options", JSON.stringify(options));
+  const resp = await fetch(`${API_BASE}/jobs/upload`, {
+    method: "POST",
+    headers: authHeaders(),
+    body,
+  });
+  if (!resp.ok) throw await readError(resp, `Could not upload video (${resp.status})`);
+  return resp.json();
+}
+
+export async function getSourcePreview(url, signal) {
+  const resp = await fetch(`${API_BASE}/sources/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ url }),
+    signal,
+  });
+  if (!resp.ok) throw await readError(resp, "Could not preview that video");
+  return resp.json();
+}
+
 /* Face-aware crop windows for a podcast clip, so the editor previews the
    composition the clip was actually rendered in. Returns {plan: null} for every
    other template, and whenever detection found nothing to track. */

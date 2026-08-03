@@ -15,6 +15,7 @@ function when(iso) {
 }
 
 function sourceLabel(url) {
+  if (url.startsWith("upload://")) return url.slice("upload://".length);
   try {
     const u = new URL(url);
     return (u.searchParams.get("v") || u.pathname.replace("/", "")) || u.hostname;

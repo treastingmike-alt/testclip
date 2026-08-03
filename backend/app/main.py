@@ -4,7 +4,8 @@ Run with:
     uvicorn app.main:app --reload --port 8000
 
 Endpoints:
-    POST /jobs            submit a video URL, returns a job id
+    POST /jobs            submit a public video URL, returns a job id
+    POST /jobs/upload     upload a local video and return a job id
     GET  /jobs/{job_id}    poll status + get clip results once done
     GET  /clips/{job_id}/{filename}   download a rendered clip
 """
@@ -17,8 +18,10 @@ import subprocess
 import random
 import threading
 import traceback
+import shutil
+from urllib.parse import urlparse
 
-from fastapi import (BackgroundTasks, Depends, FastAPI, File, HTTPException,
+from fastapi import (BackgroundTasks, Depends, FastAPI, File, Form, HTTPException,
                      Request, UploadFile)
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,7 +33,7 @@ from sqlalchemy.orm import Session
 from app import auth, billing, editing, workspace
 from app.db import SessionLocal, get_session, init_db
 from app.jobs import create_job, get_job, get_job_transcript, list_jobs, update_job
-from app.models import Clip, User
+from app.models import Clip, Job, User
 from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
                           pacing, reframe, render, scoring, subtitles,
                           transcriber, voiceover)
@@ -48,6 +51,11 @@ app.add_middleware(
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
 # Drop royalty-safe gameplay loops (mp4/mov) in here to enable the split layout.
 GAMEPLAY_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "gameplay")
+
+# Uploads are streamed to disk, never read into RAM. Keep this configurable for
+# a production host with object storage or a stricter reverse-proxy limit.
+MAX_UPLOAD_BYTES = int(os.environ.get("CLIPPER_MAX_UPLOAD_BYTES", 1024 * 1024 * 1024))
+VIDEO_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 
 # A template is a complete look: how the frame is filled AND how captions are
@@ -200,6 +208,10 @@ class JobRequest(BaseModel):
     # Transcribe speech that switches language mid-sentence with the model that
     # can follow it. Off by default and gated on the plan -- see billing.allows.
     multilingual: bool = False
+
+
+class SourcePreviewRequest(BaseModel):
+    url: str
 
 
 class Credentials(BaseModel):
@@ -662,6 +674,7 @@ def save_clip_edit(job_id: str, index: int, body: ClipRecipe):
     can offer an export.
     """
     with SessionLocal() as session:
+        job = session.get(Job, job_id)
         clip = (session.query(Clip)
                 .filter(Clip.job_id == job_id, Clip.index == index).first())
         if not clip:
@@ -676,9 +689,18 @@ def save_clip_edit(job_id: str, index: int, body: ClipRecipe):
         clip.edit = recipe
         if body.title is not None and body.title.strip():
             clip.title = body.title.strip()[:120]
-        clip.start = body.start
-        clip.end = body.end
-        clip.duration = round(body.end - body.start, 1)
+        # Do not mutate the baked clip bounds until export. The per-clip proxy
+        # was encoded around those baked bounds, and changing them here makes a
+        # reopened editor calculate the wrong proxy offset for the same file.
+        # The recipe carries the draft trim; export commits it.
+        clip.duration = editing.tightened_duration(
+            job.transcript if job else None,
+            body.start,
+            body.end,
+            recipe.get("lines"),
+            ((job.options or {}) if job else {}).get("tighten_pauses", True),
+            body.speed,
+        )
         clip.rendered = False
         session.commit()
         return clip.to_dict()
@@ -808,9 +830,12 @@ def rerender_clip(job_id: str, index: int, body: ClipEdit):
         raise HTTPException(status_code=500, detail=f"Re-render failed: {e}")
 
 
-@app.post("/jobs")
-def submit_job(req: JobRequest, background_tasks: BackgroundTasks,
-               user: User = Depends(auth.current_user_optional)):
+def _prepare_job(req: JobRequest, user: User = None, uploaded: bool = False) -> list:
+    """Validate shared job options and return any pre-resolved gameplay loops."""
+    if not uploaded:
+        parsed = urlparse(req.url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(status_code=400, detail="Paste a public video link starting with http:// or https://.")
     tpl = TEMPLATES.get(req.template)
     if not tpl:
         raise HTTPException(status_code=400,
@@ -849,11 +874,109 @@ def submit_job(req: JobRequest, background_tasks: BackgroundTasks,
     # The editor has to preview the same composition the renderer builds, and it
     # was inferring that from the template name -- so every template added since
     # was silently previewed as `blur`, whatever it actually renders as.
+    return gameplay_loops
+
+
+def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
+               user: User = None, uploaded: bool = False, gameplay_loops: list = None) -> str:
     options = req.dict()
     options["frame"] = TEMPLATES.get(req.template, TEMPLATES["classic"])["frame"]
+    options["input_type"] = "upload" if uploaded else "link"
     job_id = create_job(req.url, options, user_id=user.id if user else None)
     background_tasks.add_task(run_pipeline, job_id, req, gameplay_loops,
-                              user.id if user else None)
+                              user.id if user else None, uploaded)
+    return job_id
+
+
+@app.post("/sources/preview")
+def source_preview(body: SourcePreviewRequest):
+    """Confirm a public URL's identity before a user starts a job."""
+    parsed = urlparse(body.url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Paste a public video link starting with http:// or https://.")
+    try:
+        return downloader.inspect_url(body.url.strip())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/jobs")
+def submit_job(req: JobRequest, background_tasks: BackgroundTasks,
+               user: User = Depends(auth.current_user_optional)):
+    gameplay_loops = _prepare_job(req, user)
+    job_id = _start_job(req, background_tasks, user, gameplay_loops=gameplay_loops)
+    return {"job_id": job_id}
+
+
+def _remove_failed_upload(job_id: str) -> None:
+    """Remove a just-created job if its source file fails validation."""
+    shutil.rmtree(os.path.join(STORAGE_DIR, job_id), ignore_errors=True)
+    with SessionLocal() as session:
+        row = session.get(Job, job_id)
+        if row:
+            session.delete(row)
+            session.commit()
+
+
+def _assert_video_file(path: str) -> None:
+    """Reject a renamed text/archive file before it reaches ffmpeg workers."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or "video" not in probe.stdout:
+        raise HTTPException(status_code=400, detail="That file is not a readable video.")
+
+
+@app.post("/jobs/upload")
+async def submit_uploaded_job(background_tasks: BackgroundTasks,
+                              file: UploadFile = File(...), options: str = Form("{}"),
+                              user: User = Depends(auth.current_user_optional)):
+    """Create a job from a local video without involving a platform downloader."""
+    try:
+        req = JobRequest(**json.loads(options))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Upload settings were invalid.") from exc
+
+    name = os.path.basename(file.filename or "video.mp4")
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in VIDEO_UPLOAD_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Upload an MP4, MOV, M4V, WebM or MKV video.")
+    if (file.content_type and file.content_type != "application/octet-stream"
+            and not file.content_type.startswith("video/")):
+        raise HTTPException(status_code=400, detail="Choose a video file to upload.")
+
+    gameplay_loops = _prepare_job(req, user, uploaded=True)
+    req.url = f"upload://{name}"
+    job_id = _start_job(req, background_tasks, user, uploaded=True,
+                        gameplay_loops=gameplay_loops)
+    job_dir = os.path.join(STORAGE_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    part_path = os.path.join(job_dir, "source.mp4.part")
+    source_path = os.path.join(job_dir, "source.mp4")
+    written = 0
+
+    try:
+        with open(part_path, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploads must be under {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                    )
+                out.write(chunk)
+        if not written:
+            raise HTTPException(status_code=400, detail="That upload was empty.")
+        os.replace(part_path, source_path)
+        _assert_video_file(source_path)
+    except Exception:
+        _remove_failed_upload(job_id)
+        raise
+    finally:
+        await file.close()
+
     return {"job_id": job_id}
 
 
@@ -902,23 +1025,32 @@ def _build_proxies_quietly(job_id: str, video_path: str, job_dir: str,
 
 
 def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
-                 job_user_id: str = None):
+                 job_user_id: str = None, uploaded_source: bool = False):
     gameplay_loops = gameplay_loops or []
     tpl = TEMPLATES.get(req.template, TEMPLATES["classic"])
     job_dir = os.path.join(STORAGE_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        # Audio first: it is a fraction of the video's size, and if the transcript
-        # yields no usable clips we never pay to download the video at all.
-        update_job(job_id, status="downloading", progress_message="Fetching audio track...", percent=0)
-        audio_path = downloader.download_audio(
-            req.url,
-            os.path.join(job_dir, "audio.mp3"),
-            on_progress=lambda p: update_job(
-                job_id, percent=round(p), progress_message=f"Fetching audio track... {p:.0f}%"
-            ),
-        )
+        # Link jobs fetch an audio-only stream first. Uploads already live in
+        # this job directory, so extracting audio locally avoids yt-dlp entirely.
+        audio_path = os.path.join(job_dir, "audio.mp3")
+        if uploaded_source:
+            video_path = os.path.join(job_dir, "source.mp4")
+            if not os.path.exists(video_path):
+                raise RuntimeError("The uploaded source video is missing. Upload it again.")
+            update_job(job_id, status="downloading", progress_message="Preparing uploaded video...", percent=0)
+            workspace.ensure_space(job_dir, os.path.getsize(video_path))
+            downloader.extract_audio(video_path, audio_path)
+        else:
+            update_job(job_id, status="downloading", progress_message="Fetching audio track...", percent=0)
+            audio_path = downloader.download_audio(
+                req.url,
+                audio_path,
+                on_progress=lambda p: update_job(
+                    job_id, percent=round(p), progress_message=f"Fetching audio track... {p:.0f}%"
+                ),
+            )
 
         update_job(job_id, status="transcribing",
                    progress_message="Transcribing speech with Deepgram...", percent=0)
@@ -1007,16 +1139,19 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
 
         update_job(job_id, status="rendering",
                    progress_message="Checking disk space...", percent=0)
-        workspace.ensure_space(job_dir, downloader.estimate_video_bytes(req.url))
-
-        update_job(job_id, progress_message="Downloading video...", percent=0)
-        video_path = downloader.download_video(
-            req.url,
-            os.path.join(job_dir, "source.mp4"),
-            on_progress=lambda p: update_job(
-                job_id, percent=round(p * 0.5), progress_message=f"Downloading video... {p:.0f}%"
-            ),
-        )
+        if uploaded_source:
+            workspace.ensure_space(job_dir, os.path.getsize(video_path))
+            update_job(job_id, progress_message="Preparing your uploaded video...", percent=0)
+        else:
+            workspace.ensure_space(job_dir, downloader.estimate_video_bytes(req.url))
+            update_job(job_id, progress_message="Downloading video...", percent=0)
+            video_path = downloader.download_video(
+                req.url,
+                os.path.join(job_dir, "source.mp4"),
+                on_progress=lambda p: update_job(
+                    job_id, percent=round(p * 0.5), progress_message=f"Downloading video... {p:.0f}%"
+                ),
+            )
 
         # Start the editor proxies NOW, alongside clip rendering, instead of
         # after it. The trim/caption editor is useless without them, and building
@@ -1083,12 +1218,14 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
             # they desync by exactly the amount removed.
             segments = None
             clip_words = clip["words"]
+            render_duration = clip["end"] - clip["start"]
             if req.tighten_pauses and clip_words:
                 segments, clip_words, removed = pacing.tighten(
                     clip_words, clip["start"], clip["end"])
                 if removed < 0.4:
                     segments, clip_words = None, clip["words"]   # not worth a re-cut
                 else:
+                    render_duration = sum(e - s for s, e in segments)
                     print(f"[clipper] clip {i}: removed {removed:.1f}s of dead air")
 
             mute_spans = None
@@ -1147,9 +1284,11 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 "hook": clip["hook"],
                 "start": clip["start"],
                 "end": clip["end"],
+                "duration": round(render_duration, 1),
                 "score": shown_score,
                 "scores": shown_scores,
                 "voiceover_script": clip.get("voiceover_script"),
+                "words": clip_words,
             })
 
         # The clips are the deliverable; the source video is often several hundred
