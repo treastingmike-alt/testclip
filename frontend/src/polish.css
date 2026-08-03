@@ -20,6 +20,12 @@
 }
 
 /* ---------------- dark theme ---------------- */
+/* `--ink` was doing two jobs in styles.css: the text colour AND "a deliberately
+   dark surface" (the marquee bar, the play button). Inverting it flipped those
+   surfaces white with white text on them. `--ink-solid` is the second job,
+   named, and it stays dark in both themes. */
+:root { --ink-solid: #101014; }
+
 html[data-theme="dark"] {
   --bg: #0d0d10;
   --surface: #16161c;
@@ -120,6 +126,12 @@ html[data-theme="dark"] select option { background: var(--surface); color: var(-
 /* Enough opacity that the pill stays a pill when backdrop-filter is
    unavailable -- at 0.72 the page ran straight through it. */
 html[data-theme="dark"] .nav-wrap.scrolled .nav-pill { background: rgba(19, 19, 24, 0.92); }
+/* Surfaces that are dark *by design*, in either theme. */
+.marquee { background: var(--ink-solid); color: #fff; }
+.stage-play { background: var(--ink-solid); color: #fff; }
+html[data-theme="dark"] .marquee { background: #191922; }
+html[data-theme="dark"] .stage-play { background: rgba(255, 255, 255, 0.14); }
+
 /* The editor's own chrome, written against the cream page. */
 html[data-theme="dark"] .live-head { background: rgba(13, 13, 16, 0.92); }
 html[data-theme="dark"] .export-veil { background: rgba(13, 13, 16, 0.84); }

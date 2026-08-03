@@ -9,6 +9,7 @@ import { useEditHistory } from "./useEditHistory";
 import { PLATFORMS, platformOverlay, BACKGROUNDS, logoSrc } from "./EditorPresets";
 import TimelineTracks from "./TimelineTracks";
 import CaptionPresetPicker, { useCaptionPresets } from "./CaptionPresets";
+import { useToast } from "./Toast";
 
 /* Caption looks come from the server (`/caption-options`), which serves the
    renderer's own preset registry translated into CSS terms. This file used to
@@ -505,6 +506,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const [dragging, setDragging] = useState(null);
   const [exporting, setExporting] = useState(false);
   const [exported, setExported] = useState(false);
+  const toast = useToast();
   const [exportError, setExportError] = useState("");
   const [status, setStatus] = useState("");
 
@@ -935,7 +937,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [now, start, end, capOn, playing, clipMap]);
 
-  async function doExport() {    setExporting(true);
+  async function doExport() {
+    setExporting(true);
     setStatus("");
     setExportError("");
     try {
@@ -945,8 +948,12 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
       // than a word of grey text. Confirm it, then return to the clips, which
       // is where someone goes next anyway (to watch or download it).
       setExported(true);
+      toast("Clip exported", {
+        detail: "Your edit is baked into the file and ready to download.",
+        tone: "success" });
     } catch (e) {
       setExportError(e.message);
+      toast("Export failed", { detail: e.message, tone: "error" });
     } finally {
       setExporting(false);
     }
@@ -969,8 +976,11 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         )}
 
         {exported && (
-          <div className="export-veil" onClick={onClose}>
-            <div className="export-card done" onClick={(e) => e.stopPropagation()}>
+          /* No click-to-dismiss on a confirmation: the backdrop used to call
+             onClose, so a stray click on the panel someone was reading closed
+             the whole editor. The two explicit choices are right there. */
+          <div className="export-veil" data-testid="export-done">
+            <div className="export-card done">
               <span className="export-tick" aria-hidden="true">
                 <svg viewBox="0 0 24 24" width="26" height="26" fill="none">
                   <path d="m5 13 4 4L19 7" stroke="currentColor" strokeWidth="2.6"

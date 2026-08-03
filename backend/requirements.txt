@@ -4,6 +4,7 @@ requests
 pydantic
 python-multipart
 fonttools
+sqlalchemy
 
 # Face-aware reframing for the Podcast template (app/pipeline/reframe.py).
 # opencv carries the YuNet detector; the model file itself is an asset rather

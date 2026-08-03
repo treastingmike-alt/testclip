@@ -648,7 +648,6 @@ class ClipRecipe(BaseModel):
     ratio: Optional[str] = None
     caption_style: Optional[str] = None
     caption_font: Optional[str] = None
-    speed: Optional[float] = None
     translate_to: Optional[str] = None
     lines: Optional[list[CaptionLine]] = None
     overlays: Optional[list[Overlay]] = None
