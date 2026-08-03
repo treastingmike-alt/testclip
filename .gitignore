@@ -36,3 +36,9 @@ frontend/dist/
 .DS_Store
 .claude/
 CHANGES_THIS_SESSION.md
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
