@@ -37,6 +37,16 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
   return resp.json(); // { job_id }
 }
 
+/* Face-aware crop windows for a podcast clip, so the editor previews the
+   composition the clip was actually rendered in. Returns {plan: null} for every
+   other template, and whenever detection found nothing to track. */
+export async function getClipReframe(jobId, index, start, end) {
+  const q = start != null && end != null ? `?start=${start}&end=${end}` : "";
+  const resp = await fetch(`${API_BASE}/jobs/${jobId}/reframe/${index}${q}`);
+  if (!resp.ok) return { plan: null };
+  return resp.json();
+}
+
 export async function getJob(jobId) {
   const resp = await fetch(`${API_BASE}/jobs/${jobId}`);
   if (!resp.ok) throw new Error(`Failed to fetch job (${resp.status})`);

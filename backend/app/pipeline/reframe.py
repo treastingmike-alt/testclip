@@ -44,6 +44,24 @@ TRACK_RADIUS = 0.18
 MIN_TRACK_COVERAGE = 0.35  # a track seen in fewer than this fraction of samples
                            # is a passer-by, a reflection, or a poster face.
 
+# Fraction of samples that must show two faces AT THE SAME INSTANT before the
+# stacked layout is allowed.
+#
+# Two tracks is not the same claim as two people. A podcast edit that cuts
+# between two camera angles on ONE speaker puts their face at a different screen
+# position after each cut, and position-based tracking reads that as a second
+# person -- so the stacked layout showed the same man twice, in two angles, side
+# by side. Genuinely two-shot footage has both faces in nearly every frame
+# (co-occurrence near 1.0); cut-based footage has them in none (near 0.0). The
+# gap between those cases is enormous, so this threshold is not delicate.
+MIN_CO_OCCURRENCE = 0.45
+
+# A jump larger than this, in one sample step, is a camera CUT rather than a
+# person moving -- nobody crosses a fifth of the frame in half a second. Cuts
+# must snap, not glide: smoothly sliding the crop across a hard cut is the one
+# motion that looks unmistakably like a bug rather than like camerawork.
+SNAP_DISTANCE = 0.20
+
 # --- smoothing and shot discipline ----------------------------------------
 
 SMOOTHING = 0.12          # EMA weight on each new sample. Low = heavy damping.
@@ -138,7 +156,12 @@ def detect_faces(video_path, start=0.0, end=None, sample_fps=SAMPLE_FPS):
         found = []
         if faces is not None:
             for f in faces:
-                x, y, w, h = f[0], f[1], f[2], f[3]
+                # float() on every component, not just the score. OpenCV hands
+                # back numpy scalars, which propagate all the way into the plan
+                # and format fine into an ffmpeg expression -- but are not JSON
+                # serialisable, so the editor's preview endpoint 500s on a plan
+                # the renderer was perfectly happy with.
+                x, y, w, h = (float(f[0]), float(f[1]), float(f[2]), float(f[3]))
                 found.append((
                     (x + w / 2) / det_w, (y + h / 2) / det_h,
                     w / det_w, h / det_h, float(f[-1]),
@@ -201,8 +224,29 @@ def smooth(points, key=1):
     committed = cur
     last_move_t = points[0][0]
 
+    prev_raw = points[0][key]
+
     for i, p in enumerate(points):
         t, v = p[0], p[key]
+
+        # A cut is not motion, and none of the damping below should apply to it.
+        # Every stage of this function exists to stop the crop reacting to a
+        # subject who moved; when the SHOT changed instead, the crop has to
+        # arrive at the new framing immediately or it spends a second sliding
+        # across a frame the viewer already sees as a new angle.
+        if abs(v - prev_raw) > SNAP_DISTANCE:
+            # Two points a hair apart in time: the interpolation in `expr` then
+            # renders this as a step rather than a ramp, without that function
+            # needing to know cuts exist.
+            if out:
+                out.append((max(t - 0.04, out[-1][0] + 1e-3), committed))
+            cur = committed = v
+            last_move_t = t
+            out.append((t, committed))
+            prev_raw = v
+            continue
+        prev_raw = v
+
         cur += (v - cur) * SMOOTHING                     # EMA
 
         want = cur
@@ -215,6 +259,36 @@ def smooth(points, key=1):
             committed += step
             last_move_t = t
         out.append((t, committed))
+    return out
+
+
+def co_occurrence(samples):
+    """Fraction of sampled frames showing two or more faces at once.
+
+    The question this answers is "are there two people in this shot", which is
+    not the same question as "did tracking produce two tracks" -- see
+    MIN_CO_OCCURRENCE.
+    """
+    seen = [s for s in samples if s[1]]
+    if not seen:
+        return 0.0
+    return sum(1 for _, faces in seen if len(faces) >= 2) / len(seen)
+
+
+def primary_timeline(samples):
+    """The dominant face in each sample: who this shot is of, cut by cut.
+
+    Deliberately not a track. When an edit cuts between angles the subject is
+    the same person at a new position, and following the largest face per frame
+    keeps them framed across the cut -- where following one positional track
+    would hold on empty chair for every second shot.
+    """
+    out = []
+    for t, faces in samples:
+        if not faces:
+            continue
+        cx, cy, w, h, score = max(faces, key=lambda f: f[2] * f[3])
+        out.append((t, cx, cy, w, h, score))
     return out
 
 
@@ -338,11 +412,22 @@ def plan(video_path, start, end, out_w, out_h):
     if not tracks:
         return None
 
-    if len(tracks) >= 2:
+    # Stacked requires two people VISIBLE TOGETHER, not merely two tracks. The
+    # earlier version asked only for two tracks, and an edit that cuts between
+    # two angles on one speaker satisfies that -- which is how the same man
+    # ended up in both tiles at once, facing two different directions.
+    together = co_occurrence(samples)
+    if len(tracks) >= 2 and together >= MIN_CO_OCCURRENCE:
         win_w, win_h, windows = stacked_windows(tracks, src_w, src_h, out_w, out_h)
         mode = "stacked"
     else:
-        win_w, win_h, keys = portrait_window(tracks[0], src_w, src_h, out_w, out_h)
+        # One person, or an edit that shows them one at a time. Either way the
+        # whole frame belongs to whoever is on screen -- following the dominant
+        # face per sample keeps that true across the cuts.
+        subject = {"points": primary_timeline(samples)}
+        if not subject["points"]:
+            return None
+        win_w, win_h, keys = portrait_window(subject, src_w, src_h, out_w, out_h)
         windows, mode = [keys], "single"
 
     # Detection ran against source timestamps, but the renderer seeks to `start`

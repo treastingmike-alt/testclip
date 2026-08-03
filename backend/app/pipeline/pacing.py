@@ -63,6 +63,30 @@ def plan_segments(words: list, max_pause: float = DEFAULT_MAX_PAUSE) -> list:
     return merged
 
 
+def remap_time(t: float, segments: list) -> float:
+    """A source timestamp's position on the shortened timeline.
+
+    The scalar counterpart of `remap_words`, for things that are keyed to time
+    but are not words -- reframing keyframes, most of all. Those are built
+    against source time while the filter that consumes them runs AFTER the
+    tightening concat, so without this they lag by every second removed before
+    them and drift further out as the clip goes on.
+
+    A time inside a removed gap collapses to the start of the next kept
+    segment, which is where the viewer actually arrives.
+    """
+    if not segments:
+        return t
+    elapsed = 0.0
+    for start, end in segments:
+        if t < start:
+            return elapsed
+        if t <= end:
+            return elapsed + (t - start)
+        elapsed += end - start
+    return elapsed
+
+
 def remap_words(words: list, segments: list) -> list:
     """Rewrites word timings onto the shortened timeline.
 

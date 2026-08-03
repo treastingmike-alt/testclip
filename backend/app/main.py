@@ -10,6 +10,7 @@ Endpoints:
 """
 
 from app import env  # noqa: F401  -- loads .env BEFORE anything reads keys
+import json
 import os
 import uuid
 import subprocess
@@ -430,6 +431,56 @@ class ClipEdit(BaseModel):
     caption_lines: Optional[list[CaptionLine]] = None   # rewritten subtitle text
     caption_font: Optional[str] = None        # id from subtitles.FONTS
     translate_to: Optional[str] = None        # language code from translation.LANGUAGES
+
+
+@app.get("/jobs/{job_id}/reframe/{index}")
+def clip_reframe(job_id: str, index: int, start: float = None, end: float = None):
+    """Where the faces are, so the editor can PREVIEW the podcast composition.
+
+    The editor draws its preview from the source proxy and composes the frame
+    itself. It had no way to know about face-aware cropping, so it drew the old
+    letterbox -- showing the user a layout their clip was not in and had never
+    been in.
+
+    Cached on disk per clip: detection takes several seconds, and reopening an
+    editor should not pay that again. Trimming passes explicit bounds and gets a
+    fresh plan for the new range, since that is a genuinely different question.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job.")
+    tpl = TEMPLATES.get((job.get("options") or {}).get("template", "classic"),
+                        TEMPLATES["classic"])
+    if tpl["frame"] != "podcast":
+        return {"plan": None}          # every other frame is fixed geometry
+
+    clips = job.get("clips") or []
+    if index < 0 or index >= len(clips):
+        raise HTTPException(status_code=404, detail="No such clip.")
+    clip = clips[index]
+    s = clip["start"] if start is None else start
+    e = clip["end"] if end is None else end
+
+    job_dir = os.path.join(STORAGE_DIR, job_id)
+    cache = os.path.join(job_dir, f"reframe_{index}_{s:.1f}_{e:.1f}.json")
+    if os.path.exists(cache):
+        with open(cache) as f:
+            return {"plan": json.load(f)}
+
+    source = os.path.join(job_dir, "source.mp4")
+    if not os.path.exists(source):
+        return {"plan": None}
+    ratio = (job.get("options") or {}).get("ratio", "9:16")
+    out_w, out_h = render.RATIOS.get(ratio, render.RATIOS["9:16"])
+    try:
+        plan = reframe.plan(source, s, e, out_w, out_h)
+    except Exception as exc:
+        print(f"[clipper] editor reframe preview failed: {exc}")
+        return {"plan": None}
+    if plan:
+        with open(cache, "w") as f:
+            json.dump(plan, f)
+    return {"plan": plan}
 
 
 @app.get("/jobs/{job_id}/transcript")

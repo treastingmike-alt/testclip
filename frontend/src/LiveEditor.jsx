@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getTranscript, saveClipEdit, exportClip, previewUrl,
-         uploadOverlayImage, overlayImageUrl, gameplayUrl } from "./api";
+         uploadOverlayImage, overlayImageUrl, gameplayUrl,
+         getClipReframe } from "./api";
 import { FontPicker, SizePicker, LanguagePicker, useFonts,
          useTitleStyles, titleLookCss } from "./CaptionToolbar";
 import { useEditHistory } from "./useEditHistory";
@@ -377,6 +378,66 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   function blockTop(bias) {
     return Math.min(Math.max(bias - fgHeight / 2, 0), 1 - fgHeight);
   }
+
+  /* The face-aware podcast plan, fetched once per clip range.
+     Without this the editor composed the OLD letterbox and showed a layout the
+     clip was never in -- the single worst kind of preview, because it looks
+     deliberate. Null for every other template, and null when detection found
+     nothing, which is exactly when the renderer falls back to the letterbox
+     too, so the two stay in agreement either way. */
+  const [reframePlan, setReframePlan] = useState(null);
+  useEffect(() => {
+    if (frameMode !== "podcast" || !job?.id) { setReframePlan(null); return; }
+    let live = true;
+    getClipReframe(job.id, index)
+      .then((d) => { if (live) setReframePlan(d.plan || null); })
+      .catch(() => { if (live) setReframePlan(null); });
+    return () => { live = false; };
+  }, [job?.id, index, frameMode]);
+
+  /* One crop window as CSS, mirroring smart_filter's crop+scale.
+     The renderer maps a `win` box from the source onto the whole tile; the same
+     mapping in DOM is a video blown up by (source / window) and shifted so the
+     window's centre lands at the tile's centre. Percentages are of the TILE, so
+     this works for a full frame and for a stacked half without special-casing. */
+  function cropStyle(winW, winH, cx, cy, sw, sh) {
+    return {
+      position: "absolute",
+      width: `${(sw / winW) * 100}%`,
+      height: `${(sh / winH) * 100}%`,
+      left: `${50 - (cx / winW) * 100}%`,
+      top: `${50 - (cy / winH) * 100}%`,
+      objectFit: "fill",
+      maxWidth: "none",
+    };
+  }
+
+  /* Crop centre at the current playhead. The plan is keyframed in clip-relative
+     seconds, the same timebase the renderer's expressions use; holding the last
+     key past the end matches how those expressions behave too. */
+  function windowAt(keys, t) {
+    if (!keys?.length) return null;
+    let k = keys[0];
+    for (const cand of keys) { if (cand[0] <= t) k = cand; else break; }
+    return { cx: k[1], cy: k[2] };
+  }
+
+  /* The scale factor comes from the PLAN's own source dimensions, never from
+     the <video> element. The proxy is a 640x360 downscale, while `win` is a box
+     in full-resolution source pixels -- dividing one by the other produced a
+     crop three times too small and a video that filled a third of its tile.
+     The plan carries `src` precisely so the two numbers come from one place. */
+  const smartFrame = frameMode === "podcast" && reframePlan?.src
+    ? reframePlan : null;
+  const [planW, planH] = smartFrame ? smartFrame.src : [0, 0];
+  /* `now` is a source timestamp; the plan's keys were rebased against the range
+     it was COMPUTED for, which is the clip's own bounds. So the offset is
+     clip.start -- not the trim start, which moves as the handles move and would
+     slide the preview onto the wrong keyframe the moment anyone trimmed. */
+  const smartT = Math.max(0, now - clip.start);
+  const smartTop = smartFrame ? windowAt(smartFrame.windows[0], smartT) : null;
+  const smartBottom = smartFrame && smartFrame.windows[1]
+    ? windowAt(smartFrame.windows[1], smartT) : null;
 
   /* The blurred backdrop is a second decode of the same file, so it has to be
      told where the playhead is. Exact frame-lock is unnecessary -- it is
@@ -789,6 +850,50 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                     aria-hidden="true"
                   />
                 </div>
+              ) : smartFrame && smartTop ? (
+                /* Face-aware podcast. The renderer crops to the people and
+                   fills the canvas, so there is no blurred backdrop and no
+                   letterbox to draw -- previewing those was showing a layout
+                   the exported clip is not in. */
+                smartFrame.mode === "stacked" && smartBottom ? (
+                  <>
+                    <div className="stage-tile" style={{ top: 0 }}>
+                      <video
+                        ref={videoRef}
+                        src={proxySrc}
+                        playsInline preload="auto"
+                        onClick={togglePlay}
+                        onLoadedMetadata={onMeta}
+                        style={cropStyle(smartFrame.win[0], smartFrame.win[1],
+                                         smartTop.cx, smartTop.cy, planW, planH)}
+                      />
+                    </div>
+                    <div className="stage-tile" style={{ top: "50%" }}>
+                      {/* Second decode of the same file for the lower speaker,
+                          kept in step by the same effect that drives the blur
+                          layer. Muted so the audio is not doubled. */}
+                      <video
+                        ref={blurRef}
+                        src={proxySrc}
+                        playsInline muted preload="auto" aria-hidden="true"
+                        style={cropStyle(smartFrame.win[0], smartFrame.win[1],
+                                         smartBottom.cx, smartBottom.cy, planW, planH)}
+                      />
+                    </div>
+                  </>
+                ) : (
+                  <div className="stage-tile" style={{ top: 0, height: "100%" }}>
+                    <video
+                      ref={videoRef}
+                      src={proxySrc}
+                      playsInline preload="auto"
+                      onClick={togglePlay}
+                      onLoadedMetadata={onMeta}
+                      style={cropStyle(smartFrame.win[0], smartFrame.win[1],
+                                       smartTop.cx, smartTop.cy, planW, planH)}
+                    />
+                  </div>
+                )
               ) : (
                 <>
                   {/* The default frame is a blurred copy of the source behind

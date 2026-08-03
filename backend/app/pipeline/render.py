@@ -270,6 +270,12 @@ def smart_filter(plan: dict, width: int, height: int) -> str:
     win_w -= win_w % 2
     win_h -= win_h % 2
 
+    # lanczos on every scale below, because this path is the only one that
+    # genuinely ENLARGES: a 607-wide crop of a 1080p source becomes a 1080-wide
+    # canvas, a 1.8x upscale. ffmpeg's default bicubic is built for downscaling
+    # and turns that into mush; lanczos keeps the edge detail, at a cost too
+    # small to measure next to the encode.
+
     if plan["mode"] == "stacked":
         tile_h = height // 2
         tile_h -= tile_h % 2
@@ -281,7 +287,7 @@ def smart_filter(plan: dict, width: int, height: int) -> str:
             # The window is expressed by its CENTRE; crop wants a corner.
             parts.append(
                 f"[{tag}]crop={win_w}:{win_h}:'({x})-{win_w // 2}':'({y})-{win_h // 2}',"
-                f"scale={width}:{tile_h},setsar=1[{label}];"
+                f"scale={width}:{tile_h}:flags=lanczos,setsar=1[{label}];"
             )
         parts.append("[top][bottom]vstack=inputs=2[framed]")
         return "".join(parts)
@@ -291,7 +297,7 @@ def smart_filter(plan: dict, width: int, height: int) -> str:
     y = reframe.expr([(t, v) for t, _, v in keys], 0, 0)
     return (
         f"[0:v]crop={win_w}:{win_h}:'({x})-{win_w // 2}':'({y})-{win_h // 2}',"
-        f"scale={width}:{height},setsar=1[framed]"
+        f"scale={width}:{height}:flags=lanczos,setsar=1[framed]"
     )
 
 
@@ -480,7 +486,19 @@ def render_clip(
         filter_complex = fit_filter(width, height, background, sw, sh)
     elif frame == "podcast" and reframe_plan:
         # Face-aware crop, which is the whole point of the podcast template.
-        filter_complex = smart_filter(reframe_plan, width, height)
+        #
+        # Rebase the keyframes when pauses were cut. The plan is keyed to clip
+        # time, but this filter reads `t` from the stream AFTER the tightening
+        # concat -- so on a clip with dead air removed, every crop move fired
+        # late by the total removed so far, drifting further out toward the end.
+        plan = reframe_plan
+        if segments:
+            from app.pipeline import pacing
+            plan = dict(plan, windows=[
+                [(pacing.remap_time(start + t, segments), x, y) for t, x, y in keys]
+                for keys in plan["windows"]
+            ])
+        filter_complex = smart_filter(plan, width, height)
     elif frame == "podcast":
         # No plan: detection found nothing trackable (a screen share, a wide
         # stage shot, b-roll). The fixed letterbox is the honest answer there --
@@ -559,8 +577,13 @@ def render_clip(
         *audio_map,
         "-t", str(duration),
         # veryfast/crf 20 encodes several times quicker than medium/crf 18 and the
-        # difference is not visible once the clip is re-compressed by TikTok/Shorts
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        # difference is not visible once the clip is re-compressed by TikTok/Shorts.
+        # The face-aware frames are the exception: they ENLARGE a crop ~1.8x, so
+        # they arrive at the encoder already soft with no detail to spare, and
+        # every later recompression starts from that. Measured side by side, the
+        # preset barely moved -- crf did, so only crf moves here.
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "19" if reframe_plan else "20",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
         *extra,

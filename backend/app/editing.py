@@ -16,7 +16,8 @@ import os
 
 from app.db import SessionLocal
 from app.models import Clip, Job
-from app.pipeline import censor, downloader, render, subtitles, transcriber, translation
+from app.pipeline import (censor, downloader, pacing, reframe, render,
+                          subtitles, transcriber, translation)
 
 # A trim must still leave something watchable, and an extend must not run away
 # with the whole source video.
@@ -145,15 +146,38 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         source = ensure_source(job, job_dir)
 
         out_w, out_h = render.RATIOS.get(ratio, render.RATIOS["9:16"])
+
+        # Recomputed, not remembered. Editing a clip must produce the same
+        # composition it was delivered in -- and this call used to omit it
+        # entirely, so every trim silently re-rendered a face-aware podcast clip
+        # as the old letterbox and handed back a different video than the one
+        # being edited. Recomputing rather than storing the original plan is
+        # what makes a TRIM correct: the new range may cover different footage,
+        # and framing keyed to the old range would be aimed at the wrong place.
+        reframe_plan = None
+        if tpl["frame"] == "podcast":
+            try:
+                reframe_plan = reframe.plan(source, start, end, out_w, out_h)
+            except Exception as exc:
+                print(f"[clipper] edit: reframing failed ({exc}); fixed frame")
+
         if caption_pos is not None:
             # An explicit position from the editor wins over the automatic
-            # letterbox placement -- the user dragged it there on purpose.
+            # placement -- the user dragged it there on purpose.
             margin_v = render.caption_margin_from_position(out_h, caption_pos)
         elif tpl["frame"] == "gameplay":
             margin_v = render.split_caption_margin_v(out_h)
+        elif reframe_plan:
+            margin_v = render.smart_caption_margin_v(reframe_plan, out_h)
         else:
+            # These frames put the video somewhere other than the middle, so the
+            # generic margin strands captions in the wrong band. main.py has
+            # always picked per frame here; this path had been left behind.
             src_w, src_h = render.probe_dimensions(source)
-            margin_v = render.caption_margin_v(src_w, src_h, out_w, out_h)
+            place = {"podcast": render.podcast_caption_margin_v,
+                     "fit": render.fit_caption_margin_v}.get(
+                         tpl["frame"], render.caption_margin_v)
+            margin_v = place(src_w, src_h, out_w, out_h)
         size_px = caption_size or None
 
         if caption_lines:
@@ -161,10 +185,33 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         else:
             words = words_in_range(job.transcript, start, end)
 
+        # Re-cut the dead air, exactly as the first render did.
+        #
+        # This was missing entirely, and it quietly undid the thing that makes a
+        # clip a clip: the delivered file had its pauses removed, but ANY edit --
+        # changing a caption, adding a logo, nudging the speed -- re-rendered
+        # from the source without them, handing back a longer, slacker video
+        # than the one being edited. The user did not ask for the pauses back.
+        #
+        # Timing is why this has to happen before captions are built: `tighten`
+        # returns words remapped onto the shortened timeline, and captions
+        # written against the original timings would drift by the removed
+        # seconds, further out with every pause.
+        segments = None
+        if options.get("tighten_pauses", True) and words:
+            tightened, remapped, removed = pacing.tighten(words, start, end)
+            # The same floor the pipeline uses: under this, a re-cut buys
+            # nothing and costs a seam.
+            if tightened and removed >= 0.4:
+                segments, words = tightened, remapped
+
         style = caption_style or (job.options or {}).get("caption_style_override",
                                                          tpl["caption_style"])
 
-        caption_words, mute_spans = (censor.apply(words, start)
+        # Segments rebase the clip to zero, so the caption offset has to follow.
+        caption_offset = 0.0 if segments else start
+
+        caption_words, mute_spans = (censor.apply(words, caption_offset)
                                      if options.get("auto_censor", True) and words
                                      else (words, None))
 
@@ -193,7 +240,7 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                                           size_px=size_px, animation=caption_anim,
                                           title_style=title_style, title_font=title_font)
             else:
-                subtitles.build_ass(caption_words, start, subtitle_path, margin_v,
+                subtitles.build_ass(caption_words, caption_offset, subtitle_path, margin_v,
                                     style=style, play_res=(out_w, out_h),
                                     title=clip.title or "", keywords=clip.keywords,
                                     font=caption_font, size_px=size_px, animation=caption_anim,
@@ -218,10 +265,12 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
             ratio=ratio,
             frame=tpl["frame"],
             overlay_list=overlay_list,
+            segments=segments,
             mute_spans=mute_spans,
             speed=speed,
             speed_pitched=speed_pitched,
             background=background,
+            reframe_plan=reframe_plan,
         )
         os.replace(tmp_path, final_path)
 
