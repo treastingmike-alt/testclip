@@ -41,10 +41,15 @@ from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
 
 app = FastAPI(title="Clipper API")
 
-# Allow a local React dev server to call this API
+# The frontend normally reaches this API same-origin (a dev-server proxy, or an
+# ingress that routes /api here), so CORS is only in play for a direct
+# cross-origin call. CLIPPER_CORS_ORIGINS covers hosted frontends without
+# needing a code change; the local dev servers are the default.
+_cors = os.environ.get("CLIPPER_CORS_ORIGINS", "").strip()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=([o.strip() for o in _cors.split(",") if o.strip()]
+                   or ["http://localhost:3000", "http://localhost:5173"]),
     allow_methods=["*"],
     allow_headers=["*"],
 )

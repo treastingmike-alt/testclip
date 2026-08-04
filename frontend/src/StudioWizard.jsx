@@ -109,7 +109,9 @@ export default function StudioWizard({
   const { limits, can, isFree } = plan;
   const sourceReady = source.mode === "upload" ? !!source.file : !!source.url.trim();
   const lockedTemplates = templates.filter((t) => t.id === "gameplay" && !can("gameplay"));
-  const anyLocked = isFree;
+  // What is actually locked, rather than what the plan is called -- see usePlan.
+  const anyLocked = lockedTemplates.length > 0
+    || !can("tighten_pauses") || !can("multilingual");
 
   const clipOptions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
   const cost = prefs.nClips * plan.creditsPerClip;
@@ -329,7 +331,7 @@ export default function StudioWizard({
               : `${cost} of your ${plan.credits} credits`} />
           </div>
 
-          {isFree && (
+          {plan.watermarked && (
             <div className="review-note" data-testid="watermark-note">
               <span>
                 Free clips carry a small <strong>Made with Clipper</strong> credit at the
