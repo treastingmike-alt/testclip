@@ -301,6 +301,10 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
             speed_pitched=speed_pitched,
             background=background,
             reframe_plan=reframe_plan,
+            # The watermark decision was made when the job was created and is
+            # stored with it. Re-reading the plan here would silently strip the
+            # mark from every clip a lapsed subscriber re-exports.
+            watermark=options.get("watermark") or None,
         )
         os.replace(tmp_path, final_path)
 

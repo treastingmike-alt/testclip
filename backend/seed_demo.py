@@ -17,9 +17,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.db import SessionLocal, init_db          # noqa: E402
-from app.models import Clip, Job                  # noqa: E402
+from app.models import Clip, Job, User            # noqa: E402
 
 JOB_ID = "demo-job-0001"
+# Owned by the admin test account when it exists, so the paid flows (share
+# pages) have something they are allowed to act on. Ownership is checked on
+# every share, so an unowned job could not be shared at all.
+OWNER_EMAIL = "admin@clipper.test"
 STORAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 
 SCRIPT = [
@@ -80,13 +84,16 @@ def main():
             s.delete(old)
         s.commit()
 
+        owner = s.query(User).filter(User.email == OWNER_EMAIL).first()
         s.add(Job(
             id=JOB_ID, url="https://example.com/demo", status="done", percent=100,
+            user_id=owner.id if owner else None,
             progress_message="Done", transcript=transcript, source_duration=duration + 2,
             options={"n_clips": 1, "template": "classic", "ratio": "9:16",
                      "burn_subtitles": True, "auto_censor": True,
                      "frame": "blur", "caption_style": "classic",
-                     "tighten_pauses": True},
+                     "tighten_pauses": True, "watermark": "",
+                     "max_source_minutes": 240},
         ))
         s.add(Clip(
             job_id=JOB_ID, index=0, file="clip_1.mp4",

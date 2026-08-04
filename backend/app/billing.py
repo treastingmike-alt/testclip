@@ -28,7 +28,7 @@ import os
 from datetime import datetime, timezone
 
 from app.db import SessionLocal
-from app.models import CreditLedger, User
+from app.models import CreditLedger, User, _iso_utc
 
 # 10 credits per finished clip. The unit users are billed in is the unit they
 # actually receive, which is the whole point -- see the module docstring.
@@ -117,11 +117,39 @@ PLANS = [
 #                   sentence, and it costs materially more per minute, which is
 #                   the whole reason it is a paid capability rather than the
 #                   default for everyone.
+#   gameplay       -- the split-screen template. Ours to host and ours to keep
+#                     legally clean, and it doubles render time.
+#   tighten_pauses -- cutting dead air; an extra analysis pass and a re-cut.
+#   priority       -- ahead of free jobs in the queue.
+#   branding       -- a logo or handle burned into the clip.
+#   no_watermark   -- free clips carry ours. See WATERMARK_TEXT.
+#   share_pages    -- the public score/hook page per clip.
+#   bulk_export    -- Pro only.
+_PAID = frozenset({"multilingual", "gameplay", "tighten_pauses", "priority",
+                   "branding", "no_watermark", "share_pages"})
+
 ENTITLEMENTS = {
     "free": frozenset(),
-    "creator": frozenset({"multilingual"}),
-    "pro": frozenset({"multilingual"}),
+    "creator": _PAID,
+    "pro": _PAID | {"bulk_export"},
 }
+
+# Hard numbers, separate from ENTITLEMENTS because a limit is a ceiling rather
+# than an on/off switch. Free is deliberately usable rather than crippled: two
+# real clips off a half-hour video is a genuine trial, and the ceiling is the
+# reason to upgrade -- not a broken experience.
+LIMITS = {
+    "free":    {"max_clips": 2,  "max_source_minutes": 30,
+                "max_upload_mb": 500},
+    "creator": {"max_clips": 10, "max_source_minutes": MAX_SOURCE_MINUTES,
+                "max_upload_mb": 2048},
+    "pro":     {"max_clips": 10, "max_source_minutes": MAX_SOURCE_MINUTES,
+                "max_upload_mb": 4096},
+}
+
+# Burned into free clips. Configurable because the product name is not final,
+# and a watermark is the one string that ends up on someone else's timeline.
+WATERMARK_TEXT = os.environ.get("CLIPPER_WATERMARK", "Made with Clipper")
 
 
 # Accounts that get every capability regardless of plan, for testing the paid
@@ -172,6 +200,13 @@ def entitlements_for(plan_id: str, email: str = None) -> frozenset:
     if is_admin(email):
         return frozenset().union(*ENTITLEMENTS.values())
     return ENTITLEMENTS.get(plan_id or "free", ENTITLEMENTS["free"])
+
+
+def limits_for(plan_id: str, email: str = None) -> dict:
+    """The ceilings this account works under. Signed out == free."""
+    if is_admin(email):
+        return dict(LIMITS["pro"])
+    return dict(LIMITS.get(plan_id or "free", LIMITS["free"]))
 
 
 def allows(plan_id: str, feature: str, email: str = None) -> bool:
@@ -277,5 +312,7 @@ def history(user_id: str, limit: int = 50) -> list:
             "balance_after": r.balance_after,
             "note": r.note,
             "job_id": r.job_id,
-            "at": r.created_at.isoformat() if r.created_at else None,
+            # Offset-stamped for the same reason Job.created_at is -- see
+            # models._iso_utc.
+            "at": _iso_utc(r.created_at),
         } for r in rows]

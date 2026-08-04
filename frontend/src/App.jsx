@@ -4,10 +4,12 @@ import LiveEditor from "./LiveEditor";
 import Dashboard from "./Dashboard";
 import Pricing from "./Pricing";
 import AuthModal from "./AuthModal";
-import { fetchMe, logout } from "./api";
+import { fetchMe, logout, createShare } from "./api";
 import ThemeToggle, { useTheme } from "./ThemeToggle";
 import { useToast } from "./Toast";
-
+import StudioWizard from "./StudioWizard";
+import UpgradeModal from "./UpgradeModal";
+import { usePlan } from "./usePlan";
 const STAGES = [
   { key: "downloading", label: "Fetching audio", blurb: "Pulling just the audio track — it's a fraction of the video." },
   { key: "transcribing", label: "Transcribing speech", blurb: "Every word, with millisecond-accurate timestamps." },
@@ -430,19 +432,6 @@ function TemplatePreview({ template, variants }) {
   );
 }
 
-/** One-line summary of current choices, shown while the panel is collapsed. */
-function optionsSummary({ nClips, ratio, lengthPref, template, burnSubtitles }) {
-  const tpl = TEMPLATES.find((t) => t.id === template);
-  const lengthLabel = { any: "Any length", short: "<30s", medium: "30–60s",
-                        long: "60–90s", extended: ">90s" }[lengthPref];
-  return [
-    `${nClips} clip${nClips > 1 ? "s" : ""}`,
-    ratio,
-    lengthLabel,
-    burnSubtitles ? (tpl ? tpl.name : "Custom") : "No captions",
-  ].join("  ·  ");
-}
-
 const MARQUEE_ITEMS = [
   "Speech-aware cuts",
   "9:16 vertical reframe",
@@ -579,11 +568,13 @@ export default function App() {
   const [ratio, setRatio] = useState("9:16");
   const [lengthPref, setLengthPref] = useState("any");
   const [intent, setIntent] = useState("");
-  const [optionsOpen, setOptionsOpen] = useState(false);
+  const [tightenPauses, setTightenPauses] = useState(false);
+  // The studio is a 3-step wizard now: 1 source, 2 preferences, 3 review.
+  const [step, setStep] = useState(1);
+  // The feature someone just reached for, so the upgrade dialog can name it.
+  const [upgradeFor, setUpgradeFor] = useState(null);
+  const [sharing, setSharing] = useState(null);
   const [editing, setEditing] = useState(null);   // { clip, index } while the editor is open
-  // "idle" = landing page is just the URL bar; "setup" = the settings step.
-  // Keeping choices off the landing page makes the first screen a single decision.
-  const [stage, setStage] = useState("idle");
   const [showDash, setShowDash] = useState(false);
   const [studioOpen, setStudioOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -615,7 +606,51 @@ export default function App() {
   /* Signed out means no plan, which means the free entitlement set. Read from
      the server's list rather than comparing plan names here, so adding a tier
      is a backend-only change. */
-  const canMultilingual = !!user?.entitlements?.includes("multilingual");
+  const plan = usePlan(user);
+  const canMultilingual = plan.can("multilingual");
+
+  /* Clip count is a ceiling, not a switch, so it has to be corrected rather
+     than blocked: the default of 3 is above the free ceiling of 2, and someone
+     who signs out of a paid plan would otherwise keep a choice the server now
+     rejects -- discovered only after pressing Generate. */
+  useEffect(() => {
+    setNClips((n) => Math.min(n, plan.limits.max_clips));
+  }, [plan.limits.max_clips]);
+
+  // Pause tightening is paid, so it defaults on only where it is available.
+  useEffect(() => {
+    if (plan.can("tighten_pauses")) setTightenPauses(true);
+  }, [plan.plan, plan.isAdmin]);
+
+  function requestUpgrade(feature) {
+    setUpgradeFor(feature || null);
+  }
+
+  /* Copies a public link to one clip. A 402 is the plan boundary, not an error:
+     turn it into the upgrade dialog rather than a red toast, because the person
+     just told us exactly which feature they wanted. */
+  async function shareClip(index) {
+    if (!user) { setAuthOpen(true); return; }
+    if (!plan.can("share_pages")) { requestUpgrade("share_pages"); return; }
+    setSharing(index);
+    try {
+      const { path } = await createShare(job.id, index);
+      const link = `${window.location.origin}${path}`;
+      try {
+        await navigator.clipboard.writeText(link);
+        toast("Share link copied", { detail: link, tone: "success" });
+      } catch {
+        // Clipboard needs a permission this browser did not grant; the link is
+        // useless if we swallow it, so show it instead.
+        toast("Share link ready", { detail: link, tone: "success", ttl: 15000 });
+      }
+    } catch (e) {
+      if (e.status === 402) requestUpgrade("share_pages");
+      else toast("Couldn't create a share link", { detail: e.message, tone: "error" });
+    } finally {
+      setSharing(null);
+    }
+  }
 
   // Persistence makes a job reachable again after the tab is closed, so ?job=<id>
   // reopens one. Also how a shared or bookmarked result gets back on screen.
@@ -733,9 +768,10 @@ export default function App() {
         mode: "original",
         burnSubtitles,
         autoCensor,
-        // Never send it on a plan that does not include it: the server would
-        // reject the whole job rather than quietly downgrade it.
+        // Never send a gated flag on a plan that does not include it: the server
+        // rejects the whole job rather than quietly downgrading it.
         multilingual: multilingual && canMultilingual,
+        tightenPauses: tightenPauses && plan.can("tighten_pauses"),
         voice: "onyx",
         language: "English",
         template,
@@ -751,6 +787,7 @@ export default function App() {
             burn_subtitles: options.burnSubtitles,
             auto_censor: options.autoCensor,
             multilingual: options.multilingual,
+            tighten_pauses: options.tightenPauses,
             voice: options.voice,
             language: options.language,
             template: options.template,
@@ -782,7 +819,8 @@ export default function App() {
     setStudioOpen(true);
     // A job already running means this is a way back to its progress, not a new
     // run -- leaving it disabled stranded anyone who closed the studio mid-job.
-    if (!jobActive) { setStage("setup"); setOptionsOpen(true); }
+    // With a source already in hand, skip straight to the choices.
+    if (!jobActive) setStep(sourceReady ? 2 : 1);
   }
 
   const continueBtn = (
@@ -1177,239 +1215,41 @@ export default function App() {
             <header className="dash-head">
               <div>
                 <h2>Studio</h2>
-                <p className="dash-sub">Paste a public link or upload your video.</p>
+                <p className="dash-sub">Three steps: pick a source, choose how the clips come out, generate.</p>
               </div>
               <button className="btn btn-ghost btn-sm" onClick={() => setStudioOpen(false)}>
                 Exit studio
               </button>
             </header>
 
-            {!job && (
-              <div className="workspace-compose">
-                <SourceTabs value={sourceMode} onChange={setSourceMode}
-                            className="workspace-source-tabs" />
-                {sourceMode === "link" ? (
-                  <div className="workspace-urlrow">
-                    <input type="url" placeholder="Paste a public video link..." value={url}
-                           onChange={(e) => setUrl(e.target.value)}
-                           data-testid="studio-url-input"
-                           onKeyDown={(e) => {
-                             if (e.key === "Enter" && url.trim()) { setStage("setup"); setOptionsOpen(true); }
-                           }} aria-label="Public video URL" />
-                    {stage !== "setup" && (
-                      <button
-                        className="btn btn-primary btn-sm btn-shine"
-                        disabled={!sourceReady}
-                        data-testid="studio-continue-btn"
-                        onClick={() => { setStage("setup"); setOptionsOpen(true); }}
-                      >
-                        Continue
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <>
-                    <DropZone file={uploadFile} onFile={setUploadFile} />
-                    {stage !== "setup" && (
-                      <div className="dropzone-actions">
-                        <button
-                          className="btn btn-primary btn-sm btn-shine"
-                          disabled={!sourceReady}
-                          data-testid="studio-continue-btn"
-                          onClick={() => { setStage("setup"); setOptionsOpen(true); }}
-                        >
-                          Continue
-                        </button>
-                      </div>
-                    )}
-                  </>
-                )}
-                {sourceMode === "link" && (
-                  <SourcePreview preview={linkPreview} loading={previewLoading}
-                                 error={previewError} uploadUrl="" uploadFile={null} />
-                )}
-              </div>
-            )}
-
-            {stage === "setup" && !jobActive && (
-            <div className="composer-options">
-              <button
-                type="button"
-                className={`options-toggle ${optionsOpen ? "open" : ""}`}
-                onClick={() => setOptionsOpen((v) => !v)}
-                aria-expanded={optionsOpen}
-              >
-                <span className="options-toggle-label">Output settings</span>
-                <span className="options-toggle-summary">
-                  {optionsSummary({ nClips, ratio, lengthPref, template, burnSubtitles })}
-                </span>
-                <svg className="options-chevron" viewBox="0 0 24 24" width="16" height="16"
-                     fill="none" aria-hidden="true">
-                  <path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="2.4"
-                        strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-
-              {optionsOpen && (
-                <div className="options-body">
-              <div className="options-row">
-                <label className="chip">
-                  Clips
-                  <select
-                    value={nClips}
-                    onChange={(e) => setNClips(Number(e.target.value))}
-                    disabled={jobActive}
-                  >
-                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-                      <option key={n} value={n}>{n}</option>
-                    ))}
-                  </select>
-                </label>
-                <button
-                  type="button"
-                  className={`chip toggle ${burnSubtitles ? "active" : ""}`}
-                  onClick={() => setBurnSubtitles((v) => !v)}
-                  disabled={jobActive}
-                  role="switch"
-                  aria-checked={burnSubtitles}
-                  data-testid="opt-captions"
-                >
-                  <span className="chip-switch" aria-hidden="true" />
-                  Captions
-                </button>
-                <button
-                  type="button"
-                  className={`chip toggle ${autoCensor ? "active" : ""}`}
-                  onClick={() => setAutoCensor((v) => !v)}
-                  disabled={jobActive}
-                  role="switch"
-                  aria-checked={autoCensor}
-                  data-testid="opt-censor"
-                  title="Mutes profanity and stars it in captions, so clips stay monetisable"
-                >
-                  <span className="chip-switch" aria-hidden="true" />
-                  Auto-censor
-                </button>
-                {/* Shown to everyone, locked for plans that do not include it.
-                    Hiding it entirely would mean the people most likely to
-                    want it -- creators whose footage is bilingual -- never
-                    learn it exists. The backend gates this independently;
-                    `canMultilingual` is presentation only. */}
-                <button
-                  type="button"
-                  className={`chip toggle ${multilingual ? "active" : ""} ${canMultilingual ? "" : "locked"}`}
-                  onClick={() => canMultilingual
-                    ? setMultilingual((v) => !v)
-                    : document.getElementById("pricing")
-                        ?.scrollIntoView({ behavior: "smooth" })}
-                  disabled={jobActive}
-                  role={canMultilingual ? "switch" : undefined}
-                  aria-checked={canMultilingual ? multilingual : undefined}
-                  data-testid="opt-multilingual"
-                  title={canMultilingual
-                    ? (user?.is_admin
-                        ? "Unlocked by your admin account — transcribes speech that switches language mid-sentence"
-                        : "Transcribes speech that switches language mid-sentence, like Hindi and English in one line")
-                    : "Creator and Pro plans — for speech that switches language mid-sentence"}
-                >
-                  {canMultilingual ? (
-                    <span className="chip-switch" aria-hidden="true" />
-                  ) : (
-                    <svg className="chip-lock" viewBox="0 0 24 24" width="13" height="13"
-                         fill="none" aria-hidden="true">
-                      <rect x="5" y="11" width="14" height="9" rx="2.2" stroke="currentColor" strokeWidth="2" />
-                      <path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                    </svg>
-                  )}
-                  Mixed language
-                </button>
-                <label className="chip">
-                  Ratio
-                  <select
-                    value={ratio}
-                    onChange={(e) => setRatio(e.target.value)}
-                    disabled={jobActive}
-                  >
-                    <option value="9:16">9:16</option>
-                    <option value="1:1">1:1</option>
-                    <option value="16:9">16:9</option>
-                  </select>
-                </label>
-                <label className="chip">
-                  Length
-                  <select
-                    value={lengthPref}
-                    onChange={(e) => setLengthPref(e.target.value)}
-                    disabled={jobActive}
-                  >
-                    <option value="any">Any length</option>
-                    <option value="short">&lt;30s</option>
-                    <option value="medium">30–60s</option>
-                    <option value="long">60–90s</option>
-                    <option value="extended">&gt;90s</option>
-                  </select>
-                </label>
-              </div>
-
-              <div className="template-picker">
-                <div className="template-picker-label">Template</div>
-                <div className="template-grid">
-                  {TEMPLATES.map((t) => {
-                    const variants = previewManifest[t.id];
-                    const selected = template === t.id;
-                    return (
-                      <button
-                        type="button"
-                        key={t.id}
-                        className={`template-card ${selected ? "selected" : ""}`}
-                        onClick={() => setTemplate(t.id)}
-                        disabled={jobActive}
-                        aria-pressed={selected}
-                      >
-                        <TemplatePreview template={t} variants={variants} />
-                        <span className="template-name">{t.name}</span>
-                        <span className="template-note">{t.note}</span>
-                        {selected && <span className="template-tick">✓</span>}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <label className="intent-field">
-                <span className="intent-label">
-                  Find clip moment <span className="intent-optional">Optional</span>
-                </span>
-                <input
-                  type="text"
-                  value={intent}
-                  onChange={(e) => setIntent(e.target.value)}
-                  placeholder="For example: when he talks about pricing."
-                  disabled={jobActive}
-                />
-              </label>
-                </div>
-              )}
-
-              {submitError && <div className="error-box">{submitError}</div>}
-
-              <div className="setup-actions">
-                <button
-                  className="btn btn-ghost btn-sm"
-                  onClick={() => setStage("idle")}
-                  disabled={submitting}
-                >
-                  Back
-                </button>
-                <button
-                  className="btn btn-primary btn-shine"
-                  onClick={handleSubmit}
-                  disabled={submitting || jobActive}
-                >
-                  {submitting ? "Starting..." : "Generate clips"}
-                </button>
-              </div>
-            </div>
+            {!jobActive && (!job || job.status === "failed") && (
+              <StudioWizard
+                step={step}
+                setStep={setStep}
+                source={{
+                  mode: sourceMode, setMode: setSourceMode,
+                  url, setUrl,
+                  file: uploadFile, setFile: setUploadFile,
+                  preview: linkPreview, loading: previewLoading, error: previewError,
+                }}
+                prefs={{
+                  nClips, setNClips, ratio, setRatio, lengthPref, setLengthPref,
+                  burnSubtitles, setBurnSubtitles, autoCensor, setAutoCensor,
+                  multilingual, setMultilingual, tightenPauses, setTightenPauses,
+                  template, setTemplate, intent, setIntent,
+                }}
+                plan={plan}
+                templates={TEMPLATES}
+                previewManifest={previewManifest}
+                TemplatePreview={TemplatePreview}
+                SourceTabs={SourceTabs}
+                DropZone={DropZone}
+                SourcePreview={SourcePreview}
+                submitting={submitting}
+                submitError={submitError}
+                onGenerate={handleSubmit}
+                onUpgrade={requestUpgrade}
+              />
             )}
 
             {/* Working panel */}
@@ -1515,6 +1355,32 @@ export default function App() {
                         </svg>
                         Trim
                       </button>
+                      {/* Sharing publishes the score breakdown, which until now
+                          only its owner ever saw -- so it is the paid plan's
+                          distribution feature, not a nicety. */}
+                      <button
+                        type="button"
+                        className={`btn btn-ghost btn-sm clip-share ${plan.can("share_pages") ? "" : "locked"}`}
+                        onClick={() => shareClip(i)}
+                        disabled={sharing === i}
+                        title={plan.can("share_pages")
+                          ? "Copy a public link to this clip and its score"
+                          : "Share pages are on the Creator plan"}
+                        data-testid={`clip-share-${i}`}
+                      >
+                        {plan.can("share_pages") ? (
+                          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" aria-hidden="true">
+                            <path d="M8.7 13.3a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 1 0-5-5l-1 1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                            <path d="M15.3 10.7a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 1 0 5 5l1-1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                          </svg>
+                        ) : (
+                          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true">
+                            <rect x="5" y="11" width="14" height="9" rx="2.2" stroke="currentColor" strokeWidth="2" />
+                            <path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                          </svg>
+                        )}
+                        {sharing === i ? "Linking..." : "Share"}
+                      </button>
                       <a
                         className="btn btn-primary btn-shine clip-download"
                         href={clipUrl(job.id, clip.file, clip.version)}
@@ -1555,6 +1421,10 @@ export default function App() {
               onClick={() => {
                 setJob(null);
                 setUrl("");
+                setUploadFile(null);
+                // Back to the start of the wizard, not to whatever step the last
+                // run happened to end on.
+                setStep(1);
                 focusUrlbar();
               }}
             >
@@ -1568,8 +1438,22 @@ export default function App() {
       {showDash && user && (
         <Dashboard
           user={user}
-          onClose={() => { setShowDash(false); setStage("idle"); }}
+          onClose={() => { setShowDash(false); setStep(1); }}
           onOpenJob={(j) => { setJob(j); setShowDash(false); setStudioOpen(true); }}
+        />
+      )}
+
+      {upgradeFor !== null && (
+        <UpgradeModal
+          reason={upgradeFor}
+          limits={plan.limits}
+          onClose={() => setUpgradeFor(null)}
+          onSeePlans={() => {
+            setUpgradeFor(null);
+            setStudioOpen(false);
+            setTimeout(() => document.getElementById("pricing")
+              ?.scrollIntoView({ behavior: "smooth" }), 60);
+          }}
         />
       )}
 

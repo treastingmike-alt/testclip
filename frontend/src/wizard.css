@@ -1,0 +1,447 @@
+/* =========================================================================
+   wizard.css — the three-step studio, the upgrade dialog, and the public
+   share page. Kept separate from polish.css because that file is a
+   refinement layer over existing markup, while this is new surface.
+   ========================================================================= */
+
+.wizard {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+/* ---------------- step rail ----------------
+   The progress bar sits BEHIND the numbers rather than above them, so the two
+   cannot disagree about where you are. */
+.wiz-rail {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 4px;
+}
+.wiz-rail::before,
+.wiz-rail-fill {
+  content: "";
+  position: absolute;
+  top: 17px;
+  left: 8%;
+  right: 8%;
+  height: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+.wiz-rail-fill {
+  right: auto;
+  background: var(--grad-accent);
+  transition: width 0.45s var(--ease-out);
+}
+.wiz-step { margin: 0; }
+.wiz-step button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  padding: 0;
+  color: var(--ink-faint);
+  transition: color 0.2s;
+}
+.wiz-step button:disabled { cursor: default; }
+.wiz-num {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--bg);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--ink) 14%, transparent);
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 14px;
+  transition: background 0.25s, box-shadow 0.25s, color 0.25s, transform 0.3s var(--ease-spring);
+}
+.wiz-label { display: flex; flex-direction: column; gap: 1px; }
+.wiz-label strong { font-size: 13.5px; font-weight: 700; }
+.wiz-label em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  line-height: 1.3;
+}
+.wiz-step.now button { color: var(--ink); }
+.wiz-step.now .wiz-num {
+  background: var(--ink);
+  color: var(--surface);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--violet) 18%, transparent);
+  transform: scale(1.06);
+}
+.wiz-step.done button { color: var(--ink-soft); }
+.wiz-step.done .wiz-num {
+  background: var(--success);
+  color: #08130d;
+  box-shadow: none;
+}
+
+/* ---------------- panels ---------------- */
+.wiz-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 28px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--elev-2), inset 0 0 0 1px var(--line);
+  animation: wizIn 0.4s var(--ease-out) both;
+}
+@keyframes wizIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.wiz-head { display: flex; flex-direction: column; gap: 5px; }
+.wiz-head h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+.wiz-head p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+
+.wiz-limits {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+  line-height: 1.5;
+}
+.wiz-limits strong { color: var(--ink-soft); }
+.wiz-limits-link {
+  font: inherit;
+  font-weight: 700;
+  border: 0;
+  background: transparent;
+  color: var(--violet);
+  cursor: pointer;
+  padding: 0 0 0 6px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.wiz-limits-link:hover { color: var(--indigo); }
+
+.pref-group { display: flex; flex-direction: column; gap: 10px; }
+/* The segmented control is a two-option switch, not a full-width bar: stretched
+   across a 860px panel the thumb travels 400px and the whole thing reads as a
+   pair of tabs. */
+.wizard .workspace-source-tabs {
+  align-self: flex-start;
+  width: 210px;
+  margin: 0;
+}
+.wizard .workspace-urlrow { width: 100%; }
+.pref-group-label {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* ---------------- the unlock strip ----------------
+   One strip, at the end of the step. A banner beside every locked control reads
+   as nagging, and nagging is what makes people close the tab. */
+.unlock-strip {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 15px 18px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(100deg,
+              color-mix(in srgb, var(--violet) 12%, var(--surface)),
+              color-mix(in srgb, var(--indigo) 8%, var(--surface)));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--violet) 28%, transparent);
+}
+.unlock-strip span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.unlock-strip strong { font-size: 13px; line-height: 1.35; }
+.unlock-strip em {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--ink-soft);
+  line-height: 1.4;
+}
+.unlock-strip .btn { flex: none; margin-left: auto; }
+
+.template-card.locked { opacity: 0.72; }
+.template-card.locked:hover { opacity: 1; border-color: var(--violet); }
+.template-name .chip-lock { margin-left: 5px; vertical-align: -2px; }
+
+/* ---------------- review ---------------- */
+.review-card {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-md);
+  background: var(--track);
+  box-shadow: inset 0 0 0 1px var(--line);
+  overflow: hidden;
+}
+.review-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 12px 16px;
+  font-size: 13.5px;
+}
+.review-row + .review-row { box-shadow: inset 0 1px 0 var(--line); }
+.review-row span { color: var(--ink-soft); flex: none; }
+.review-row strong {
+  font-weight: 700;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-row.muted strong { color: var(--ink-faint); font-weight: 600; }
+.review-row:last-child { background: color-mix(in srgb, var(--violet) 7%, transparent); }
+
+.review-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+
+/* ---------------- footer nav ---------------- */
+.wiz-nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.wiz-nav .btn:last-child { margin-left: auto; }
+.wiz-nav-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+}
+
+/* ---------------- upgrade dialog ---------------- */
+.upgrade-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--ink) 55%, transparent);
+  backdrop-filter: blur(10px);
+  animation: fadeIn 0.2s ease;
+}
+.upgrade-card {
+  position: relative;
+  width: min(520px, 100%);
+  max-height: 88vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 30px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--elev-2), inset 0 0 0 1px var(--line);
+  animation: wizIn 0.35s var(--ease-spring) both;
+}
+.upgrade-x {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 8px;
+}
+.upgrade-x:hover { color: var(--ink); background: var(--track); }
+.upgrade-eyebrow {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: var(--grad-accent);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.upgrade-card h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 25px;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+}
+.upgrade-sub { margin: 0; font-size: 13.5px; color: var(--ink-soft); line-height: 1.55; }
+.upgrade-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.upgrade-list li { display: flex; gap: 10px; align-items: flex-start; }
+.upgrade-list li svg { flex: none; margin-top: 3px; color: var(--success); }
+.upgrade-list li span { display: flex; flex-direction: column; gap: 1px; }
+.upgrade-list strong { font-size: 13.5px; }
+.upgrade-list em {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--ink-faint);
+  line-height: 1.4;
+}
+/* The one thing they just reached for, marked. A list where everything looks
+   equally important answers a question nobody asked. */
+.upgrade-list li.hit {
+  padding: 8px 10px;
+  margin: -8px -10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--violet) 10%, transparent);
+}
+.upgrade-list li.hit strong { color: var(--violet); }
+.upgrade-actions { display: flex; gap: 10px; margin-top: 8px; }
+.upgrade-actions .btn:last-child { margin-left: auto; }
+.upgrade-foot { margin: 0; font-size: 11.5px; color: var(--ink-faint); text-align: center; }
+
+/* ---------------- share page ---------------- */
+.share-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+  padding: 48px 24px;
+  align-items: center;
+  justify-content: center;
+}
+.share-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 320px) minmax(0, 460px);
+  gap: 42px;
+  align-items: start;
+  width: 100%;
+  max-width: 880px;
+}
+.share-video {
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #000;
+  box-shadow: var(--elev-2);
+  aspect-ratio: 9 / 16;
+}
+.share-video video { width: 100%; height: 100%; display: block; object-fit: contain; }
+.share-video.skeleton { background: var(--track); }
+.share-meta { display: flex; flex-direction: column; gap: 16px; padding-top: 8px; }
+.share-score {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  align-self: flex-start;
+  padding: 6px 14px;
+  border-radius: var(--radius-pill);
+  background: var(--grad-accent);
+  color: #fff;
+}
+.share-score strong { font-family: var(--font-display); font-size: 19px; }
+.share-score em { font-style: normal; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+.share-meta h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(26px, 4vw, 38px);
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+}
+.share-hook {
+  margin: 0;
+  font-family: var(--font-serif, var(--font-display));
+  font-size: 16px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+.share-bars { display: flex; flex-direction: column; gap: 8px; }
+.share-bar {
+  display: grid;
+  grid-template-columns: 92px 1fr 24px;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.share-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track);
+  overflow: hidden;
+}
+.share-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--grad-accent);
+  animation: barGrow 0.8s var(--ease-out) both;
+}
+@keyframes barGrow { from { transform: scaleX(0); transform-origin: left; } }
+.share-bar em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--ink-faint);
+}
+.share-stats { margin: 0; font-size: 12px; color: var(--ink-faint); }
+
+.share-foot {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  width: 100%;
+  max-width: 880px;
+  padding: 20px 24px;
+  border-radius: var(--radius-lg);
+  background: var(--ink-solid);
+  color: #fff;
+}
+.share-foot span { font-size: 13.5px; line-height: 1.5; opacity: 0.86; }
+.share-foot strong { opacity: 1; }
+.share-foot .btn { flex: none; margin-left: auto; }
+/* The footer is a dark band, and btn-primary is dark ink on light -- inside it
+   the CTA disappeared into the background. */
+.share-foot .btn-primary { background: #fff; color: var(--ink-solid); }
+.share-foot .btn-primary:hover { background: var(--lime); color: #14141a; }
+html[data-theme="dark"] .share-foot { background: #191922; }
+
+.share-empty { text-align: center; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+.share-empty h1 { margin: 0; font-family: var(--font-display); font-size: 30px; }
+.share-empty p { margin: 0; color: var(--ink-soft); font-size: 14px; }
+
+@media (max-width: 760px) {
+  .share-wrap { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .share-video { max-width: 320px; margin: 0 auto; }
+  .share-foot { flex-direction: column; align-items: flex-start; }
+  .share-foot .btn { margin-left: 0; }
+  .wiz-label em { display: none; }
+  .unlock-strip { flex-direction: column; align-items: flex-start; }
+  .unlock-strip .btn { margin-left: 0; }
+}

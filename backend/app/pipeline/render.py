@@ -417,6 +417,58 @@ def _segments_filter(segments: list, want_audio: bool) -> tuple:
     return ";".join(parts), "[cv]", None
 
 
+def _ff_escape(text: str) -> str:
+    """Escape a string for use inside an ffmpeg filter argument."""
+    return (text.replace("\\", "\\\\").replace(":", "\\:")
+                .replace("'", "\u2019").replace("%", "\\%")
+                .replace(",", "\\,").replace("[", "\\[").replace("]", "\\]"))
+
+
+def _watermark_font() -> str:
+    """A bold font file drawtext can actually load.
+
+    drawtext needs a FILE, not a family, and the shipped caption fonts are not
+    present in every checkout -- so fall back through the fonts a Linux box
+    reliably has rather than failing the render over a watermark.
+    """
+    from app.pipeline.subtitles import FONTS_DIR
+    candidates = []
+    if os.path.isdir(FONTS_DIR):
+        candidates += [os.path.join(FONTS_DIR, n) for n in sorted(os.listdir(FONTS_DIR))
+                       if "bold" in n.lower() and n.lower().endswith((".ttf", ".otf"))]
+    candidates += [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def watermark_filter(text: str, video_label: str, height: int) -> tuple:
+    """(filter, new_label) drawing a burned-in credit at the foot of the frame.
+
+    Burned into the pixels on purpose: this is what a free clip carries when it
+    is posted, so it has to survive being re-uploaded, re-encoded and cropped by
+    a platform. It sits BELOW the caption band -- captions are the thing people
+    are reading -- and inside the safe area so a platform's own UI does not
+    cover it, which would defeat the point entirely.
+    """
+    font = _watermark_font()
+    if not font or not text:
+        return "", video_label
+
+    size = max(22, int(height * 0.022))
+    pad = int(height * 0.028)
+    return (
+        f"{video_label}drawtext=fontfile='{_ff_escape(font)}'"
+        f":text='{_ff_escape(text)}'"
+        f":fontcolor=white@0.9:fontsize={size}"
+        f":box=1:boxcolor=black@0.35:boxborderw={max(8, size // 3)}"
+        f":x=(w-text_w)/2:y=h-text_h-{pad}[wm]",
+        "[wm]",
+    )
+
+
 def render_clip(
     video_path: str,
     start: float,
@@ -434,6 +486,7 @@ def render_clip(
     speed_pitched: bool = False,
     background: str = None,
     reframe_plan: dict = None,
+    watermark: str = None,
 ) -> str:
     duration = max(end - start, 1)
     width, height = RATIOS.get(ratio, RATIOS["9:16"])
@@ -568,6 +621,12 @@ def render_clip(
         filter_complex += f";{a_in}{af}[aspd]"
         audio_map = ["-map", "[aspd]"]
         duration = duration / max(speed, 0.001)
+
+    # Last of all, so nothing can be composited over it.
+    if watermark:
+        wm_filter, video_label = watermark_filter(watermark, video_label, height)
+        if wm_filter:
+            filter_complex += ";" + wm_filter
 
     video_map = video_label
 

@@ -31,6 +31,22 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _iso_utc(value: datetime) -> str:
+    """ISO 8601 with an explicit offset.
+
+    SQLite has no timezone type, so a value written as aware UTC reads back
+    NAIVE. `isoformat()` on that produces "2026-06-03T21:24:00" with no offset,
+    and `new Date()` in the browser reads an offsetless string as LOCAL time --
+    so a job created a minute ago showed up as "6 hours ago" for anyone east of
+    UTC, off by exactly their own offset. Stamp the offset we actually mean.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -110,7 +126,7 @@ class Job(Base):
             # appear sooner, so the editor must be able to tell "not ready yet"
             # from "broken" instead of showing a black frame.
             "proxy_ready": self._proxy_ready(),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": _iso_utc(self.created_at),
         }
 
 
@@ -129,6 +145,26 @@ class CreditLedger(Base):
     balance_after: Mapped[int] = mapped_column(Integer)
     job_id: Mapped[str] = mapped_column(String(36), nullable=True)
     note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class Share(Base):
+    """A public page for one clip.
+
+    Explicit and per clip rather than "every clip has a URL": a share link is a
+    decision, and a guessable one for every clip ever rendered would make a
+    private job public by default. The token is the capability -- there is no
+    listing endpoint, so a link that was never shared cannot be found.
+    """
+
+    __tablename__ = "shares"
+
+    token: Mapped[str] = mapped_column(String(32), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("jobs.id"), index=True)
+    clip_index: Mapped[int] = mapped_column(Integer, default=0)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"),
+                                         nullable=True, index=True)
+    views: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

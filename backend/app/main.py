@@ -16,6 +16,7 @@ import os
 import uuid
 import subprocess
 import random
+import secrets
 import threading
 import traceback
 import shutil
@@ -33,7 +34,7 @@ from sqlalchemy.orm import Session
 from app import auth, billing, editing, workspace
 from app.db import SessionLocal, get_session, init_db
 from app.jobs import create_job, get_job, get_job_transcript, list_jobs, update_job
-from app.models import Clip, Job, User
+from app.models import Clip, Job, Share, User, _iso_utc
 from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
                           pacing, reframe, render, scoring, subtitles,
                           transcriber, voiceover)
@@ -326,6 +327,10 @@ def plans():
         "topups": billing.TOPUPS,
         "credits_per_clip": billing.CREDITS_PER_CLIP,
         "max_source_minutes": billing.MAX_SOURCE_MINUTES,
+        # Signed-out visitors get the free ceilings, which is what the studio
+        # needs before anyone has an account.
+        "limits": billing.LIMITS,
+        "entitlements": {k: sorted(v) for k, v in billing.ENTITLEMENTS.items()},
     }
 
 
@@ -339,6 +344,7 @@ def billing_me(user: User = Depends(auth.current_user_required)):
         # nobody upgrades for. Sent as a list so adding one needs no client
         # change beyond using it.
         "entitlements": sorted(billing.entitlements_for(user.plan, user.email)),
+        "limits": billing.limits_for(user.plan, user.email),
         "is_admin": billing.is_admin(user.email),
         "history": billing.history(user.id),
     }
@@ -413,6 +419,8 @@ def me(user: User = Depends(auth.current_user_required)):
     return {"id": user.id, "email": user.email, "credits": user.credits,
             "plan": user.plan,
             "entitlements": sorted(billing.entitlements_for(user.plan, user.email)),
+            # Ceilings, not switches: clip count, source length and upload size.
+            "limits": billing.limits_for(user.plan, user.email),
             # So the UI can say WHY a paid control is unlocked on an account
             # whose plan is free -- otherwise testing the paid experience looks
             # identical to a billing bug.
@@ -422,6 +430,86 @@ def me(user: User = Depends(auth.current_user_required)):
 @app.get("/jobs")
 def my_jobs(user: User = Depends(auth.current_user_required)):
     return list_jobs(user.id)
+
+
+# ---------------------------------------------------------------------------
+# Public share pages
+# ---------------------------------------------------------------------------
+# The score breakdown is already computed for every clip and, until now, only
+# the person who made it ever saw it. A page that shows the clip next to why it
+# was picked is the one thing a creator has a reason to post -- which makes it a
+# paid capability rather than a nicety: it is marketing the plan pays for.
+
+@app.post("/jobs/{job_id}/clips/{index}/share")
+def create_share(job_id: str, index: int,
+                 user: User = Depends(auth.current_user_required),
+                 session: Session = Depends(get_session)):
+    _gate(user, "share_pages",
+          "Share pages are on the Creator and Pro plans. They publish a clip "
+          "with its score breakdown on a page you can post anywhere.")
+
+    job = session.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Ownership, not just existence: a token minted for someone else's job would
+    # publish their video.
+    if job.user_id and job.user_id != user.id:
+        raise HTTPException(status_code=403, detail="That job belongs to another account.")
+    clip = next((c for c in job.clips if c.index == index), None)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    # One link per clip: re-sharing has to return the URL already in circulation,
+    # or every press of the button orphans the last one.
+    row = (session.query(Share)
+           .filter(Share.job_id == job_id, Share.clip_index == index).first())
+    if not row:
+        row = Share(token=secrets.token_urlsafe(9), job_id=job_id,
+                    clip_index=index, user_id=user.id)
+        session.add(row)
+        session.commit()
+    return {"token": row.token, "path": f"/s/{row.token}", "views": row.views}
+
+
+@app.get("/share/{token}")
+def read_share(token: str, session: Session = Depends(get_session)):
+    """Public. No auth, and deliberately no way to enumerate."""
+    row = session.get(Share, token)
+    if not row:
+        raise HTTPException(status_code=404, detail="This share link is not valid.")
+    job = session.get(Job, row.job_id)
+    clip = next((c for c in (job.clips if job else []) if c.index == row.clip_index), None)
+    if not clip:
+        raise HTTPException(status_code=404, detail="This clip is no longer available.")
+
+    row.views += 1
+    session.commit()
+
+    return {
+        "token": token,
+        "title": clip.title,
+        "hook": clip.hook,
+        "score": clip.score,
+        "scores": clip.scores or {},
+        "duration": clip.duration,
+        "keywords": clip.keywords or [],
+        "video": f"/api/share/{token}/video?v={clip._file_version()}",
+        "views": row.views,
+        "created_at": _iso_utc(row.created_at),
+    }
+
+
+@app.get("/share/{token}/video")
+def read_share_video(token: str, session: Session = Depends(get_session)):
+    row = session.get(Share, token)
+    if not row:
+        raise HTTPException(status_code=404, detail="This share link is not valid.")
+    clip = (session.query(Clip)
+            .filter(Clip.job_id == row.job_id, Clip.index == row.clip_index).first())
+    path = os.path.join(STORAGE_DIR, row.job_id, clip.file if clip else "")
+    if not clip or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="This clip is no longer available.")
+    return FileResponse(path, media_type="video/mp4")
 
 
 class CaptionLine(BaseModel):
@@ -838,6 +926,18 @@ def rerender_clip(job_id: str, index: int, body: ClipEdit):
         raise HTTPException(status_code=500, detail=f"Re-render failed: {e}")
 
 
+def _gate(user: User, feature: str, message: str) -> None:
+    """Rejects a paid capability. One helper so every gate reads the same.
+
+    Enforced here rather than trusted from the client: the UI locks these
+    controls, but locking a control is presentation, not a gate -- the request
+    can still arrive with the flag set.
+    """
+    if not billing.allows(user.plan if user else None, feature,
+                          user.email if user else None):
+        raise HTTPException(status_code=402, detail=message)
+
+
 def _prepare_job(req: JobRequest, user: User = None, uploaded: bool = False) -> list:
     """Validate shared job options and return any pre-resolved gameplay loops."""
     if not uploaded:
@@ -848,6 +948,25 @@ def _prepare_job(req: JobRequest, user: User = None, uploaded: bool = False) -> 
     if not tpl:
         raise HTTPException(status_code=400,
                             detail=f"Unknown template. Choose from: {', '.join(TEMPLATES)}")
+
+    limits = billing.limits_for(user.plan if user else None,
+                               user.email if user else None)
+    if req.n_clips > limits["max_clips"]:
+        raise HTTPException(
+            status_code=402,
+            detail=(f"Your plan covers up to {limits['max_clips']} clips per video. "
+                    f"Upgrade to ask for {req.n_clips} in one run."),
+        )
+
+    if tpl["frame"] == "gameplay":
+        _gate(user, "gameplay",
+              "Gameplay split-screen is on the Creator and Pro plans. It pairs your "
+              "clip with looping footage to hold attention through the whole video.")
+    if req.tighten_pauses:
+        _gate(user, "tighten_pauses",
+              "Pause tightening is on the Creator and Pro plans. It cuts the dead air "
+              "so a clip feels edited rather than merely trimmed.")
+
     # Resolve the gameplay asset NOW so a missing file fails the request with a
     # clear message instead of dying mid-pipeline after download+transcription.
     gameplay_loops = _gameplay_loops() if tpl["frame"] == "gameplay" else []
@@ -865,18 +984,12 @@ def _prepare_job(req: JobRequest, user: User = None, uploaded: bool = False) -> 
                         f"{have}. Ask for fewer clips, top up, or upgrade."),
             )
 
-    # Paid capability, enforced here rather than trusted from the client. The UI
-    # hides the control for free accounts, but hiding a control is presentation,
-    # not a gate -- the request can still arrive with the flag set.
-    if req.multilingual and not billing.allows(user.plan if user else None,
-                                               "multilingual",
-                                               user.email if user else None):
-        raise HTTPException(
-            status_code=402,
-            detail="Multilingual captions are on the Creator and Pro plans. "
-                   "They transcribe speech that switches between languages "
-                   "mid-sentence, which the standard model transcribes as noise.",
-        )
+    # Paid capability, enforced here rather than trusted from the client.
+    if req.multilingual:
+        _gate(user, "multilingual",
+              "Multilingual captions are on the Creator and Pro plans. "
+              "They transcribe speech that switches between languages "
+              "mid-sentence, which the standard model transcribes as noise.")
 
     # The template's frame mode is resolved once, here, and stored with the job.
     # The editor has to preview the same composition the renderer builds, and it
@@ -890,6 +1003,15 @@ def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
     options = req.dict()
     options["frame"] = TEMPLATES.get(req.template, TEMPLATES["classic"])["frame"]
     options["input_type"] = "upload" if uploaded else "link"
+    # Plan decisions are frozen onto the job at creation, not looked up while it
+    # renders. A subscription that starts or lapses mid-render must not change
+    # what the clip looks like, and a re-export months later has to match the
+    # file it replaces.
+    plan_id = user.plan if user else None
+    email = user.email if user else None
+    options["watermark"] = ("" if billing.allows(plan_id, "no_watermark", email)
+                            else billing.WATERMARK_TEXT)
+    options["max_source_minutes"] = billing.limits_for(plan_id, email)["max_source_minutes"]
     job_id = create_job(req.url, options, user_id=user.id if user else None)
     background_tasks.add_task(run_pipeline, job_id, req, gameplay_loops,
                               user.id if user else None, uploaded)
@@ -956,6 +1078,13 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
         raise HTTPException(status_code=400, detail="Choose a video file to upload.")
 
     gameplay_loops = _prepare_job(req, user, uploaded=True)
+    # Per-plan ceiling, checked while streaming rather than from a header: a
+    # Content-Length is whatever the client claims it is.
+    max_bytes = min(
+        MAX_UPLOAD_BYTES,
+        billing.limits_for(user.plan if user else None,
+                           user.email if user else None)["max_upload_mb"] * 1024 * 1024,
+    )
     req.url = f"upload://{name}"
     job_id = _start_job(req, background_tasks, user, uploaded=True,
                         gameplay_loops=gameplay_loops)
@@ -969,10 +1098,12 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
         with open(part_path, "wb") as out:
             while chunk := await file.read(1024 * 1024):
                 written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
+                if written > max_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Uploads must be under {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                        detail=(f"Your plan allows uploads up to "
+                                f"{max_bytes // (1024 * 1024)} MB. Upgrade for larger "
+                                f"files, or paste a link instead."),
                     )
                 out.write(chunk)
         if not written:
@@ -1038,6 +1169,10 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
     tpl = TEMPLATES.get(req.template, TEMPLATES["classic"])
     job_dir = os.path.join(STORAGE_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+    # Frozen at creation by _start_job -- see the note there.
+    job_options = (get_job(job_id) or {}).get("options") or {}
+    options_watermark = job_options.get("watermark") or None
+    max_source_minutes = job_options.get("max_source_minutes") or billing.MAX_SOURCE_MINUTES
 
     try:
         # Link jobs fetch an audio-only stream first. Uploads already live in
@@ -1087,12 +1222,14 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         # Source length no longer sets the price, but it still sets OUR cost, so
         # it is the one thing per-clip pricing has to bound. Rejected here,
         # after transcription has revealed the true duration.
-        if source_seconds > billing.MAX_SOURCE_MINUTES * 60:
+        if source_seconds > max_source_minutes * 60:
+            pretty = (f"{max_source_minutes // 60} hours" if max_source_minutes >= 120
+                      else f"{max_source_minutes} minutes")
             update_job(
                 job_id, status="failed",
-                error=(f"This video is {source_seconds/3600:.1f} hours long, over "
-                       f"the {billing.MAX_SOURCE_MINUTES // 60}-hour limit. "
-                       f"Clip a section of it instead -- you were not charged."),
+                error=(f"This video is {source_seconds/60:.0f} minutes long, over "
+                       f"your {pretty} limit. Clip a shorter section, or upgrade "
+                       f"for longer sources -- you were not charged."),
             )
             workspace.clear_intermediates(job_dir)
             return
@@ -1279,6 +1416,7 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 segments=segments,
                 mute_spans=mute_spans,
                 reframe_plan=clip_plan,
+                watermark=options_watermark,
             )
 
             # Raw scores rank the clips; these are what gets shown. The mapping

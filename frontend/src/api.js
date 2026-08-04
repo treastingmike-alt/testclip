@@ -6,7 +6,7 @@ function authHeaders() {
 }
 
 
-export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, voice, language, template, ratio, lengthPref, intent }) {
+export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, tightenPauses, voice, language, template, ratio, lengthPref, intent }) {
   const resp = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -17,6 +17,7 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
       burn_subtitles: burnSubtitles,
       auto_censor: autoCensor !== false,
       multilingual: multilingual === true,
+      tighten_pauses: tightenPauses === true,
       voice,
       language,
       template,
@@ -77,6 +78,31 @@ export async function getClipReframe(jobId, index, start, end) {
 export async function getJob(jobId) {
   const resp = await fetch(`${API_BASE}/jobs/${jobId}`);
   if (!resp.ok) throw new Error(`Failed to fetch job (${resp.status})`);
+  return resp.json();
+}
+
+/* Public pricing AND the per-plan ceilings. The studio needs the free limits
+   before anyone has signed in, so they cannot come from /auth/me.
+   (Defined once, further down — see getPlans.) */
+
+/* Mints (or returns) the public page for one clip. 402 when the plan does not
+   include it -- the caller turns that into the upgrade prompt. */
+export async function createShare(jobId, index) {
+  const resp = await fetch(`${API_BASE}/jobs/${jobId}/clips/${index}/share`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    const err = await readError(resp, "Could not create a share link");
+    err.status = resp.status;
+    throw err;
+  }
+  return resp.json();
+}
+
+export async function getShare(token) {
+  const resp = await fetch(`${API_BASE}/share/${token}`);
+  if (!resp.ok) throw await readError(resp, "This share link is not valid");
   return resp.json();
 }
 
