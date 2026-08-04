@@ -76,18 +76,77 @@
 - The marketing nav is stowed while the studio or dashboard is open.
 - Focus-visible rings, `::selection` colour, reduced-motion support.
 
+## Implemented — June 2026, session 2
+
+### Bug fix: job history timestamps
+`models._iso_utc()`. SQLite has no timezone type, so a datetime written as aware
+UTC read back naive, and `isoformat()` produced an offsetless string that the
+browser parsed as *local* time — a job made a minute ago showed as "6 hours
+ago" for anyone east of UTC, off by exactly their own offset. Applied to
+`Job.to_dict`, the credit ledger and share pages.
+
+### The studio is a 3-step wizard
+`StudioWizard.jsx`. It used to be one screen where the source row, a collapsed
+"Output settings" drawer and Generate coexisted, so the order was implied by
+vertical position and nothing confirmed what was about to run. Now:
+**1 Source → 2 Preferences → 3 Review**, with a progress rail (completed steps
+are clickable, future ones are not), grouped preference sections, and a review
+card listing every choice and its credit cost before anything is spent.
+
+### Free vs premium, bifurcated
+- `billing.LIMITS` — free: **2 clips/video, 30-min sources, 500 MB uploads**;
+  creator: 10 / 240 min / 2 GB; pro: 10 / 240 min / 4 GB.
+- `billing.ENTITLEMENTS` — paid: `gameplay`, `tighten_pauses`, `multilingual`,
+  `priority`, `branding`, `no_watermark`, `share_pages` (+ `bulk_export` on pro).
+- Enforced server-side by `main._gate()` (HTTP 402 with a descriptive reason) —
+  the UI locks are presentation only.
+- Locked controls stay **visible** with a lock and a tooltip, plus one
+  "What's in Creator?" strip at the end of step 2. `UpgradeModal.jsx` names the
+  feature the person just reached for and links to pricing. No per-control nags.
+- Limits are stated in step 1, before they bite, instead of arriving as a
+  rejection after Generate. Clip count is clamped rather than blocked.
+
+### Watermark on free exports
+`render.watermark_filter()` — a burned-in credit at the foot of the frame, below
+the caption band and inside the safe area, so it survives re-encoding and
+platform cropping. The decision is **frozen onto `job.options.watermark` at
+creation**, so a re-export months later matches the file it replaces and a
+lapsed subscriber cannot strip it by re-exporting. Text comes from
+`CLIPPER_WATERMARK` because the product name is not final.
+
+### Public share pages (premium)
+`Share` model + `POST /jobs/{id}/clips/{i}/share`, `GET /share/{token}`,
+`GET /share/{token}/video`. Opt-in per clip, ownership-checked, one idempotent
+token per clip, no listing endpoint — the token is the only capability.
+`SharePage.jsx` renders at `/s/<token>` (resolved from the path in `main.jsx`;
+the app has no router and this is the only public path) with the clip, its score
+breakdown, the hook and a "Made with Clipper" footer CTA.
+
+### Notes
+- `usePlan.js` derives paid state from the **entitlement list**, not the plan
+  name: the `ADMIN_EMAILS` bypass grants entitlements while leaving `plan` at
+  "free", and a plan-string check told admins their exports would be
+  watermarked when the server had already decided otherwise.
+- CORS origins now come from `CLIPPER_CORS_ORIGINS`.
+
 ## Backlog
 
+### P0 — deferred by the user
+- **Emoji in a burned-in title do not render.** libass needs a font with those
+  glyphs; Noto Emoji would render monochrome. The user chose to leave it.
+
 ### P1
-- The editor's ←/→ step in *source* time, so a step that lands inside a
-  tightened pause appears to do nothing. Step in output time instead.
+- The editor's ←/→ step in *source* time, so a step landing inside a tightened
+  pause appears to do nothing. Step in output time instead.
 - Loading skeletons for the dashboard job list and the clip grid.
-- Top-up credit packs are display-only — no checkout is wired.
+- Payments are not wired: `/billing/checkout` returns `provider_not_configured`
+  and grants nothing, so nobody can actually reach a paid plan yet — the only
+  route to the paid experience is `ADMIN_EMAILS`. Top-up packs are display-only.
+- `rerender` and `export` on the same clip take no lock; concurrent calls race.
 
 ### P2
-- Audit the rest of `styles.css` for literal colours; a few rare panels
-  (billing edge cases, some picker menus) have only been spot-checked in dark.
-- `main.py` CORS `allow_origins` is localhost-only; fine behind this ingress,
-  not for a direct-origin deployment.
-- Mobile pass on the editor (the inspector column stacks but has not been
-  reviewed at phone widths).
+- Audit the rest of `styles.css` for literal colours; a few rare panels have
+  only been spot-checked in dark.
+- Mobile pass on the editor and the wizard.
+- Share pages have no revoke, and no view analytics beyond a counter.
+
