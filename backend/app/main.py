@@ -41,8 +41,23 @@ from app.models import Clip, FreeEditorExport, Job, Share, User, _iso_utc
 from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
                           pacing, reframe, render, scoring, subtitles,
                           transcriber, voiceover)
-from app.polar_catalog import checkout_url as polar_checkout_url
+from app.polar_catalog import checkout_url as polar_static_checkout_url
 from app.polar_catalog import subscription_product, topup_product
+
+
+def polar_checkout_url(product, user_id: str, email: str) -> str | None:
+    """A checkout URL for this user, best available method first.
+
+    An API-created session is preferred because it can carry `success_url` and
+    `metadata.reference_id`; a static Checkout Link can carry neither reliably,
+    which is why purchases through one left the buyer on Polar's page with no
+    credits granted. The static link stays as the fallback so checkout still
+    works before POLAR_ACCESS_TOKEN is configured.
+    """
+    if not product:
+        return None
+    return (polar_payments.create_checkout_session(product, user_id, email)
+            or polar_static_checkout_url(product, user_id, email))
 
 app = FastAPI(title="Clipper API")
 
