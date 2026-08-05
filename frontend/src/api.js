@@ -1,4 +1,14 @@
-export const API_BASE = "/api";
+/* Same-origin "/api" by default, which is what the dev server proxies and what
+   a single-origin ingress serves. A frontend deployed SEPARATELY from its API
+   -- static hosting on one domain, the API on another -- has no such path, and
+   a relative URL there resolves against the frontend's own domain: the login
+   POST went to the static host and came back 404, never reaching the API at
+   all. VITE_API_BASE overrides it with the API's absolute origin.
+
+   Vite inlines this at BUILD time, so it must be set in the host's environment
+   before the build, and changing it needs a redeploy. Include any prefix the
+   API is mounted under (see backend/server.py, which mounts at /api). */
+export const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
 /* Keep implementation failures on the server. A creator only needs the next
    useful action, not the name of the downloader or transcription provider. */
