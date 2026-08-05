@@ -47,3 +47,5 @@ def init_db() -> None:
     """Creates any missing tables. Safe to call on every startup."""
     from app import models  # noqa: F401  -- registers the mappers
     Base.metadata.create_all(bind=engine)
+
+print("[database]", DATABASE_URL.split("@")[-1])
