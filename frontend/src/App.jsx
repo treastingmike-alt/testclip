@@ -9,6 +9,7 @@ import ThemeToggle, { useTheme } from "./ThemeToggle";
 import { useToast } from "./Toast";
 import StudioWizard from "./StudioWizard";
 import UpgradeModal from "./UpgradeModal";
+import WelcomeUpgrade from "./WelcomeUpgrade";
 import { usePlan } from "./usePlan";
 const STAGES = [
   { key: "downloading", label: "Getting your video ready", blurb: "Your video is being prepared." },
@@ -544,6 +545,10 @@ export default function App() {
     };
   }, [accountOpen]);
   const [user, setUser] = useState(null);
+  /* Set once the webhook has actually landed and the account really is on a
+     paid plan -- not merely on return from Polar. Someone who abandons checkout
+     also comes back here, and congratulating them would be worse than silence. */
+  const [justUpgraded, setJustUpgraded] = useState(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState("signin");
   const [authIntent, setAuthIntent] = useState(null);
@@ -585,25 +590,38 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const params = new URLSearchParams(window.location.search);
-    const returningFromPayment = params.get("payment") === "success";
+
+    /* Any of these means "just paid". Watching only for `payment=success` was
+       too narrow: which marker arrives depends on how checkout was started, and
+       a purchase through a Checkout Link came back carrying nothing but
+       `customer_session_token` -- so the buyer landed on a completely ordinary
+       home page with no acknowledgement that they had just been charged. */
+    const returningFromPayment = params.get("payment") === "success"
+      || params.has("customer_session_token")
+      || params.has("checkout_id");
 
     async function refresh(attempt = 0) {
       const nextUser = await fetchMe();
       if (cancelled) return;
       setUser(nextUser);
-      if (returningFromPayment && attempt < 3) {
-        window.setTimeout(() => refresh(attempt + 1).catch(() => {}), 1200);
+      /* Keep polling until the plan actually changes. The webhook is what
+         grants credits, and it races the redirect -- a fixed number of tries
+         used to give up while the payment was still settling, leaving someone
+         who HAD paid looking at their old balance. */
+      if (returningFromPayment && attempt < 8
+          && !nextUser?.entitlements?.length) {
+        window.setTimeout(() => refresh(attempt + 1).catch(() => {}), 1500);
+      }
+      if (returningFromPayment && nextUser?.entitlements?.length) {
+        setJustUpgraded(nextUser);
       }
     }
     refresh().catch(() => {});
 
     if (returningFromPayment) {
-      toast("Payment received", {
-        detail: "Your plan and credits will update here in a moment.",
-        tone: "success",
-      });
       params.delete("payment");
       params.delete("checkout_id");
+      params.delete("customer_session_token");
       const query = params.toString();
       window.history.replaceState(window.history.state, "",
         `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
@@ -1572,6 +1590,18 @@ export default function App() {
           onSeePlans={() => {
             setUpgradeFor(null);
             setPricingOpen(true);
+          }}
+        />
+      )}
+
+      {justUpgraded && (
+        <WelcomeUpgrade
+          user={justUpgraded}
+          onClose={() => setJustUpgraded(null)}
+          onStart={() => {
+            // Straight to the one thing they upgraded in order to do.
+            document.querySelector('input[type="url"]')?.focus();
+            window.scrollTo({ top: 0, behavior: "smooth" });
           }}
         />
       )}
