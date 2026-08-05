@@ -126,6 +126,14 @@ def _friendly_error(log_text: str) -> str:
     return None
 
 
+def _public_failure(log_text: str) -> str:
+    """A useful next step for creators; detailed provider output stays in logs."""
+    friendly = _friendly_error(log_text)
+    if friendly:
+        return "We couldn't access this video. Check that it is public, or upload the video file instead."
+    return "This link is busy or unavailable right now. Try again shortly, or upload the video file instead."
+
+
 def _is_auth_failure(log_text: str) -> bool:
     return "Sign in to confirm" in log_text
 
@@ -223,8 +231,9 @@ def _run_with_progress(cmd: list, on_progress=None, _retrying: bool = False) -> 
             # Full log to the server console for debugging; only the sentence
             # travels to the user.
             print("[clipper] yt-dlp failure:\n" + log)
-            raise RuntimeError(friendly)
-        raise RuntimeError("yt-dlp failed:\n" + log)
+            raise RuntimeError(_public_failure(log))
+        print("[clipper] downloader failure:\n" + log)
+        raise RuntimeError(_public_failure(log))
 
 
 def estimate_video_bytes(url: str) -> int:
@@ -264,8 +273,9 @@ def inspect_url(url: str) -> dict:
         raise RuntimeError("Could not check that video link. Try again or upload the file.") from exc
 
     if proc.returncode != 0:
-        raise RuntimeError(_friendly_error(proc.stderr + proc.stdout)
-                           or "Could not read that video link. Check that it is public.")
+        log = proc.stderr + proc.stdout
+        print("[clipper] source preview failure:\n" + log)
+        raise RuntimeError(_public_failure(log))
     try:
         info = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:

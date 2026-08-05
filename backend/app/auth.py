@@ -1,10 +1,8 @@
 """Accounts: password hashing, JWT issuing, and request authentication.
 
-Auth is deliberately OPTIONAL on the clipping endpoints for now. Requiring a
-login today would break the current flow for no gain, since nothing is metered
-yet -- so `current_user_optional` returns None for anonymous callers and the job
-is simply saved without an owner. When credits start being enforced, the
-endpoints switch to `current_user_required` and anonymous jobs stop.
+Source previews stay public, but creating or uploading a job requires an
+account. That keeps credits, plan limits, history, and ownership attached to the
+same person before any expensive processing starts.
 """
 
 import os
@@ -65,7 +63,7 @@ def _user_from_request(request: Request, session: Session):
 
 
 def current_user_optional(request: Request, session: Session = Depends(get_session)):
-    """None when signed out -- never raises, so anonymous use keeps working."""
+    """None when signed out, for public or backward-compatible reads."""
     return _user_from_request(request, session)
 
 

@@ -20,6 +20,7 @@ import secrets
 import threading
 import traceback
 import shutil
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from fastapi import (BackgroundTasks, Depends, FastAPI, File, Form, HTTPException,
@@ -29,15 +30,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import auth, billing, editing, workspace
+from app import auth, billing, editing, polar_payments, workspace
 from app.db import SessionLocal, get_session, init_db
-from app.jobs import create_job, get_job, get_job_transcript, list_jobs, update_job
-from app.models import Clip, Job, Share, User, _iso_utc
+from app.jobs import (create_job, expire_due_jobs, get_job, get_job_transcript,
+                      list_jobs, update_job)
+from app.models import Clip, FreeEditorExport, Job, Share, User, _iso_utc
 from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
                           pacing, reframe, render, scoring, subtitles,
                           transcriber, voiceover)
+from app.polar_catalog import checkout_url as polar_checkout_url
+from app.polar_catalog import subscription_product, topup_product
 
 app = FastAPI(title="Clipper API")
 
@@ -64,9 +69,9 @@ MAX_UPLOAD_BYTES = int(os.environ.get("CLIPPER_MAX_UPLOAD_BYTES", 1024 * 1024 * 
 VIDEO_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 
-# A template is a complete look: how the frame is filled AND how captions are
-# drawn. Keeping them paired here means the UI sends one id and no invalid
-# combination (e.g. a middle-of-frame caption over a split screen) can be built.
+# Templates provide framing defaults. Caption styling is chosen separately in
+# Preferences and stored on the job, while these legacy defaults keep old jobs
+# rendering exactly as they did before the choices were separated.
 TEMPLATES = {
     "classic":  {"frame": "blur",     "caption_style": "classic",
                  "label": "Classic"},
@@ -206,6 +211,7 @@ class JobRequest(BaseModel):
     language: str = "English"
     burn_subtitles: bool = True
     template: str = "classic"       # key into TEMPLATES
+    caption_style: str = "karaoke_fill"  # independent of the frame layout
     ratio: str = "9:16"             # key into render.RATIOS
     length_pref: str = "any"        # key into analyzer.LENGTH_PREFS
     intent: str = ""                # free-text steer, e.g. "when he talks about pricing"
@@ -285,13 +291,9 @@ def on_startup():
     from app.pipeline import downloader as _dl
     print(f"[clipper] model: {os.environ.get('CLIPPER_MODEL', 'gpt-4o')} | "
           f"youtube session: {_dl.cookie_source()}")
-    removed = workspace.purge_old_jobs(STORAGE_DIR)
+    removed = expire_due_jobs()
     if removed:
-        # The window is configurable (CLIPPER_RETENTION_HOURS) and this line used
-        # to say a hardcoded "48h" regardless -- so the log confidently reported
-        # the wrong number for the one event that destroys a user's clips.
-        print(f"[clipper] removed {removed} job folder(s) older than "
-              f"{workspace.DEFAULT_MAX_AGE_HOURS}h")
+        print(f"[clipper] expired {removed} finished project(s)")
 
 
 @app.post("/auth/register")
@@ -306,7 +308,11 @@ def register(body: Credentials, session: Session = Depends(get_session)):
     if session.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=409, detail="That email is already registered.")
 
-    user = User(email=email, password_hash=auth.hash_password(body.password))
+    user = User(
+        email=email,
+        password_hash=auth.hash_password(body.password),
+        credits=billing.FREE_SIGNUP_CREDITS,
+    )
     session.add(user)
     session.commit()
     return {"token": auth.create_token(user.id),
@@ -376,13 +382,9 @@ class CheckoutRequest(BaseModel):
 
 @app.post("/billing/checkout")
 def checkout(body: CheckoutRequest, user: User = Depends(auth.current_user_required)):
-    """Records purchase intent and returns what a provider needs.
-
-    No provider is connected yet, so this deliberately does NOT grant credits --
-    doing so would be giving away paid product. When Polar/Stripe is added, its
-    webhook calls billing.grant_credits() on a confirmed payment and this returns
-    a real redirect URL.
-    """
+    """Return a user-bound Polar Checkout Link for a server-priced item."""
+    if body.interval not in {"monthly", "yearly"}:
+        raise HTTPException(status_code=400, detail="Choose monthly or yearly billing.")
     if body.plan_id:
         plan = billing.get_plan(body.plan_id)
         if not plan:
@@ -396,24 +398,67 @@ def checkout(body: CheckoutRequest, user: User = Depends(auth.current_user_requi
                 status_code=400,
                 detail=f"{plan['name']} is not offered at {body.credits} credits.",
             )
+        product = subscription_product(plan["id"], tier["credits"], body.interval)
         price = tier["yearly_usd"] if body.interval == "yearly" else tier["monthly_usd"]
-        return {
-            "status": "provider_not_configured",
-            "detail": "Connect a payment provider to complete checkout.",
-            "line_item": {"kind": "plan", "plan_id": plan["id"], "name": plan["name"],
-                          "interval": body.interval, "usd": price,
-                          "credits": tier["credits"]},
-        }
+        line_item = {"kind": "plan", "plan_id": plan["id"], "name": plan["name"],
+                     "interval": body.interval, "usd": price,
+                     "credits": tier["credits"]}
+        try:
+            url = polar_checkout_url(product, user.id, user.email) if product else None
+        except ValueError as exc:
+            print(f"[clipper] Polar checkout configuration error: {exc}")
+            raise HTTPException(status_code=503,
+                                detail="Checkout is temporarily unavailable.") from exc
+        if not url:
+            return {"status": "provider_not_configured",
+                    "detail": "Checkout is not available for this option yet.",
+                    "config_key": product.sku if product else None,
+                    "line_item": line_item}
+        return {"status": "ready", "checkout_url": url, "line_item": line_item}
 
     topup = next((t for t in billing.TOPUPS if t["credits"] == body.credits), None)
     if not topup:
         raise HTTPException(status_code=400, detail="Unknown credit pack.")
 
-    return {
-        "status": "provider_not_configured",
-        "detail": "Connect a payment provider to complete checkout.",
-        "line_item": {"kind": "topup", "credits": topup["credits"], "usd": topup["usd"]},
-    }
+    product = topup_product(topup["credits"])
+    try:
+        url = polar_checkout_url(product, user.id, user.email) if product else None
+    except ValueError as exc:
+        print(f"[clipper] Polar checkout configuration error: {exc}")
+        raise HTTPException(status_code=503,
+                            detail="Checkout is temporarily unavailable.") from exc
+    line_item = {"kind": "topup", "credits": topup["credits"], "usd": topup["usd"]}
+    if not url:
+        return {"status": "provider_not_configured",
+                "detail": "Checkout is not available for this credit pack yet.",
+                "config_key": product.sku if product else None,
+                "line_item": line_item}
+    return {"status": "ready", "checkout_url": url, "line_item": line_item}
+
+
+@app.post("/billing/polar/webhook", status_code=202)
+async def polar_webhook(request: Request):
+    """Verify Polar's signature, then fulfill paid orders exactly once."""
+    body = await request.body()
+    try:
+        event = polar_payments.validate_webhook(body, request.headers)
+    except polar_payments.PolarConfigurationError as exc:
+        print(f"[clipper] Polar webhook configuration error: {exc}")
+        raise HTTPException(status_code=503, detail="Payment updates are unavailable.") from exc
+    except Exception as exc:
+        # Signature failures stay deliberately vague at the public boundary.
+        print(f"[clipper] Rejected Polar webhook: {exc}")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.") from exc
+
+    event_id = polar_payments.delivery_id(request.headers, body)
+    try:
+        result = polar_payments.handle_event(event, event_id)
+    except polar_payments.PolarConfigurationError as exc:
+        # A retry after fixing the catalog should succeed, so do not acknowledge
+        # configuration mismatches with a 2xx response.
+        print(f"[clipper] Polar fulfillment error: {exc}")
+        raise HTTPException(status_code=503, detail="Payment update needs attention.") from exc
+    return {"received": True, **result}
 
 
 @app.get("/auth/me")
@@ -567,7 +612,13 @@ def clip_reframe(job_id: str, index: int, start: float = None, end: float = None
     e = clip["end"] if end is None else end
 
     job_dir = os.path.join(STORAGE_DIR, job_id)
-    cache = os.path.join(job_dir, f"reframe_{index}_{s:.1f}_{e:.1f}.json")
+    # Include the planner version. Reusing a v1 whole-clip stacked plan after the
+    # adaptive planner shipped would preserve duplicated speakers in old projects
+    # even though every new render was fixed.
+    cache = os.path.join(
+        job_dir,
+        f"reframe_v{reframe.PLAN_VERSION}_{index}_{s:.1f}_{e:.1f}.json",
+    )
     if os.path.exists(cache):
         with open(cache) as f:
             return {"plan": json.load(f)}
@@ -578,7 +629,11 @@ def clip_reframe(job_id: str, index: int, start: float = None, end: float = None
     ratio = (job.get("options") or {}).get("ratio", "9:16")
     out_w, out_h = render.RATIOS.get(ratio, render.RATIOS["9:16"])
     try:
-        plan = reframe.plan(source, s, e, out_w, out_h)
+        transcript = get_job_transcript(job_id)
+        speaker_words = (editing.words_in_range(transcript, s, e)
+                         if transcript else None)
+        plan = reframe.plan(
+            source, s, e, out_w, out_h, speaker_words=speaker_words)
     except Exception as exc:
         print(f"[clipper] editor reframe preview failed: {exc}")
         return {"plan": None}
@@ -756,6 +811,7 @@ class ClipRecipe(BaseModel):
     captions_on: Optional[bool] = None      # False = export with no captions
     speed: Optional[float] = None           # 0.5 - 3.0 playback speed
     speed_pitched: Optional[bool] = None    # True = pitch rides with speed (meme)
+    tighten_pauses: Optional[bool] = None   # per-clip original/tight pacing
     background: Optional[str] = None        # bar colour for the fit/pad frame
     # The title is its own design decision, not a second caption. Look and
     # typeface move independently: the same white plate reads very differently
@@ -764,8 +820,38 @@ class ClipRecipe(BaseModel):
     title_font: Optional[str] = None        # font id, independent of captions
 
 
+CAPTION_RECIPE_DEFAULTS = {
+    "caption_font": None,
+    "caption_size": None,
+    "caption_pos": None,
+    "caption_anim": "none",
+    "caption_color": None,
+    "caption_active_color": None,
+    "translate_to": None,
+    "lines": None,
+}
+
+
+def _caption_recipe_changed(job: Job, previous: dict, incoming: dict) -> bool:
+    """Whether this save changes a caption-specific part of the recipe."""
+    options = ((job.get("options") if isinstance(job, dict) else job.options)
+               or {})
+    template = TEMPLATES.get(options.get("template", "classic"), TEMPLATES["classic"])
+    defaults = {
+        **CAPTION_RECIPE_DEFAULTS,
+        "caption_style": options.get("caption_style") or template["caption_style"],
+        "captions_on": options.get("burn_subtitles", True),
+    }
+    current = {**defaults, **(previous or {})}
+    return any(
+        key in incoming and incoming[key] != current.get(key)
+        for key in defaults
+    )
+
+
 @app.put("/jobs/{job_id}/clips/{index}/edit")
-def save_clip_edit(job_id: str, index: int, body: ClipRecipe):
+def save_clip_edit(job_id: str, index: int, body: ClipRecipe,
+                   user: User = Depends(auth.current_user_required)):
     """Stores the recipe. Costs nothing -- no render, no API calls.
 
     The rendered file is now stale, which `rendered: false` records so the UI
@@ -777,6 +863,17 @@ def save_clip_edit(job_id: str, index: int, body: ClipRecipe):
                 .filter(Clip.job_id == job_id, Clip.index == index).first())
         if not clip:
             raise HTTPException(status_code=404, detail="Clip not found")
+
+        if job.user_id and job.user_id != user.id:
+            raise HTTPException(status_code=403, detail="That clip belongs to another account.")
+
+        incoming = body.dict(exclude_unset=True)
+        if _caption_recipe_changed(job, clip.edit or {}, incoming):
+            _gate(user, "caption_editing",
+                  "Changing caption text and styling is available on Creator and Pro.")
+        if incoming.get("tighten_pauses") is True:
+            _gate(user, "tighten_pauses",
+                  "Automatic pause tightening is available on Creator and Pro.")
 
         recipe = body.dict(exclude_none=True)
         if body.lines is not None:
@@ -791,13 +888,17 @@ def save_clip_edit(job_id: str, index: int, body: ClipRecipe):
         # was encoded around those baked bounds, and changing them here makes a
         # reopened editor calculate the wrong proxy offset for the same file.
         # The recipe carries the draft trim; export commits it.
+        options = (job.options or {}) if job else {}
+        template = TEMPLATES.get(options.get("template", "classic"),
+                                 TEMPLATES["classic"])
         clip.duration = editing.tightened_duration(
             job.transcript if job else None,
             body.start,
             body.end,
             recipe.get("lines"),
-            ((job.options or {}) if job else {}).get("tighten_pauses", True),
+            recipe.get("tighten_pauses", options.get("tighten_pauses", True)),
             body.speed,
+            pacing.max_pause_for_frame(template["frame"]),
         )
         clip.rendered = False
         session.commit()
@@ -811,8 +912,17 @@ MAX_LOGO_BYTES = 4 * 1024 * 1024
 
 
 @app.post("/jobs/{job_id}/overlays/upload")
-async def upload_overlay_image(job_id: str, file: UploadFile = File(...)):
+async def upload_overlay_image(job_id: str, file: UploadFile = File(...),
+                               user: User = Depends(auth.current_user_required)):
     """Stores a logo for this job and returns the name to put in a recipe."""
+    with SessionLocal() as session:
+        job = session.get(Job, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.user_id and job.user_id != user.id:
+            raise HTTPException(status_code=403, detail="That clip belongs to another account.")
+    _gate(user, "branding", "Adding your own logo or handle is available on Creator and Pro.")
+
     if file.content_type not in LOGO_TYPES:
         raise HTTPException(
             status_code=400,
@@ -841,8 +951,54 @@ def get_overlay_image(job_id: str, name: str):
     return FileResponse(path)
 
 
+def _reserve_editor_export(job_id: str, index: int, user: User = None) -> Optional[str]:
+    """Reserve the one edited export included with Free.
+
+    The row is written before ffmpeg starts, closing the double-click/concurrent
+    request hole. Callers delete it when rendering fails, so failed work never
+    spends the allowance.
+    """
+    with SessionLocal() as session:
+        job = session.get(Job, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.user_id and (not user or user.id != job.user_id):
+            raise HTTPException(status_code=403, detail="That clip belongs to another account.")
+
+        if user and billing.allows(user.plan, "no_watermark", user.email):
+            return None
+
+        reservation = FreeEditorExport(
+            user_id=user.id if user else None,
+            job_id=job_id,
+            clip_index=index,
+        )
+        session.add(reservation)
+        try:
+            session.commit()
+            return reservation.id
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(
+                status_code=402,
+                detail=("Your free edited export has already been used. "
+                        "Upgrade to Creator for unlimited edited exports."),
+            )
+
+
+def _release_editor_export(reservation_id: Optional[str]) -> None:
+    if not reservation_id:
+        return
+    with SessionLocal() as session:
+        row = session.get(FreeEditorExport, reservation_id)
+        if row:
+            session.delete(row)
+            session.commit()
+
+
 @app.post("/jobs/{job_id}/clips/{index}/export")
-def export_clip(job_id: str, index: int):
+def export_clip(job_id: str, index: int,
+                user: User = Depends(auth.current_user_required)):
     """Renders the stored recipe to a real MP4. The only expensive operation."""
     job = get_job(job_id)
     if not job:
@@ -854,6 +1010,13 @@ def export_clip(job_id: str, index: int):
         if not clip:
             raise HTTPException(status_code=404, detail="Clip not found")
         recipe = dict(clip.edit or {})
+        if _caption_recipe_changed(job, {}, recipe):
+            _gate(user, "caption_editing",
+                  "Changing caption text and styling is available on Creator and Pro.")
+        if recipe.get("tighten_pauses", (job.get("options") or {}).get(
+                "tighten_pauses", True)):
+            _gate(user, "tighten_pauses",
+                  "Automatic pause tightening is available on Creator and Pro.")
         start = recipe.get("start", clip.start)
         end = recipe.get("end", clip.end)
 
@@ -873,6 +1036,7 @@ def export_clip(job_id: str, index: int):
 
     tpl = TEMPLATES.get((job.get("options") or {}).get("template", "classic"))
     loops = _gameplay_loops() if tpl and tpl["frame"] == "gameplay" else []
+    reservation_id = _reserve_editor_export(job_id, index, user)
     try:
         result = editing.rerender_clip(
             job_id, index, start, end, STORAGE_DIR, TEMPLATES, loops,
@@ -893,6 +1057,7 @@ def export_clip(job_id: str, index: int):
             background=recipe.get("background"),
             title_style=recipe.get("title_style"),
             title_font=recipe.get("title_font"),
+            tighten_pauses=recipe.get("tighten_pauses"),
         )
         with SessionLocal() as session:
             clip = (session.query(Clip)
@@ -903,20 +1068,32 @@ def export_clip(job_id: str, index: int):
             # flag was flipped and would tell the UI the export is still pending.
             return clip.to_dict()
     except ValueError as e:
+        _release_editor_export(reservation_id)
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
+        _release_editor_export(reservation_id)
         raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+    except Exception:
+        _release_editor_export(reservation_id)
+        print(f"[clipper] unexpected editor export failure\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="We couldn't finish this export right now.")
 
 
 @app.post("/jobs/{job_id}/clips/{index}/rerender")
-def rerender_clip(job_id: str, index: int, body: ClipEdit):
+def rerender_clip(job_id: str, index: int, body: ClipEdit,
+                  user: User = Depends(auth.current_user_required)):
     """Re-cuts one clip to new in/out points, reusing the stored transcript."""
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if any((body.caption_style, body.caption_font, body.translate_to,
+            body.caption_lines)):
+        _gate(user, "caption_editing",
+              "Changing caption text and styling is available on Creator and Pro.")
 
     tpl = TEMPLATES.get((job.get("options") or {}).get("template", "classic"))
     loops = _gameplay_loops() if tpl and tpl["frame"] == "gameplay" else []
+    reservation_id = _reserve_editor_export(job_id, index, user)
     try:
         return editing.rerender_clip(
             job_id, index, body.start, body.end, STORAGE_DIR, TEMPLATES, loops,
@@ -926,9 +1103,15 @@ def rerender_clip(job_id: str, index: int, body: ClipEdit):
             translate_to=body.translate_to,
         )
     except ValueError as e:
+        _release_editor_export(reservation_id)
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
+        _release_editor_export(reservation_id)
         raise HTTPException(status_code=500, detail=f"Re-render failed: {e}")
+    except Exception:
+        _release_editor_export(reservation_id)
+        print(f"[clipper] unexpected re-render failure\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="We couldn't finish this export right now.")
 
 
 def _gate(user: User, feature: str, message: str) -> None:
@@ -1003,6 +1186,22 @@ def _prepare_job(req: JobRequest, user: User = None, uploaded: bool = False) -> 
     return gameplay_loops
 
 
+def _gate_source_duration(duration_seconds: Optional[float], user: User = None) -> None:
+    """Block expensive work before transcription or analysis starts."""
+    limit = billing.limits_for(user.plan if user else None,
+                               user.email if user else None)["max_source_minutes"]
+    if duration_seconds is None and limit <= billing.LIMITS["free"]["max_source_minutes"]:
+        raise HTTPException(
+            status_code=402,
+            detail="We couldn't confirm this video's length on the Free plan. Upload a file instead, or choose a plan with longer sources.",
+        )
+    if duration_seconds and duration_seconds > limit * 60:
+        raise HTTPException(
+            status_code=402,
+            detail=f"This video is longer than the {limit}-minute limit on your plan.",
+        )
+
+
 def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
                user: User = None, uploaded: bool = False, gameplay_loops: list = None) -> str:
     options = req.dict()
@@ -1017,6 +1216,10 @@ def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
     options["watermark"] = ("" if billing.allows(plan_id, "no_watermark", email)
                             else billing.WATERMARK_TEXT)
     options["max_source_minutes"] = billing.limits_for(plan_id, email)["max_source_minutes"]
+    options["retention_until"] = (
+        datetime.now(timezone.utc)
+        + timedelta(hours=billing.retention_hours_for(plan_id, email))
+    ).isoformat()
     job_id = create_job(req.url, options, user_id=user.id if user else None)
     background_tasks.add_task(run_pipeline, job_id, req, gameplay_loops,
                               user.id if user else None, uploaded)
@@ -1037,8 +1240,15 @@ def source_preview(body: SourcePreviewRequest):
 
 @app.post("/jobs")
 def submit_job(req: JobRequest, background_tasks: BackgroundTasks,
-               user: User = Depends(auth.current_user_optional)):
+               user: User = Depends(auth.current_user_required)):
     gameplay_loops = _prepare_job(req, user)
+    # Metadata-only inspection happens before a job is created, so an over-limit
+    # link never downloads media or reaches a paid transcription/analysis call.
+    try:
+        metadata = downloader.inspect_url(req.url.strip())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _gate_source_duration(metadata.get("duration"), user)
     job_id = _start_job(req, background_tasks, user, gameplay_loops=gameplay_loops)
     return {"job_id": job_id}
 
@@ -1053,21 +1263,28 @@ def _remove_failed_upload(job_id: str) -> None:
             session.commit()
 
 
-def _assert_video_file(path: str) -> None:
+def _assert_video_file(path: str) -> float:
     """Reject a renamed text/archive file before it reaches ffmpeg workers."""
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+         "-show_entries", "format=duration:stream=codec_type", "-of", "json", path],
         capture_output=True, text=True,
     )
-    if probe.returncode != 0 or "video" not in probe.stdout:
+    try:
+        data = json.loads(probe.stdout)
+        has_video = any(s.get("codec_type") == "video" for s in data.get("streams", []))
+        duration = float(data.get("format", {}).get("duration") or 0)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        has_video, duration = False, 0
+    if probe.returncode != 0 or not has_video:
         raise HTTPException(status_code=400, detail="That file is not a readable video.")
+    return duration
 
 
 @app.post("/jobs/upload")
 async def submit_uploaded_job(background_tasks: BackgroundTasks,
                               file: UploadFile = File(...), options: str = Form("{}"),
-                              user: User = Depends(auth.current_user_optional)):
+                              user: User = Depends(auth.current_user_required)):
     """Create a job from a local video without involving a platform downloader."""
     try:
         req = JobRequest(**json.loads(options))
@@ -1091,9 +1308,8 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
                            user.email if user else None)["max_upload_mb"] * 1024 * 1024,
     )
     req.url = f"upload://{name}"
-    job_id = _start_job(req, background_tasks, user, uploaded=True,
-                        gameplay_loops=gameplay_loops)
-    job_dir = os.path.join(STORAGE_DIR, job_id)
+    upload_id = f"upload-{uuid.uuid4().hex}"
+    job_dir = os.path.join(STORAGE_DIR, upload_id)
     os.makedirs(job_dir, exist_ok=True)
     part_path = os.path.join(job_dir, "source.mp4.part")
     source_path = os.path.join(job_dir, "source.mp4")
@@ -1114,13 +1330,16 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
         if not written:
             raise HTTPException(status_code=400, detail="That upload was empty.")
         os.replace(part_path, source_path)
-        _assert_video_file(source_path)
+        _gate_source_duration(_assert_video_file(source_path), user)
     except Exception:
-        _remove_failed_upload(job_id)
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise
     finally:
         await file.close()
 
+    job_id = _start_job(req, background_tasks, user, uploaded=True,
+                        gameplay_loops=gameplay_loops)
+    os.replace(job_dir, os.path.join(STORAGE_DIR, job_id))
     return {"job_id": job_id}
 
 
@@ -1187,21 +1406,21 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
             video_path = os.path.join(job_dir, "source.mp4")
             if not os.path.exists(video_path):
                 raise RuntimeError("The uploaded source video is missing. Upload it again.")
-            update_job(job_id, status="downloading", progress_message="Preparing uploaded video...", percent=0)
+            update_job(job_id, status="downloading", progress_message="Getting your video ready...", percent=0)
             workspace.ensure_space(job_dir, os.path.getsize(video_path))
             downloader.extract_audio(video_path, audio_path)
         else:
-            update_job(job_id, status="downloading", progress_message="Fetching audio track...", percent=0)
+            update_job(job_id, status="downloading", progress_message="Getting your video ready...", percent=0)
             audio_path = downloader.download_audio(
                 req.url,
                 audio_path,
                 on_progress=lambda p: update_job(
-                    job_id, percent=round(p), progress_message=f"Fetching audio track... {p:.0f}%"
+                    job_id, percent=round(p), progress_message=f"Getting your video ready... {p:.0f}%"
                 ),
             )
 
         update_job(job_id, status="transcribing",
-                   progress_message="Transcribing speech with Deepgram...", percent=0)
+                   progress_message="Listening to the conversation...", percent=0)
         # The pricier model is asked for, not inferred. Tying it to the podcast
         # template was the wrong proxy: code-switching is a property of how
         # people SPEAK, not of the layout picked for them -- a bilingual
@@ -1241,11 +1460,11 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
 
         # Prosody: how lines were delivered, which the transcript cannot show.
         update_job(job_id, status="analyzing",
-                   progress_message="Listening for energy, laughter and emphasis...", percent=0)
+                   progress_message="Finding the strongest moments...", percent=0)
         utterances = energy.analyze(audio_path, utterances)
 
         update_job(job_id,
-                   progress_message=f"Reading {len(utterances)} moments to find the best ones...",
+                   progress_message="Comparing the moments worth posting...",
                    percent=0)
         raw_clips = analyzer.pick_clips(
             utterances,
@@ -1257,7 +1476,7 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 percent=100 if n < 0 else round(n / total * 100),
                 progress_message=(
                     f"Comparing the {total} strongest moments..."
-                    if n < 0 else f"Scoring section {n} of {total}..."
+                    if n < 0 else f"Reviewing moment {n} of {total}..."
                 ),
             ),
         )
@@ -1288,18 +1507,18 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 return
 
         update_job(job_id, status="rendering",
-                   progress_message="Checking disk space...", percent=0)
+                   progress_message="Preparing your clips...", percent=0)
         if uploaded_source:
             workspace.ensure_space(job_dir, os.path.getsize(video_path))
-            update_job(job_id, progress_message="Preparing your uploaded video...", percent=0)
+            update_job(job_id, progress_message="Getting the full video ready...", percent=0)
         else:
             workspace.ensure_space(job_dir, downloader.estimate_video_bytes(req.url))
-            update_job(job_id, progress_message="Downloading video...", percent=0)
+            update_job(job_id, progress_message="Getting the full video ready...", percent=0)
             video_path = downloader.download_video(
                 req.url,
                 os.path.join(job_dir, "source.mp4"),
                 on_progress=lambda p: update_job(
-                    job_id, percent=round(p * 0.5), progress_message=f"Downloading video... {p:.0f}%"
+                    job_id, percent=round(p * 0.5), progress_message=f"Getting the full video ready... {p:.0f}%"
                 ),
             )
 
@@ -1337,11 +1556,12 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         for i, clip in enumerate(resolved_clips, start=1):
             update_job(
                 job_id,
-                progress_message=f"Rendering clip {i} of {total}...",
+                progress_message=f"Finishing clip {i} of {total}...",
                 percent=round(50 + (i - 1) / total * 50),
             )
             subtitle_path = None
             audio_override = None
+            clip_words = clip["words"]
 
             # Where the people actually are in THIS clip. Per clip rather than
             # per job: a podcast cuts between a two-shot and a single, so one
@@ -1354,24 +1574,35 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 # template renders without it -- so no failure in detection is
                 # worth losing a job the user has already paid to transcribe.
                 try:
-                    clip_plan = reframe.plan(video_path, clip["start"],
-                                             clip["end"], out_w, out_h)
+                    clip_plan = reframe.plan(
+                        video_path, clip["start"], clip["end"], out_w, out_h,
+                        speaker_words=clip_words)
                 except Exception as exc:
                     print(f"[clipper] clip {i}: reframing failed ({exc}); "
                           "falling back to the fixed podcast frame")
                 if clip_plan:
                     print(f"[clipper] clip {i}: reframing as {clip_plan['mode']}")
                     clip_margin_v = render.smart_caption_margin_v(clip_plan, out_h)
+                    # Save the exact plan used for the export before the large
+                    # source is reclaimed. The editor can then reproduce this
+                    # composition without another face-analysis pass.
+                    cache_path = os.path.join(
+                        job_dir,
+                        (f"reframe_v{reframe.PLAN_VERSION}_{i - 1}_"
+                         f"{clip['start']:.1f}_{clip['end']:.1f}.json"),
+                    )
+                    with open(cache_path, "w") as cache_file:
+                        json.dump(clip_plan, cache_file)
 
             # Dead air is what makes a clip feel trimmed rather than edited, so
             # this is on by default. Captions must use the remapped timings or
             # they desync by exactly the amount removed.
             segments = None
-            clip_words = clip["words"]
             render_duration = clip["end"] - clip["start"]
             if req.tighten_pauses and clip_words:
                 segments, clip_words, removed = pacing.tighten(
-                    clip_words, clip["start"], clip["end"])
+                    clip_words, clip["start"], clip["end"],
+                    max_pause=pacing.max_pause_for_frame(tpl["frame"]))
                 if removed < 0.4:
                     segments, clip_words = None, clip["words"]   # not worth a re-cut
                 else:
@@ -1391,7 +1622,8 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                     subtitle_path = os.path.join(job_dir, f"clip_{i}.ass")
                     subtitles.build_ass(caption_words,
                                         0.0 if segments else clip["start"], subtitle_path,
-                                        clip_margin_v, style=tpl["caption_style"],
+                                        clip_margin_v,
+                                        style=caption_presets.get(req.caption_style)["id"],
                                         play_res=(out_w, out_h),
                                         title=clip.get("title", ""),
                                         keywords=clip.get("keywords"))
@@ -1454,4 +1686,11 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         # RuntimeErrors are raised by us with messages written for humans; for
         # anything else, still show only the message, not the stack.
         traceback.print_exc()
-        update_job(job_id, status="failed", error=str(e) or e.__class__.__name__)
+        raw = str(e) or e.__class__.__name__
+        if "No speech was found" in raw or "Nothing in this video scored" in raw:
+            message = raw
+        elif "longer than" in raw and "limit" in raw:
+            message = "This video is longer than your plan allows. Choose a shorter video or upgrade for longer sources."
+        else:
+            message = "We couldn't finish this video right now. Try again shortly, or upload the video file instead."
+        update_job(job_id, status="failed", error=message)

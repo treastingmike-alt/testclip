@@ -12,6 +12,7 @@ missing. That is a deliberate trade: a few minutes on the rare edit, against
 hundreds of MB per job sitting around forever on the common path.
 """
 
+import json
 import os
 
 from app.db import SessionLocal
@@ -103,7 +104,8 @@ def words_from_lines(lines: list, transcript: dict = None) -> list:
 
 def tightened_duration(transcript: dict, start: float, end: float,
                        caption_lines: list = None, tighten_pauses: bool = True,
-                       speed: float = None) -> float:
+                       speed: float = None,
+                       max_pause: float = pacing.DEFAULT_MAX_PAUSE) -> float:
     """Experienced output duration for an edit recipe.
 
     `start`/`end` are source bounds. If pause tightening is enabled, the exported
@@ -116,7 +118,8 @@ def tightened_duration(transcript: dict, start: float, end: float,
         words = (words_from_lines(caption_lines, transcript)
                  if caption_lines else words_in_range(transcript, start, end))
         if words:
-            segments, _, removed = pacing.tighten(words, start, end)
+            segments, _, removed = pacing.tighten(
+                words, start, end, max_pause=max_pause)
             if segments and removed >= 0.4:
                 duration = sum(e - s for s, e in segments)
     return round(duration / max(speed or 1.0, 0.001), 1)
@@ -132,7 +135,8 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
                   speed_pitched: bool = False, background: str = None,
                   caption_color: str = None, caption_active_color: str = None,
                   captions_on: bool = True,
-                  title_style: str = None, title_font: str = None):
+                  title_style: str = None, title_font: str = None,
+                  tighten_pauses: bool = None):
     """Re-cuts clip `index` of `job_id` to [start, end]. Returns the updated clip.
 
     `caption_style` overrides the template's caption look for this clip only.
@@ -170,6 +174,11 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
 
         out_w, out_h = render.RATIOS.get(ratio, render.RATIOS["9:16"])
 
+        if caption_lines:
+            words = words_from_lines(caption_lines, job.transcript)
+        else:
+            words = words_in_range(job.transcript, start, end)
+
         # Recomputed, not remembered. Editing a clip must produce the same
         # composition it was delivered in -- and this call used to omit it
         # entirely, so every trim silently re-rendered a face-aware podcast clip
@@ -180,7 +189,8 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         reframe_plan = None
         if tpl["frame"] == "podcast":
             try:
-                reframe_plan = reframe.plan(source, start, end, out_w, out_h)
+                reframe_plan = reframe.plan(
+                    source, start, end, out_w, out_h, speaker_words=words)
             except Exception as exc:
                 print(f"[clipper] edit: reframing failed ({exc}); fixed frame")
 
@@ -203,11 +213,6 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
             margin_v = place(src_w, src_h, out_w, out_h)
         size_px = caption_size or None
 
-        if caption_lines:
-            words = words_from_lines(caption_lines, job.transcript)
-        else:
-            words = words_in_range(job.transcript, start, end)
-
         # Re-cut the dead air, exactly as the first render did.
         #
         # This was missing entirely, and it quietly undid the thing that makes a
@@ -222,16 +227,21 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
         # seconds, further out with every pause.
         segments = None
         render_duration = duration
-        if options.get("tighten_pauses", True) and words:
-            tightened, remapped, removed = pacing.tighten(words, start, end)
+        use_tightening = (options.get("tighten_pauses", True)
+                          if tighten_pauses is None else tighten_pauses)
+        if use_tightening and words:
+            tightened, remapped, removed = pacing.tighten(
+                words, start, end,
+                max_pause=pacing.max_pause_for_frame(tpl["frame"]))
             # The same floor the pipeline uses: under this, a re-cut buys
             # nothing and costs a seam.
             if tightened and removed >= 0.4:
                 segments, words = tightened, remapped
                 render_duration = sum(e - s for s, e in segments)
 
-        style = caption_style or (job.options or {}).get("caption_style_override",
-                                                         tpl["caption_style"])
+        style = (caption_style or (job.options or {}).get("caption_style")
+                 or (job.options or {}).get("caption_style_override")
+                 or tpl["caption_style"])
 
         # Segments rebase the clip to zero, so the caption offset has to follow.
         caption_offset = 0.0 if segments else start
@@ -307,6 +317,17 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
             watermark=options.get("watermark") or None,
         )
         os.replace(tmp_path, final_path)
+
+        # The source is deliberately cleaned up after rendering. Keep the
+        # already-computed composition so reopening the editor previews the
+        # same podcast framing that was burned into this export.
+        if reframe_plan:
+            cache_path = os.path.join(
+                job_dir,
+                f"reframe_v{reframe.PLAN_VERSION}_{index}_{start:.1f}_{end:.1f}.json",
+            )
+            with open(cache_path, "w") as cache_file:
+                json.dump(reframe_plan, cache_file)
 
         # The editor proxy is windowed around the committed clip bounds. Once an
         # export changes those bounds, refresh that low-res proxy so reopening

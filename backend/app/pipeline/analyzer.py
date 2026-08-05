@@ -186,7 +186,7 @@ Untagged lines are ordinary delivery. LOUD/dynamic/fast clusters are where the
 room came alive; that is usually where the clip is. But energy alone is not a
 clip -- a loud line with no substance is still noise.
 
-{intent}Nominate up to {n} ranges. Hunt for ALL of these shapes, not just stories:
+{intent}{length}Nominate up to {n} ranges. Hunt for ALL of these shapes, not just stories:
 - a complete joke or funny exchange that lands on its punchline
 - a sharp one-liner, roast, or genuine spontaneous reaction
 - advice or an opinion delivered with real conviction
@@ -235,6 +235,7 @@ If the speech is already in a Latin-script language (English, Spanish, French, P
 
 This title is burned into the video and used as the download filename, so it must read like a real creator wrote it, not like a translation>",
       "hook": "<one sentence in English: why this grabs someone in the first 2 seconds>",
+      "intent_match": <true only when this directly matches the user's optional request; false when there is no request>,
       "scores": {{
         "hook": <1-10, does the first line create an unresolved question>,
         "standalone": <1-10, fully understandable with zero context>,
@@ -261,18 +262,28 @@ LENGTH_PREFS = {
     "extended": "Prefer extended moments over 90 seconds -- full stories or arguments.",
 }
 
-# Injected when the user asks for a specific kind of moment or clip length.
-INTENT_TEMPLATE = """WHAT THIS USER WANTS: {intent}
-Weight this heavily -- prefer moments matching it, but never nominate a weak or
-incomplete moment just to satisfy it.
+# A specific request is a priority lane, not a filter. A multi-clip result still
+# needs the video's strongest general moments.
+INTENT_TEMPLATE = """WHAT THIS USER IS LOOKING FOR: {intent}
+Nominate strong direct matches, and mark those candidates with intent_match=true.
+Also nominate the strongest unrelated moment in this section when one exists.
+Never nominate a weak or incomplete match just to satisfy the request.
+
+"""
+
+LENGTH_TEMPLATE = """LENGTH PREFERENCE: {preference}
+This is advisory only. A stronger complete moment outside the range still wins.
 
 """
 
 
-def _collect_candidates(utterances: list, on_progress=None, intent: str = "") -> list:
+def _collect_candidates(utterances: list, on_progress=None, intent: str = "",
+                        length_guidance: str = "") -> list:
     spans = _windows(len(utterances))
     candidates = []
     intent_block = INTENT_TEMPLATE.format(intent=intent) if intent else ""
+    length_block = (LENGTH_TEMPLATE.format(preference=length_guidance)
+                    if length_guidance else "")
 
     for n, (lo, hi) in enumerate(spans, start=1):
         if on_progress:
@@ -281,6 +292,7 @@ def _collect_candidates(utterances: list, on_progress=None, intent: str = "") ->
         data = _openai_chat(PROMPT.format(
             n=CANDIDATES_PER_WINDOW,
             intent=intent_block,
+            length=length_block,
             transcript=_numbered_slice(utterances, lo, hi),
         ))
 
@@ -305,6 +317,7 @@ def _collect_candidates(utterances: list, on_progress=None, intent: str = "") ->
                 "end_index": end_idx,
                 "title": (c.get("title") or "Untitled moment").strip()[:80],
                 "hook": (c.get("hook") or "").strip(),
+                "intent_match": bool(intent) and c.get("intent_match") is True,
                 "scores": scores,
                 "score": round(total, 2),
             })
@@ -348,7 +361,7 @@ Below are candidate moments already shortlisted from a longer video, each with
 its full text. They were scored in isolation, so their numbers are NOT
 comparable -- judge them against each other now, by reading them.
 
-Pick the {n} strongest as standalone short-form videos. Compare directly: if two
+{intent}Pick the {n} strongest as standalone short-form videos. Compare directly: if two
 make a similar point, keep only the better-told one. Prefer a moment that earns
 its length over one padded to fill time, and prefer a concrete story or a sharp
 claim over a general observation.
@@ -380,6 +393,13 @@ Candidates:
 {candidates}
 """
 
+SELECT_INTENT_TEMPLATE = """The creator asked for: {intent}
+When a strong labelled match exists, include one. Fill the remaining places with
+the strongest moments overall. Do not make the whole batch about the request
+unless those moments genuinely beat the general candidates.
+
+"""
+
 
 def _candidate_text(utterances: list, clip: dict, max_chars: int = 900) -> str:
     text = " ".join(
@@ -389,18 +409,54 @@ def _candidate_text(utterances: list, clip: dict, max_chars: int = 900) -> str:
     return text[:max_chars] + ("..." if len(text) > max_chars else "")
 
 
-def _final_selection(utterances: list, shortlist: list, n_clips: int) -> list:
+def _balance_intent_selection(chosen: list, shortlist: list, n_clips: int,
+                              intent: str) -> list:
+    """Keep one strong requested moment without turning the request into a filter."""
+    if not intent or n_clips < 2 or not chosen:
+        return chosen
+
+    selected = list(chosen)
+    selected_ranges = {(c["start_index"], c["end_index"]) for c in selected}
+    matches = [c for c in shortlist if c.get("intent_match")]
+    general = [c for c in shortlist if not c.get("intent_match")]
+
+    if matches and not any(c.get("intent_match") for c in selected):
+        selected[-1] = matches[0]
+        selected_ranges = {(c["start_index"], c["end_index"]) for c in selected}
+
+    selected_matches = sorted(
+        [c for c in selected if c.get("intent_match")],
+        key=lambda c: c["score"], reverse=True,
+    )
+    available_general = [
+        c for c in general
+        if (c["start_index"], c["end_index"]) not in selected_ranges
+    ]
+    for extra in selected_matches[1:]:
+        if not available_general or extra["score"] > available_general[0]["score"] + 1:
+            continue
+        selected[selected.index(extra)] = available_general.pop(0)
+
+    return selected[:n_clips]
+
+
+def _final_selection(utterances: list, shortlist: list, n_clips: int,
+                     intent: str = "") -> list:
     """Head-to-head comparison of finalists. Falls back to score order."""
     if len(shortlist) <= n_clips:
         return shortlist
 
     blocks = "\n\n".join(
-        f"[id {n}] ({clip['duration']:.0f}s)\n{_candidate_text(utterances, clip)}"
+        f"[id {n}] ({clip['duration']:.0f}s)"
+        f"{' [matches request]' if clip.get('intent_match') else ''}\n"
+        f"{_candidate_text(utterances, clip)}"
         for n, clip in enumerate(shortlist)
     )
 
     try:
-        data = _openai_chat(SELECT_PROMPT.format(n=n_clips, candidates=blocks))
+        intent_block = SELECT_INTENT_TEMPLATE.format(intent=intent) if intent else ""
+        data = _openai_chat(SELECT_PROMPT.format(
+            n=n_clips, intent=intent_block, candidates=blocks))
         chosen = []
         for entry in data.get("chosen", []):
             idx = int(entry["id"])
@@ -418,11 +474,12 @@ def _final_selection(utterances: list, shortlist: list, n_clips: int) -> list:
             if len(chosen) >= n_clips:
                 break
         if chosen:
-            return [{k: v for k, v in c.items() if k != "_id"} for c in chosen]
+            clean = [{k: v for k, v in c.items() if k != "_id"} for c in chosen]
+            return _balance_intent_selection(clean, shortlist, n_clips, intent)
     except (RuntimeError, KeyError, TypeError, ValueError):
         pass
 
-    return shortlist[:n_clips]
+    return _balance_intent_selection(shortlist[:n_clips], shortlist, n_clips, intent)
 
 
 # --- pass 3: boundary refinement --------------------------------------------
@@ -584,8 +641,13 @@ def pick_clips(utterances: list, n_clips: int, on_progress=None,
                  because a great 20s moment beats a padded 45s one even when the
                  user asked for 30-60s.
     """
-    steer = " ".join(p for p in (intent.strip(), LENGTH_PREFS.get(length_pref, "")) if p)
-    candidates = _collect_candidates(utterances, on_progress, intent=steer)
+    intent = intent.strip()
+    candidates = _collect_candidates(
+        utterances,
+        on_progress,
+        intent=intent,
+        length_guidance=LENGTH_PREFS.get(length_pref, ""),
+    )
 
     # Overlapping windows nominate the same moment twice; dedupe on identical ranges.
     seen = set()
@@ -616,7 +678,7 @@ def pick_clips(utterances: list, n_clips: int, on_progress=None,
     if SELECTION_PASSES >= 2:
         if on_progress:
             on_progress(-1, len(shortlist))      # signals the comparison stage
-        chosen = _final_selection(utterances, shortlist, n_clips)
+        chosen = _final_selection(utterances, shortlist, n_clips, intent=intent)
     else:
         chosen = shortlist[:n_clips]
 
@@ -629,8 +691,9 @@ def pick_clips(utterances: list, n_clips: int, on_progress=None,
         if not any(_overlaps(c, picked) for picked in deduped):
             deduped.append(c)
 
-    # Present them in the order they occur in the video, not by score.
-    deduped.sort(key=lambda c: c["start_index"])
+    # Rendering and the dashboard preserve this order, so clip 1 is always the
+    # strongest result rather than simply the earliest moment in the source.
+    deduped.sort(key=lambda c: c["score"], reverse=True)
     return deduped
 
 

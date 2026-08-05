@@ -53,9 +53,9 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    # Billing hook: 1 credit == 1 minute of source video, matching how the
-    # market prices this. Not enforced yet.
-    credits: Mapped[int] = mapped_column(Integer, default=100)
+    # Credits buy finished clips; registration sets the current free grant
+    # explicitly, while this default protects non-HTTP creation paths.
+    credits: Mapped[int] = mapped_column(Integer, default=20)
     plan: Mapped[str] = mapped_column(String(32), default="free")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
@@ -145,6 +145,64 @@ class CreditLedger(Base):
     balance_after: Mapped[int] = mapped_column(Integer)
     job_id: Mapped[str] = mapped_column(String(36), nullable=True)
     note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PolarWebhookEvent(Base):
+    """Processed delivery IDs stop Polar retries from repeating side effects."""
+
+    __tablename__ = "polar_webhook_events"
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PolarOrderGrant(Base):
+    """One paid Polar order can grant credits exactly once."""
+
+    __tablename__ = "polar_order_grants"
+
+    order_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    product_id: Mapped[str] = mapped_column(String(255), index=True)
+    credits: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PolarSubscription(Base):
+    """Tracks which subscription currently owns a user's paid entitlement."""
+
+    __tablename__ = "polar_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    product_id: Mapped[str] = mapped_column(String(255), index=True)
+    plan_id: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class FreeEditorExport(Base):
+    """The single edited export included with Free.
+
+    A dedicated table lets existing databases adopt the rule through
+    create_all without altering the users table. Signed-in accounts are unique
+    by user; anonymous legacy jobs are unique by job.
+    """
+
+    __tablename__ = "free_editor_exports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True, unique=True, index=True
+    )
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("jobs.id"), unique=True, index=True
+    )
+    clip_index: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

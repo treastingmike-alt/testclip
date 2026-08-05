@@ -11,10 +11,10 @@ import StudioWizard from "./StudioWizard";
 import UpgradeModal from "./UpgradeModal";
 import { usePlan } from "./usePlan";
 const STAGES = [
-  { key: "downloading", label: "Fetching audio", blurb: "Pulling just the audio track — it's a fraction of the video." },
-  { key: "transcribing", label: "Transcribing speech", blurb: "Every word, with millisecond-accurate timestamps." },
-  { key: "analyzing", label: "Finding the best moments", blurb: "Reading the full transcript for hooks and payoffs." },
-  { key: "rendering", label: "Rendering vertical clips", blurb: "Reframing to 9:16 and burning in captions." },
+  { key: "downloading", label: "Getting your video ready", blurb: "Your video is being prepared." },
+  { key: "transcribing", label: "Listening to the conversation", blurb: "KlipCut is following what is being said." },
+  { key: "analyzing", label: "Choosing the best moments", blurb: "Looking for clear hooks, stories and payoffs." },
+  { key: "rendering", label: "Finishing your clips", blurb: "Adding your layout and caption style." },
 ];
 
 const STAGE_ORDER = ["queued", "downloading", "transcribing", "analyzing", "rendering", "done"];
@@ -128,51 +128,6 @@ function SpotlightCard({ children, className = "", style }) {
   );
 }
 
-/* ---------- decorative clip collage ---------- */
-
-const FAN_CARDS = [
-  { grad: "linear-gradient(160deg, #ffb46b, #ff5c39)", caption: "wait for it…", time: "0:24" },
-  { grad: "linear-gradient(160deg, #7ce7d8, #1fa48f)", caption: "the best advice", time: "0:41" },
-  { grad: "linear-gradient(160deg, #8a7bff, #4f46e5)", caption: "nobody tells you", time: "0:33" },
-  { grad: "linear-gradient(160deg, #f9a8d4, #d9467c)", caption: "this changed everything", time: "0:19" },
-  { grad: "linear-gradient(160deg, #c8f169, #5aa832)", caption: "here's the trick", time: "0:28" },
-];
-
-function ClipFan() {
-  const ref = useRef(null);
-
-  function onMove(e) {
-    const el = ref.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    el.style.setProperty("--mx", (e.clientX - r.left) / r.width - 0.5);
-    el.style.setProperty("--my", (e.clientY - r.top) / r.height - 0.5);
-  }
-
-  function onLeave() {
-    const el = ref.current;
-    if (!el) return;
-    el.style.setProperty("--mx", 0);
-    el.style.setProperty("--my", 0);
-  }
-
-  return (
-    <div className="clipfan" ref={ref} onMouseMove={onMove} onMouseLeave={onLeave} aria-hidden="true">
-      {FAN_CARDS.map((c, i) => (
-        <div className={`fan-card f${i}`} key={i} style={{ "--grad": c.grad, "--depth": (i % 3) + 1 }}>
-          <span className="fan-play">
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none">
-              <path d="M8 5.5v13l11-6.5-11-6.5Z" fill="currentColor" />
-            </svg>
-          </span>
-          <span className="fan-caption">{c.caption}</span>
-          <span className="fan-time">{c.time}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 /** Filename for a downloaded clip, built from its title.
  *
  * Keeps non-Latin scripts intact -- a Hindi clip should land in Downloads with
@@ -227,6 +182,34 @@ function ProgressRing({ percent }) {
   );
 }
 
+const PROCESSING_TIPS = [
+  "You can close this page. We’ll keep working and add the finished clips to your Library.",
+  "Your layout and caption choices are being applied to every clip.",
+  "The strongest clips will appear first, ready for you to review.",
+];
+
+function friendlyProgress(message = "", status = "") {
+  const text = String(message).toLowerCase();
+  const percent = String(message).match(/\d+(?:\.\d+)?%/)?.[0];
+  const suffix = percent ? ` ${percent}` : "";
+  if (text.includes("deepgram") || text.includes("transcrib")) return "Listening to the conversation...";
+  if (text.includes("download") || text.includes("fetching audio") || text.includes("disk space")) return `Getting your video ready...${suffix}`;
+  if (text.includes("render") || text.includes("ffmpeg")) return "Finishing your clips...";
+  if (text.includes("scor") || text.includes("energy") || text.includes("reading")) return "Comparing the moments worth posting...";
+  if (message) return message;
+  if (status === "analyzing") return "Finding the strongest moments...";
+  return "Working on your clips...";
+}
+
+function ProcessingTip() {
+  const [tip, setTip] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setTip((value) => (value + 1) % PROCESSING_TIPS.length), 7000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <span>{PROCESSING_TIPS[tip]}</span>;
+}
+
 /* Full-width working panel shown while a job runs */
 function ProcessingStudio({ job, startedAt, onCancel }) {
   const currentIdx = Math.max(
@@ -255,7 +238,7 @@ function ProcessingStudio({ job, startedAt, onCancel }) {
           <div className="studio-meta">
             <span className="studio-live">
               <span className="live-dot" aria-hidden="true" />
-              {job.progress_message || "Working..."}
+              {friendlyProgress(job.progress_message, job.status)}
             </span>
             <span className="studio-timer">
               <Elapsed since={startedAt} /> elapsed
@@ -263,6 +246,13 @@ function ProcessingStudio({ job, startedAt, onCancel }) {
           </div>
         </div>
       </div>
+
+      {!failed && (
+        <div className="studio-away-note">
+          <strong>Safe to leave</strong>
+          <ProcessingTip />
+        </div>
+      )}
 
       <ol className="stage-rail">
         {STAGES.map((s, i) => {
@@ -307,55 +297,44 @@ function ProcessingStudio({ job, startedAt, onCancel }) {
   );
 }
 
-// Each card pairs a layout with a caption style -- users pick a look, not a
-// matrix of independent switches. `words` drive a live word-by-word highlight
-// in the preview, using the same colour and casing the renderer burns in, so
-// the card shows what the output actually looks like rather than a swatch.
-// Five distinct looks, each differing on framing AND caption treatment -- not
-// just font size. `id` matches the backend TEMPLATES registry, so the card and
-// the render can never disagree. `preview` is a real rendered clip if one has
-// been generated (see backend/make_previews.py); otherwise the CSS mockup below
-// stands in.
+// Layout and captions are separate choices. These cards only decide how the
+// source fills the frame; the caption picker in Preferences decides the words.
 const TEMPLATES = [
   {
     id: "classic", name: "Classic", frame: "blur", scene: "scene-neutral",
     words: ["Here", "is", "your"], color: "#d8f24e", capClass: "cap-classic",
-    note: "Blurred fill · coloured word",
+    note: "Full video · soft background",
   },
   {
     id: "fitvideo", name: "Fit video", frame: "fit", scene: "scene-black",
     words: ["Here", "is", "your"], color: "#ffffff", chip: "#2b6cf6",
-    capClass: "cap-fitbox", note: "Flat colour bars · blue chip",
+    capClass: "cap-fitbox", note: "Full video · solid bars",
   },
   {
     id: "tech", name: "Tech", frame: "fill", scene: "scene-azure",
     words: ["Here", "is", "your"], color: "#bfe9ff", capClass: "cap-tech",
-    note: "Edge to edge · caption centred",
+    note: "Fill frame · close crop",
   },
   {
     id: "business", name: "Business", frame: "fill", scene: "scene-warm",
     words: ["Here", "is", "your"], color: "#1e1a1a", capClass: "cap-business",
-    note: "Edge to edge · white plate",
+    note: "Fill frame · warm crop",
   },
   {
     id: "gameplay", name: "Gameplay", frame: "gameplay", scene: "scene-sunset",
     words: ["HERE", "IS", "YOUR"], color: "#3ad43a", capClass: "cap-gameplay",
-    pop: true, note: "Half video · half gameplay",
+    pop: true, note: "Video and gameplay split",
   },
   {
     id: "podcast", name: "Podcast", frame: "podcast", scene: "scene-studio",
     words: ["Here", "is", "your"], color: "#e8f0f5", capClass: "cap-podcast",
-    note: "Two-shot uncropped · room for captions",
+    note: "Keep both speakers visible",
   },
 ];
 
-/** Miniature of the rendered clip: framing, caption style, and highlight timing.
- *
- * Prefers a real rendered clip from /previews/<id>.mp4 when one exists, so the
- * card shows genuine output rather than an approximation. Falls back to the CSS
- * mockup when no sample has been generated, which keeps the picker usable on a
- * fresh checkout with no footage installed. */
-function TemplatePreview({ template, variants }) {
+/** A framing-only preview. Caption samples do not belong here because the
+ * caption preset is selected independently and always wins in the render. */
+function TemplatePreview({ template }) {
   const isSplit = template.frame === "gameplay";
   /* A podcast is a two-shot -- that IS the reason this template exists, since
      every other one zooms in far enough to lose the second person. A card
@@ -366,81 +345,34 @@ function TemplatePreview({ template, variants }) {
      the band -- which meant changing how much of the frame the video gets
      changed nothing visible here. */
   const isBlur = template.frame === "blur";
-  const [hasVideo, setHasVideo] = useState(true);
-  const [variant, setVariant] = useState(0);
-
-  // Only show video when the manifest actually lists one. Guessing at a URL
-  // meant a 404 per card on any install without generated previews.
-  const sources = variants?.length ? variants : [];
-  const showVideo = hasVideo && sources.length > 0;
-
-  // With several gameplay loops installed, cycle them so the card shows what
-  // "gameplay" actually means here rather than implying a single fixed clip.
-  useEffect(() => {
-    if (sources.length < 2) return;
-    const id = setInterval(
-      () => setVariant((v) => (v + 1) % sources.length),
-      4200
-    );
-    return () => clearInterval(id);
-  }, [sources.length]);
-
   return (
     <span className={`tpl-frame ${isSplit ? "is-split" : ""} ${isPodcast ? "is-podcast" : ""} ${isBlur ? "is-blur" : ""} ${template.scene}`}>
-      {showVideo && (
-        <video
-          className="tpl-video"
-          key={sources[variant]}
-          src={`/previews/${sources[variant]}`}
-          autoPlay
-          muted
-          loop
-          playsInline
-          preload="metadata"
-          onError={() => setHasVideo(false)}
-        />
-      )}
-
-      {!showVideo && (
-        <>
-          <span className="tpl-scene" aria-hidden="true">
-            <span className="tpl-head" />
-            <span className="tpl-body" />
-            {isPodcast && <><span className="tpl-head two" />
-                           <span className="tpl-body two" /></>}
-          </span>
-          {isSplit && (
-            <span className="tpl-game" aria-hidden="true">
-              <span className="tpl-game-lane" />
-              <span className="tpl-game-lane" />
-              <span className="tpl-game-player" />
-            </span>
-          )}
-          <span
-            className={`tpl-caption ${template.capClass} ${template.pop ? "pop" : ""}`}
-            style={{ "--hl": template.color, "--chip": template.chip || "transparent" }}
-          >
-            {template.words.map((w, i) => (
-              <span key={w} className="tpl-word" style={{ "--i": i }}>
-                {w}
-              </span>
-            ))}
-          </span>
-        </>
+      <span className="tpl-scene" aria-hidden="true">
+        <span className="tpl-head" />
+        <span className="tpl-body" />
+        {isPodcast && <><span className="tpl-head two" />
+                       <span className="tpl-body two" /></>}
+      </span>
+      {isSplit && (
+        <span className="tpl-game" aria-hidden="true">
+          <span className="tpl-game-lane" />
+          <span className="tpl-game-lane" />
+          <span className="tpl-game-player" />
+        </span>
       )}
     </span>
   );
 }
 
 const MARQUEE_ITEMS = [
-  "Speech-aware cuts",
-  "9:16 vertical reframe",
-  "Burned-in captions",
-  "AI moment detection",
-  "Zero editing skills",
-  "Original audio kept",
-  "Word-accurate subtitles",
-  "One link in, clips out",
+  "Best moments picked",
+  "Vertical, square or wide",
+  "Caption styles included",
+  "Edit before you post",
+  "No editing experience needed",
+  "Keep the real voice",
+  "Add your logo or handle",
+  "Link or upload",
 ];
 
 const HEADLINE = [
@@ -518,18 +450,19 @@ function DropZone({ file, onFile, disabled }) {
       ) : (
         <>
           <strong>Drop a video here, or <em>browse</em></strong>
-          <span>MP4, MOV, WebM or MKV · up to 1 GB</span>
+          <span>MP4, MOV, WebM or MKV</span>
         </>
       )}
     </label>
   );
 }
 
-function SourcePreview({ preview, loading, error, uploadUrl, uploadFile }) {
+function SourcePreview({ preview, loading, error, uploadUrl, uploadFile, onUploadMetadata, onSwitchToUpload }) {
   if (uploadUrl && uploadFile) {
     return (
       <div className="source-preview" aria-label="Selected upload preview">
-        <video src={uploadUrl} muted playsInline preload="metadata" />
+        <video src={uploadUrl} muted playsInline preload="metadata"
+               onLoadedMetadata={(e) => onUploadMetadata?.(e.currentTarget.duration)} />
         <div className="source-preview-copy">
           <strong>{uploadFile.name}</strong>
           <span>{Math.max(1, Math.round(uploadFile.size / (1024 * 1024)))} MB · Local upload</span>
@@ -537,8 +470,19 @@ function SourcePreview({ preview, loading, error, uploadUrl, uploadFile }) {
       </div>
     );
   }
-  if (loading) return <div className="source-preview loading">Checking video…</div>;
-  if (error) return <div className="source-preview problem">{error}</div>;
+  if (loading) return <div className="source-preview loading">Checking this video…</div>;
+  if (error) return (
+    <div className="source-preview recovery" role="status">
+      <span className="source-recovery-icon" aria-hidden="true">!</span>
+      <div className="source-preview-copy">
+        <strong>We couldn't check this link</strong>
+        <span>Try a public video link, or upload the video file instead.</span>
+      </div>
+      <button type="button" className="source-recovery-action" onClick={onSwitchToUpload}>
+        Upload file
+      </button>
+    </div>
+  );
   if (!preview) return null;
   return (
     <div className="source-preview" aria-label="Link preview">
@@ -557,14 +501,17 @@ export default function App() {
   const [sourceMode, setSourceMode] = useState("link");
   const [uploadFile, setUploadFile] = useState(null);
   const [linkPreview, setLinkPreview] = useState(null);
+  const [previewedUrl, setPreviewedUrl] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [uploadPreviewUrl, setUploadPreviewUrl] = useState("");
+  const [uploadDuration, setUploadDuration] = useState(null);
   const [nClips, setNClips] = useState(3);
   const [burnSubtitles, setBurnSubtitles] = useState(true);
   const [autoCensor, setAutoCensor] = useState(true);
   const [multilingual, setMultilingual] = useState(false);
   const [template, setTemplate] = useState("classic");
+  const [captionStyle, setCaptionStyle] = useState("karaoke_fill");
   const [ratio, setRatio] = useState("9:16");
   const [lengthPref, setLengthPref] = useState("any");
   const [intent, setIntent] = useState("");
@@ -573,6 +520,7 @@ export default function App() {
   const [step, setStep] = useState(1);
   // The feature someone just reached for, so the upgrade dialog can name it.
   const [upgradeFor, setUpgradeFor] = useState(null);
+  const [pricingOpen, setPricingOpen] = useState(false);
   const [sharing, setSharing] = useState(null);
   const [editing, setEditing] = useState(null);   // { clip, index } while the editor is open
   const [showDash, setShowDash] = useState(false);
@@ -597,11 +545,71 @@ export default function App() {
   }, [accountOpen]);
   const [user, setUser] = useState(null);
   const [authOpen, setAuthOpen] = useState(false);
+  const [authMode, setAuthMode] = useState("signin");
+  const [authIntent, setAuthIntent] = useState(null);
   const [theme, toggleTheme] = useTheme();
   const toast = useToast();
 
+  function showAppView(view, push = true) {
+    setShowDash(view === "dashboard");
+    setStudioOpen(view === "studio");
+    if (push && window.history.state?.klipcutView !== view) {
+      const hash = view === "dashboard" ? "#clips" : "#studio";
+      window.history.pushState(
+        { ...window.history.state, klipcutView: view },
+        "",
+        hash,
+      );
+    }
+  }
+
+  function leaveAppView() {
+    if (window.history.state?.klipcutView) window.history.back();
+    else showAppView(null, false);
+  }
+
+  useEffect(() => {
+    function restoreView() {
+      const view = window.history.state?.klipcutView;
+      setShowDash(view === "dashboard");
+      setStudioOpen(view === "studio");
+      if (view !== "studio") setEditing(null);
+    }
+    window.addEventListener("popstate", restoreView);
+    return () => window.removeEventListener("popstate", restoreView);
+  }, []);
+
   // Restores the session from a stored token; clears it if the token expired.
-  useEffect(() => { fetchMe().then(setUser).catch(() => {}); }, []);
+  // Polar redirects here after payment. Its webhook can arrive a moment later,
+  // so refresh the account a few times before removing the return marker.
+  useEffect(() => {
+    let cancelled = false;
+    const params = new URLSearchParams(window.location.search);
+    const returningFromPayment = params.get("payment") === "success";
+
+    async function refresh(attempt = 0) {
+      const nextUser = await fetchMe();
+      if (cancelled) return;
+      setUser(nextUser);
+      if (returningFromPayment && attempt < 3) {
+        window.setTimeout(() => refresh(attempt + 1).catch(() => {}), 1200);
+      }
+    }
+    refresh().catch(() => {});
+
+    if (returningFromPayment) {
+      toast("Payment received", {
+        detail: "Your plan and credits will update here in a moment.",
+        tone: "success",
+      });
+      params.delete("payment");
+      params.delete("checkout_id");
+      const query = params.toString();
+      window.history.replaceState(window.history.state, "",
+        `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
+    }
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* Signed out means no plan, which means the free entitlement set. Read from
      the server's list rather than comparing plan names here, so adding a tier
@@ -622,15 +630,28 @@ export default function App() {
     if (plan.can("tighten_pauses")) setTightenPauses(true);
   }, [plan.plan, plan.isAdmin]);
 
-  function requestUpgrade(feature) {
-    setUpgradeFor(feature || null);
+  function openAuth(mode = "signin", intent = null) {
+    setAuthMode(mode);
+    setAuthIntent(intent);
+    setAuthOpen(true);
+  }
+
+  function handleAuthed(nextUser) {
+    const pending = authIntent;
+    setUser(nextUser);
+    setAuthIntent(null);
+    if (pending === "studio") enterStudio();
+  }
+
+  function requestUpgrade(feature = "general") {
+    setUpgradeFor(feature);
   }
 
   /* Copies a public link to one clip. A 402 is the plan boundary, not an error:
      turn it into the upgrade dialog rather than a red toast, because the person
      just told us exactly which feature they wanted. */
   async function shareClip(index) {
-    if (!user) { setAuthOpen(true); return; }
+    if (!user) { openAuth("signin"); return; }
     if (!plan.can("share_pages")) { requestUpgrade("share_pages"); return; }
     setSharing(index);
     try {
@@ -657,7 +678,15 @@ export default function App() {
   useEffect(() => {
     const id = new URLSearchParams(window.location.search).get("job");
     if (!id) return;
-    getJob(id).then((j) => { setJob(j); setStudioOpen(true); }).catch(() => {});
+    getJob(id).then((j) => {
+      setJob(j);
+      window.history.replaceState(
+        { ...window.history.state, klipcutView: null },
+        "",
+        window.location.href,
+      );
+      showAppView("studio");
+    }).catch(() => {});
   }, []);
   // Written by backend/make_previews.py; absent on a fresh checkout, in which
   // case each card falls back to a single <id>.mp4 and then the CSS mockup.
@@ -681,10 +710,17 @@ export default function App() {
   const urlbarRef = useRef(null);
 
   const jobActive = job && !["done", "failed"].includes(job.status);
-  const sourceReady = sourceMode === "upload" ? Boolean(uploadFile) : Boolean(url.trim());
+  const sourceVerified = sourceMode === "upload"
+    ? Boolean(uploadFile && Number.isFinite(uploadDuration) && uploadDuration > 0)
+    : Boolean(linkPreview && previewedUrl === url.trim() && !previewLoading && !previewError);
+  const linkTooLong = sourceMode === "link" && linkPreview?.duration > plan.limits.max_source_minutes * 60;
+  const uploadTooLong = sourceMode === "upload" && uploadDuration > plan.limits.max_source_minutes * 60;
+  const sourceTooLong = linkTooLong || uploadTooLong;
+  const sourceCanContinue = sourceVerified && !sourceTooLong;
 
   useEffect(() => {
-    if (!uploadFile) { setUploadPreviewUrl(""); return undefined; }
+    if (!uploadFile) { setUploadPreviewUrl(""); setUploadDuration(null); return undefined; }
+    setUploadDuration(null);
     const objectUrl = URL.createObjectURL(uploadFile);
     setUploadPreviewUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
@@ -694,16 +730,25 @@ export default function App() {
     const link = url.trim();
     if (sourceMode !== "link" || !/^https?:\/\//i.test(link)) {
       setLinkPreview(null);
+      setPreviewedUrl("");
       setPreviewLoading(false);
       setPreviewError("");
       return undefined;
     }
+    // A preview only belongs to the exact URL it was fetched for. As soon as
+    // the field changes, it cannot be used to unlock the next step.
+    setLinkPreview(null);
+    setPreviewedUrl("");
+    setPreviewError("");
     const controller = new AbortController();
     const timer = setTimeout(() => {
       setPreviewLoading(true);
       setPreviewError("");
       getSourcePreview(link, controller.signal)
-        .then((data) => setLinkPreview(data))
+        .then((data) => {
+          setLinkPreview(data);
+          setPreviewedUrl(link);
+        })
         .catch((err) => {
           if (err.name !== "AbortError") {
             setLinkPreview(null);
@@ -757,7 +802,9 @@ export default function App() {
   }, [job?.status]);
 
   async function handleSubmit() {
-    if (!sourceReady || submitting) return;
+    if (!sourceCanContinue || submitting) return;
+    if (!user) { openAuth("signin", "studio"); return; }
+    if (sourceTooLong) { requestUpgrade("length"); return; }
     setSubmitting(true);
     setSubmitError(null);
     setJob(null);
@@ -775,6 +822,7 @@ export default function App() {
         voice: "onyx",
         language: "English",
         template,
+        captionStyle,
         ratio,
         lengthPref,
         intent: intent.trim(),
@@ -791,6 +839,7 @@ export default function App() {
             voice: options.voice,
             language: options.language,
             template: options.template,
+            caption_style: options.captionStyle,
             ratio: options.ratio,
             length_pref: options.lengthPref,
             intent: options.intent,
@@ -800,8 +849,12 @@ export default function App() {
       const fresh = await getJob(job_id);
       setJob(fresh);
     } catch (e) {
-      setSubmitError(e.message);
-      toast("Couldn't start that job", { detail: e.message, tone: "error" });
+      if (e.status === 402) {
+        requestUpgrade(e.detail?.toLowerCase().includes("source") ? "length" : "clips");
+      } else {
+        setSubmitError(e.message);
+        toast("We couldn't start that clip", { detail: e.message, tone: "error" });
+      }
     } finally {
       setSubmitting(false);
     }
@@ -815,21 +868,51 @@ export default function App() {
   /* One entry point into the studio, so the hero, the CTA and Enter in the URL
      field all behave the same -- they used to disagree about whether Enter
      submitted a job immediately or opened the settings step. */
-  function openStudio() {
-    setStudioOpen(true);
+  function enterStudio() {
+    showAppView("studio");
     // A job already running means this is a way back to its progress, not a new
     // run -- leaving it disabled stranded anyone who closed the studio mid-job.
     // With a source already in hand, skip straight to the choices.
-    if (!jobActive) setStep(sourceReady ? 2 : 1);
+    if (!jobActive) setStep(sourceCanContinue ? 2 : 1);
+  }
+
+  function openStudio() {
+    if (!user && !jobActive) {
+      openAuth("signin", "studio");
+      return;
+    }
+    enterStudio();
+  }
+
+  function openPricingSection() {
+    setPricingOpen(false);
+    setUpgradeFor(null);
+    setStudioOpen(false);
+    setShowDash(false);
+    setEditing(null);
+    window.history.pushState(
+      { ...window.history.state, klipcutView: null },
+      "",
+      "#pricing",
+    );
+    requestAnimationFrame(() => {
+      document.getElementById("pricing")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   }
 
   const continueBtn = (
     <button
-      className="btn btn-primary btn-shine"
+      className="btn btn-primary btn-shine source-continue"
       onClick={openStudio}
-      disabled={submitting || (!jobActive && !sourceReady)}
-      title={!jobActive && !sourceReady
-        ? (sourceMode === "upload" ? "Choose a video file first" : "Paste a video link first")
+      disabled={submitting || (!jobActive && !sourceCanContinue)}
+      title={!jobActive && !sourceCanContinue
+        ? (sourceMode === "upload"
+          ? (uploadTooLong ? "Choose a plan for longer videos"
+            : !uploadFile ? "Choose a video file first" : "Checking the video file")
+          : (!url.trim() ? "Paste a public video link first"
+            : linkTooLong ? "Choose a plan for longer videos"
+            : previewLoading ? "Checking this video" : previewError
+              ? "Use another link or upload the video file" : "Waiting for a video preview"))
         : undefined}
       data-testid="hero-continue-btn"
     >
@@ -855,12 +938,13 @@ export default function App() {
                 <path d="M6 4.5v15l13-7.5-13-7.5Z" fill="currentColor" />
               </svg>
             </span>
-            Clipper
+            KlipCut
           </a>
           <div className="nav-links">
-            <a href="#how">How it works</a>
+            <a href="#how">What you do</a>
             <a href="#features">Features</a>
             <a href="#faq">FAQ</a>
+            <a href="#pricing">Pricing</a>
           </div>
           <div className="nav-cta">
             <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -873,7 +957,7 @@ export default function App() {
               <div className="account" ref={accountRef}>
                 <button
                   className="credit-pill"
-                  onClick={() => setShowDash(true)}
+                  onClick={() => showAppView("dashboard")}
                   title={`${user.credits} credits left`}
                 >
                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" aria-hidden="true">
@@ -898,12 +982,12 @@ export default function App() {
                       <strong>{user.email}</strong>
                       <span>{user.credits} credits left</span>
                     </div>
-                    <button role="menuitem" onClick={() => { setShowDash(true); setAccountOpen(false); }}>
+                    <button role="menuitem" onClick={() => { showAppView("dashboard"); setAccountOpen(false); }}>
                       My clips
                     </button>
                     <button role="menuitem" onClick={() => {
                       setAccountOpen(false);
-                      document.getElementById("pricing")?.scrollIntoView({ behavior: "smooth" });
+                      setPricingOpen(true);
                     }}>
                       Plans &amp; credits
                     </button>
@@ -917,11 +1001,11 @@ export default function App() {
               </div>
             ) : (
               <>
-                <button className="btn btn-ghost btn-sm" onClick={() => setAuthOpen(true)}>
+                <button className="btn btn-ghost btn-sm" onClick={() => openAuth("signin")}>
                   Sign in
                 </button>
                 <Magnetic className="btn btn-primary btn-sm" onClick={focusUrlbar} strength={0.25}>
-                  Try Clipper
+                  Try KlipCut
                 </Magnetic>
               </>
             )}
@@ -959,8 +1043,8 @@ export default function App() {
             </h1>
 
             <p className="sub rise r4">
-              Paste a public video link or upload a file. Clipper finds the strongest moments, cuts on real
-              speech boundaries, and renders vertical clips with word-accurate captions.
+              Add a video, choose how your clips should look, and let KlipCut find the moments worth posting.
+              You can change the captions, layout and branding before you download.
             </p>
 
             {/* The working element: URL bar */}
@@ -975,7 +1059,7 @@ export default function App() {
                   </svg>
                   <input type="url" placeholder="Paste a YouTube, X or TikTok link..." value={url}
                          onChange={(e) => setUrl(e.target.value)}
-                         onKeyDown={(e) => e.key === "Enter" && sourceReady && openStudio()}
+                         onKeyDown={(e) => e.key === "Enter" && sourceCanContinue && openStudio()}
                          disabled={jobActive} aria-label="Public video URL"
                          data-testid="hero-url-input" />
                   {continueBtn}
@@ -990,7 +1074,18 @@ export default function App() {
               )}
               {sourceMode === "link" && (
                 <SourcePreview preview={linkPreview} loading={previewLoading}
-                               error={previewError} uploadUrl="" uploadFile={null} />
+                               error={previewError} uploadUrl="" uploadFile={null}
+                               onSwitchToUpload={() => setSourceMode("upload")} />
+              )}
+              {sourceMode === "upload" && (
+                <SourcePreview preview={null} loading={false} error="" uploadUrl={uploadPreviewUrl}
+                               uploadFile={uploadFile} onUploadMetadata={setUploadDuration} />
+              )}
+              {sourceTooLong && (
+                <div className="hero-source-limit" role="status">
+                  <span>This video is longer than the {plan.limits.max_source_minutes}-minute limit on your plan.</span>
+                  <button type="button" onClick={() => setPricingOpen(true)}>View plans</button>
+                </div>
               )}
 
             </div>
@@ -999,7 +1094,6 @@ export default function App() {
                 spinning halo sized to itself, so anything nested inside it gets
                 bathed in the glow on hover. */}
             {/* Interactive clip collage */}
-            <ClipFan />
           </div>
         </section>
 
@@ -1018,9 +1112,9 @@ export default function App() {
         {/* ---------- Stats ---------- */}
         <section className="stats container">
           {[
-            { num: <CountUp to={10} suffix="×" />, label: "Faster than manual editing" },
+            { num: <CountUp to={10} suffix="×" />, label: "Less time spent editing" },
             { num: "9:16", label: "Vertical, ready for Shorts" },
-            { num: <CountUp to={100} suffix="%" />, label: "Cuts on speech boundaries" },
+            { num: <CountUp to={100} suffix="%" />, label: "Captions follow the voice" },
             { num: "0", label: "Editing skills required" },
           ].map((s, i) => (
             <div className="stat reveal" key={i} style={{ transitionDelay: `${i * 70}ms` }}>
@@ -1033,32 +1127,32 @@ export default function App() {
         {/* ---------- How it works ---------- */}
         <section className="how container" id="how">
           <div className="section-head reveal">
-            <span className="section-eyebrow">How it works</span>
+            <span className="section-eyebrow">What you do</span>
             <h2 className="section-title">
-              Link to clips in <em className="serif grad">four steps.</em>
+              From video to ready-to-post in <em className="serif grad">four steps.</em>
             </h2>
           </div>
           <div className="how-grid">
             {[
               {
                 n: "01",
-                title: "Fetch & transcribe",
-                body: "Pulls the source video and transcribes every word with exact timestamps.",
+                title: "Add your video",
+                body: "Paste a public video link or upload a video from your device.",
               },
               {
                 n: "02",
-                title: "Find real moments",
-                body: "An AI pass picks self-contained moments — cuts snap to speech boundaries, never mid-sentence.",
+                title: "Choose your look",
+                body: "Pick how many clips you want, their size, length, layout and caption style.",
               },
               {
                 n: "03",
-                title: "Reframe, no cropping",
-                body: "Vertical 9:16 with a blurred canvas fill, so nothing in the frame gets cut off.",
+                title: "Get the best moments",
+                body: "KlipCut finds the strongest parts and turns them into complete, easy-to-watch clips.",
               },
               {
                 n: "04",
-                title: "Captions burned in",
-                body: "Word-accurate captions styled for short-form, rendered straight into the video.",
+                title: "Edit and download",
+                body: "Change the words, colours, timing, logo or speed, then export a clip ready to post.",
               },
             ].map((card, i) => (
               <div className="how-card reveal" key={card.n} style={{ transitionDelay: `${i * 80}ms` }}>
@@ -1075,7 +1169,7 @@ export default function App() {
         <section className="features" id="features">
           <div className="container">
             <div className="section-head reveal">
-              <span className="section-eyebrow lime">Why Clipper</span>
+              <span className="section-eyebrow lime">Why KlipCut</span>
               <h2 className="section-title light">
                 Everything you need,
                 <br />
@@ -1086,33 +1180,33 @@ export default function App() {
               {[
                 {
                   icon: "◉",
-                  title: "Speech-aware cutting",
-                  body: "Clips never start or end mid-word. Every cut lands on a natural pause.",
+                  title: "The moments worth posting",
+                  body: "KlipCut looks for strong openings, useful points and satisfying endings.",
                 },
                 {
                   icon: "▥",
-                  title: "Smart vertical reframe",
-                  body: "Blurred canvas fill keeps the full frame visible in 9:16 — no ugly crops.",
+                  title: "Layouts for every platform",
+                  body: "Make vertical, square or wide clips without losing the important part of the video.",
                 },
                 {
                   icon: "≡",
-                  title: "Word-accurate captions",
-                  body: "Short-form styled captions burned into the render, timed to the word.",
+                  title: "Caption styles that feel different",
+                  body: "Choose karaoke, bold, clean, social, cinematic and more before you generate.",
                 },
                 {
                   icon: "◎",
-                  title: "AI moment detection",
-                  body: "Finds hooks, payoffs, and self-contained stories automatically.",
+                  title: "A real editor when you need it",
+                  body: "Fix caption text, trim the clip, move elements, add a logo and preview every change.",
                 },
                 {
                   icon: "▸",
-                  title: "Original audio kept",
-                  body: "No robotic re-dubs. The real voice and energy of the source stays.",
+                  title: "Cleaner pacing",
+                  body: "Remove long pauses and keep the speaker's real voice and energy.",
                 },
                 {
                   icon: "⇣",
-                  title: "One-click download",
-                  body: "Every clip is a ready-to-post MP4. Download and publish anywhere.",
+                  title: "Links and uploads",
+                  body: "Start from a supported public link or upload your own video file.",
                 },
               ].map((f, i) => (
                 <SpotlightCard className="feature-card reveal" key={f.title} style={{ transitionDelay: `${(i % 3) * 80}ms` }}>
@@ -1137,19 +1231,27 @@ export default function App() {
             {[
               {
                 q: "What do I need to get started?",
-                a: "Paste a public video link or upload a file, pick how many clips you want, and hit Generate.",
+                a: "Paste a supported public link or upload a video. Then choose your clip settings and press Generate.",
               },
               {
-                q: "Does it work on any video?",
-                a: "It works best on talk-heavy content — podcasts, interviews, commentary, lectures. It needs speech to find the best moments.",
+                q: "What kind of videos work best?",
+                a: "Podcasts, interviews, streams, lessons and commentary work best because there are clear spoken moments to choose from.",
               },
               {
-                q: "Will the cuts feel random?",
-                a: "No. Every clip is chosen by an AI pass over the full transcript and snapped to real speech boundaries, so clips are self-contained.",
+                q: "Can I change the captions and layout?",
+                a: "Yes. Choose a starting style before generating, then change the text, colours, size, position, ratio or layout in the editor.",
               },
               {
-                q: "What format are the clips?",
-                a: "Vertical 9:16 MP4s with burned-in captions — ready for Shorts, Reels, and TikTok.",
+                q: "How do credits work?",
+                a: "One finished clip uses 10 credits. You pay for the clips you receive, not for every minute in the source video.",
+              },
+              {
+                q: "Can I use my own branding?",
+                a: "Yes. Creator lets you add a logo or social handle and removes the KlipCut watermark.",
+              },
+              {
+                q: "Can I edit before downloading?",
+                a: "Yes. Every clip opens in the editor. Free includes one edited export; Creator includes unlimited edited exports.",
               },
             ].map((item, i) => (
               <div className={`faq-item ${openFaq === i ? "open" : ""}`} key={item.q}>
@@ -1172,7 +1274,7 @@ export default function App() {
         </section>
 
         {/* ---------- Pricing ---------- */}
-        <Pricing user={user} onRequireAuth={() => setAuthOpen(true)} />
+        <Pricing user={user} onRequireAuth={() => openAuth("signup")} />
 
         {/* ---------- Big CTA ---------- */}
         <section className="cta-band">
@@ -1184,7 +1286,7 @@ export default function App() {
             </h2>
             <p>Paste a link and get vertical, captioned clips in minutes.</p>
             <Magnetic className="btn btn-white btn-lg btn-shine" onClick={focusUrlbar}>
-              Try Clipper — it's free
+              Try KlipCut — it's free
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
                 <path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
@@ -1201,9 +1303,9 @@ export default function App() {
                 <path d="M6 4.5v15l13-7.5-13-7.5Z" fill="currentColor" />
               </svg>
             </span>
-            Clipper
+            KlipCut
           </span>
-          <span className="footer-note">FastAPI · React · ffmpeg · Deepgram</span>
+          <span className="footer-note">Built for creators who publish often.</span>
         </div>
       </footer>
 
@@ -1214,10 +1316,19 @@ export default function App() {
           <div className="container">
             <header className="dash-head">
               <div>
-                <h2>Studio</h2>
-                <p className="dash-sub">Three steps: pick a source, choose how the clips come out, generate.</p>
+                <div className="studio-brand">
+                  <span className="logo-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none">
+                      <path d="M6 4.5v15l13-7.5-13-7.5Z" fill="currentColor" />
+                    </svg>
+                  </span>
+                  <span>KlipCut</span>
+                  <em>Studio</em>
+                </div>
+                <h2>Make a new clip</h2>
+                <p className="dash-sub">Add a video, choose the look, then review and generate.</p>
               </div>
-              <button className="btn btn-ghost btn-sm" onClick={() => setStudioOpen(false)}>
+              <button className="btn btn-ghost btn-sm" onClick={leaveAppView}>
                 Exit studio
               </button>
             </header>
@@ -1231,12 +1342,15 @@ export default function App() {
                   url, setUrl,
                   file: uploadFile, setFile: setUploadFile,
                   preview: linkPreview, loading: previewLoading, error: previewError,
+                  tooLong: sourceTooLong, verified: sourceCanContinue,
+                  uploadUrl: uploadPreviewUrl, setUploadDuration,
                 }}
                 prefs={{
                   nClips, setNClips, ratio, setRatio, lengthPref, setLengthPref,
                   burnSubtitles, setBurnSubtitles, autoCensor, setAutoCensor,
                   multilingual, setMultilingual, tightenPauses, setTightenPauses,
                   template, setTemplate, intent, setIntent,
+                  captionStyle, setCaptionStyle,
                 }}
                 plan={plan}
                 templates={TEMPLATES}
@@ -1249,6 +1363,9 @@ export default function App() {
                 submitError={submitError}
                 onGenerate={handleSubmit}
                 onUpgrade={requestUpgrade}
+                onViewPlans={() => setPricingOpen(true)}
+                signedIn={Boolean(user)}
+                onRequireAuth={() => openAuth("signin", "studio")}
               />
             )}
 
@@ -1272,7 +1389,7 @@ export default function App() {
                 Fresh out of <em className="serif grad">the studio.</em>
               </h2>
               <p className="section-sub">
-                Hover any clip to preview it. Every cut lands on a real speech boundary.
+                Preview each clip, open the editor for changes, or download it when it feels right.
               </p>
             </div>
 
@@ -1365,7 +1482,7 @@ export default function App() {
                         disabled={sharing === i}
                         title={plan.can("share_pages")
                           ? "Copy a public link to this clip and its score"
-                          : "Share pages are on the Creator plan"}
+                          : "Upgrade to share this clip"}
                         data-testid={`clip-share-${i}`}
                       >
                         {plan.can("share_pages") ? (
@@ -1403,6 +1520,9 @@ export default function App() {
                 job={job}
                 clip={editing.clip}
                 index={editing.index}
+                canEditCaptions={plan.can("caption_editing")}
+                canTightenPauses={plan.can("tighten_pauses")}
+                onUpgrade={(reason) => requestUpgrade(reason || "editor_export")}
                 onClose={() => setEditing(null)}
                 onSaved={(index, updated) =>
                   setJob((prev) => {
@@ -1438,8 +1558,9 @@ export default function App() {
       {showDash && user && (
         <Dashboard
           user={user}
-          onClose={() => { setShowDash(false); setStep(1); }}
-          onOpenJob={(j) => { setJob(j); setShowDash(false); setStudioOpen(true); }}
+          onClose={() => { leaveAppView(); setStep(1); }}
+          onOpenJob={(j) => { setJob(j); showAppView("studio"); }}
+          onUpgrade={() => setPricingOpen(true)}
         />
       )}
 
@@ -1450,18 +1571,27 @@ export default function App() {
           onClose={() => setUpgradeFor(null)}
           onSeePlans={() => {
             setUpgradeFor(null);
-            setStudioOpen(false);
-            setTimeout(() => document.getElementById("pricing")
-              ?.scrollIntoView({ behavior: "smooth" }), 60);
+            setPricingOpen(true);
           }}
         />
       )}
 
+      {pricingOpen && (
+        <div className="pricing-veil" onClick={() => setPricingOpen(false)} role="presentation">
+          <div className="pricing-dialog" onClick={(e) => e.stopPropagation()} role="dialog"
+               aria-modal="true" aria-label="Plans and pricing">
+            <Pricing user={user} onRequireAuth={() => openAuth("signup")} modal
+                     onClose={() => setPricingOpen(false)}
+                     onViewAll={openPricingSection} />
+          </div>
+        </div>
+      )}
+
       {authOpen && (
         <AuthModal
-          onClose={() => setAuthOpen(false)}
-          onAuthed={setUser}
-          initialMode="signup"
+          onClose={() => { setAuthOpen(false); setAuthIntent(null); }}
+          onAuthed={handleAuthed}
+          initialMode={authMode}
         />
       )}
     </>

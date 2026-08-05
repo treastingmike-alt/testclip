@@ -60,7 +60,7 @@ class TestPlanLimits:
         assert d["is_admin"] is False
         assert d["entitlements"] == []
         assert d["limits"]["max_clips"] == 2
-        assert d["limits"]["max_source_minutes"] == 30
+        assert d["limits"]["max_source_minutes"] == 15
         assert d["limits"]["max_upload_mb"] == 500
 
     def test_plans_endpoint_public(self):
@@ -68,8 +68,10 @@ class TestPlanLimits:
         assert r.status_code == 200
         d = r.json()
         assert d["limits"]["free"]["max_clips"] == 2
-        assert d["limits"]["free"]["max_source_minutes"] == 30
+        assert d["limits"]["free"]["max_source_minutes"] == 15
         assert d["limits"]["free"]["max_upload_mb"] == 500
+        free = next(plan for plan in d["plans"] if plan["id"] == "free")
+        assert free["credits"] == 20
 
 
 # ---- Timestamp bug fix ------------------------------------------------------
@@ -199,8 +201,8 @@ class TestWatermark:
         assert r.status_code == 200, r.text
         job_id = r.json()["job_id"]
         j = requests.get(f"{BASE_URL}/api/jobs/{job_id}").json()
-        assert j["options"].get("watermark") == "Made with Clipper"
-        assert j["options"].get("max_source_minutes") == 30
+        assert j["options"].get("watermark") == "Made with KlipCut"
+        assert j["options"].get("max_source_minutes") == 15
 
     def test_admin_job_has_empty_watermark(self, admin_client):
         r = admin_client.post(f"{BASE_URL}/api/jobs", json={

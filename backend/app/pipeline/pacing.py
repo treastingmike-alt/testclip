@@ -19,6 +19,12 @@ two must be produced together or the captions desync.
 # Pauses shorter than this are natural speech rhythm and get left alone.
 DEFAULT_MAX_PAUSE = 0.35
 
+# Podcasts need breathing room. A 350 ms gap in a monologue is often emphasis,
+# and cutting every one of those gaps creates a machine-gun sequence of jump
+# cuts. Only remove clear dead air here; the editor still lets the user choose
+# the untouched source timeline per clip.
+PODCAST_MAX_PAUSE = 1.50
+
 # Kept either side of a cut so consonants are not clipped and the join does not
 # sound abrupt. Speech onsets in particular start slightly before the word's
 # nominal timestamp.
@@ -27,6 +33,11 @@ TAIL_PAD = 0.12
 
 # Below this, a "segment" is an artefact of noisy timings, not a piece of speech.
 MIN_SEGMENT = 0.20
+
+
+def max_pause_for_frame(frame: str = None) -> float:
+    """The pacing profile that matches a template's editorial rhythm."""
+    return PODCAST_MAX_PAUSE if frame == "podcast" else DEFAULT_MAX_PAUSE
 
 
 def plan_segments(words: list, max_pause: float = DEFAULT_MAX_PAUSE) -> list:

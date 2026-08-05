@@ -37,8 +37,8 @@ export default function AuthModal({ onClose, onAuthed, initialMode = "signin" })
         <h3>{signup ? "Create your account" : "Welcome back"}</h3>
         <p className="auth-sub">
           {signup
-            ? "100 free credits to start — no card needed."
-            : "Sign in to see your clip history and credits."}
+            ? "20 free credits to start — enough for 2 finished clips."
+            : "Sign in to continue and keep this video in your KlipCut library."}
         </p>
 
         <form onSubmit={submit}>

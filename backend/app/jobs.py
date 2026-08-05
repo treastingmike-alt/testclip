@@ -11,10 +11,17 @@ holding one session open across a multi-minute render would pin a connection and
 risk stale reads.
 """
 
+from datetime import datetime, timedelta, timezone
+import os
+import shutil
 from typing import Optional
 
+from app import billing
 from app.db import SessionLocal
-from app.models import Clip, Job
+from app.models import Clip, Job, User, _iso_utc
+
+
+STORAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage"))
 
 # Fields that live on the Job row itself; anything else passed to update_job is
 # handled specially (clips) or ignored.
@@ -26,6 +33,13 @@ JOB_FIELDS = {
 
 def create_job(url: str, options: dict, user_id: str = None) -> str:
     with SessionLocal() as session:
+        options = dict(options or {})
+        if "retention_until" not in options:
+            user = session.get(User, user_id) if user_id else None
+            hours = billing.retention_hours_for(
+                user.plan if user else None, user.email if user else None)
+            options["retention_until"] = (
+                datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
         job = Job(url=url, options=options, user_id=user_id, status="queued")
         session.add(job)
         session.commit()
@@ -44,6 +58,17 @@ def update_job(job_id: str, **fields):
         for key, value in fields.items():
             if key in JOB_FIELDS:
                 setattr(job, key, value)
+
+        # Retention starts when the clips become usable, not when a long source
+        # first entered the queue.
+        if fields.get("status") == "done":
+            user = job.user
+            hours = billing.retention_hours_for(
+                user.plan if user else None, user.email if user else None)
+            options = dict(job.options or {})
+            options["retention_until"] = (
+                datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+            job.options = options
 
         if clips is not None:
             # Rendering reports the full list each time; replace wholesale so a
@@ -74,15 +99,78 @@ def get_job(job_id: str) -> Optional[dict]:
         return job.to_dict() if job else None
 
 
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def retention_deadline(job: Job) -> datetime:
+    """The persisted deadline, with a plan-based fallback for older rows."""
+    raw = (job.options or {}).get("retention_until")
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return _aware(parsed)
+        except (TypeError, ValueError):
+            pass
+    user = job.user
+    hours = billing.retention_hours_for(
+        user.plan if user else None, user.email if user else None)
+    return _aware(job.created_at) + timedelta(hours=hours)
+
+
+def expire_due_jobs(user_id: str = None, now: datetime = None) -> int:
+    """Delete expired media while retaining its library row as Expired."""
+    now = _aware(now or datetime.now(timezone.utc))
+    expired = []
+    with SessionLocal() as session:
+        query = session.query(Job).filter(Job.status == "done")
+        if user_id:
+            query = query.filter(Job.user_id == user_id)
+        for job in query.all():
+            if retention_deadline(job) > now:
+                continue
+            shutil.rmtree(os.path.join(STORAGE_DIR, job.id), ignore_errors=True)
+            job.status = "expired"
+            job.progress_message = "Expired"
+            expired.append(job.id)
+        if expired:
+            session.commit()
+    return len(expired)
+
+
+def extend_user_retention(session, user_id: str, hours: int = 72) -> int:
+    """Give still-available projects a fresh paid editing window."""
+    until = datetime.now(timezone.utc) + timedelta(hours=hours)
+    changed = 0
+    rows = (session.query(Job)
+            .filter(Job.user_id == user_id, Job.status == "done")
+            .all())
+    for job in rows:
+        options = dict(job.options or {})
+        options["retention_until"] = until.isoformat()
+        job.options = options
+        changed += 1
+    return changed
+
+
 def list_jobs(user_id: str, limit: int = 50) -> list:
     """A signed-in user's history -- impossible before persistence existed."""
+    expire_due_jobs(user_id)
     with SessionLocal() as session:
         rows = (session.query(Job)
                 .filter(Job.user_id == user_id)
                 .order_by(Job.created_at.desc())
                 .limit(limit)
                 .all())
-        return [j.to_dict() for j in rows]
+        result = []
+        for job in rows:
+            item = job.to_dict()
+            item["expires_at"] = (_iso_utc(retention_deadline(job))
+                                  if job.status != "expired" else None)
+            result.append(item)
+        return result
 
 
 def get_job_transcript(job_id: str) -> Optional[dict]:

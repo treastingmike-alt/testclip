@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import CaptionPresetPicker, { useCaptionPresets } from "./CaptionPresets";
 
 /* The studio, as three deliberate steps.
  *
@@ -14,9 +15,9 @@ import { useEffect, useState } from "react";
  */
 
 const STEPS = [
-  { n: 1, id: "source", name: "Source", hint: "The video you want clipped" },
-  { n: 2, id: "prefs", name: "Preferences", hint: "How the clips should come out" },
-  { n: 3, id: "review", name: "Review", hint: "Check it, then generate" },
+  { n: 1, id: "source", name: "Video", hint: "Add a link or file" },
+  { n: 2, id: "prefs", name: "Style", hint: "Choose the look" },
+  { n: 3, id: "review", name: "Review", hint: "Confirm and start" },
 ];
 
 const LENGTHS = {
@@ -46,7 +47,7 @@ function ToggleChip({ label, on, onChange, locked, lockReason, title, testid }) 
       onClick={() => (locked ? lockReason() : onChange(!on))}
       role={locked ? undefined : "switch"}
       aria-checked={locked ? undefined : on}
-      title={locked ? "Creator plan — click to see what it includes" : title}
+      title={locked ? "Upgrade to unlock — Creator includes 100 clips a month" : title}
       data-testid={testid}
     >
       {locked ? <LockIcon /> : <span className="chip-switch" aria-hidden="true" />}
@@ -98,16 +99,39 @@ function Row({ label, value, muted }) {
   );
 }
 
+function ChoiceButtons({ label, value, options, onChange, className = "" }) {
+  return (
+    <div className={`choice-field ${className}`}>
+      <span className="choice-label">{label}</span>
+      <div className="choice-buttons" role="group" aria-label={label}>
+        {options.map((option) => (
+          <button key={option.value} type="button"
+                  className={value === option.value ? "selected" : ""}
+                  onClick={() => onChange(option)}
+                  aria-pressed={value === option.value}
+                  data-testid={option.testid}>
+            {option.locked && <LockIcon />}
+            <span>{option.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function StudioWizard({
   step, setStep, source, prefs, plan, templates, previewManifest,
   TemplatePreview, SourceTabs, DropZone, SourcePreview,
-  submitting, submitError, onGenerate, onUpgrade,
+  submitting, submitError, onGenerate, onUpgrade, onViewPlans,
+  signedIn, onRequireAuth,
 }) {
   const [maxReached, setMaxReached] = useState(step);
+  const captionData = useCaptionPresets();
   useEffect(() => { setMaxReached((m) => Math.max(m, step)); }, [step]);
 
   const { limits, can, isFree } = plan;
-  const sourceReady = source.mode === "upload" ? !!source.file : !!source.url.trim();
+  const sourceReady = Boolean(source.verified);
+  const sourceBlocked = Boolean(source.tooLong);
   const lockedTemplates = templates.filter((t) => t.id === "gameplay" && !can("gameplay"));
   // What is actually locked, rather than what the plan is called -- see usePlan.
   const anyLocked = lockedTemplates.length > 0
@@ -118,6 +142,8 @@ export default function StudioWizard({
 
   function next() {
     if (step === 1 && !sourceReady) return;
+    if (step === 1 && !signedIn) { onRequireAuth(); return; }
+    if (step === 1 && sourceBlocked) { onViewPlans(); return; }
     setStep(step + 1);
   }
 
@@ -129,8 +155,8 @@ export default function StudioWizard({
       {step === 1 && (
         <section className="wiz-panel" data-testid="wizard-panel-source">
           <header className="wiz-head">
-            <h3>Where is the video?</h3>
-            <p>Paste a public link, or upload a file from this device.</p>
+            <h3>Add the video you want to clip.</h3>
+            <p>Paste a supported public link or upload a file from this device.</p>
           </header>
 
           <SourceTabs value={source.mode} onChange={source.setMode}
@@ -146,12 +172,27 @@ export default function StudioWizard({
                      data-testid="studio-url-input" />
             </div>
           ) : (
-            <DropZone file={source.file} onFile={source.setFile} />
+            <>
+              <DropZone file={source.file} onFile={source.setFile} />
+              <SourcePreview preview={null} loading={false} error=""
+                             uploadUrl={source.uploadUrl}
+                             uploadFile={source.file} onUploadMetadata={source.setUploadDuration} />
+            </>
           )}
 
           {source.mode === "link" && (
             <SourcePreview preview={source.preview} loading={source.loading}
-                           error={source.error} uploadUrl="" uploadFile={null} />
+                           error={source.error} uploadUrl="" uploadFile={null}
+                           onSwitchToUpload={() => source.setMode("upload")} />
+          )}
+
+          {sourceBlocked && (
+            <div className="source-limit" role="status">
+              <span>This video is longer than the {limits.max_source_minutes}-minute limit on your plan.</span>
+              <button type="button" className="wiz-limits-link" onClick={onViewPlans}>
+                See plans
+              </button>
+            </div>
           )}
 
           {/* Stated before it bites, not as a rejection after Generate. */}
@@ -173,47 +214,44 @@ export default function StudioWizard({
       {step === 2 && (
         <section className="wiz-panel" data-testid="wizard-panel-prefs">
           <header className="wiz-head">
-            <h3>How should the clips come out?</h3>
-            <p>Every one of these can still be changed per clip in the editor afterwards.</p>
+            <h3>Choose your starting look.</h3>
+            <p>These choices are used in the first export. You can still change each clip in the editor.</p>
           </header>
 
           <div className="pref-group">
-            <span className="pref-group-label">Output</span>
-            <div className="options-row">
-              <label className="chip">
-                Clips
-                <select value={prefs.nClips} data-testid="opt-nclips"
-                        onChange={(e) => {
-                          const n = Number(e.target.value);
-                          if (n > limits.max_clips) { onUpgrade("clips"); return; }
-                          prefs.setNClips(n);
-                        }}>
-                  {clipOptions.map((n) => (
-                    <option key={n} value={n} disabled={n > limits.max_clips}>
-                      {n}{n > limits.max_clips ? " — Creator" : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="chip">
-                Ratio
-                <select value={prefs.ratio} onChange={(e) => prefs.setRatio(e.target.value)}
-                        data-testid="opt-ratio">
-                  <option value="9:16">9:16</option>
-                  <option value="1:1">1:1</option>
-                  <option value="16:9">16:9</option>
-                </select>
-              </label>
-              <label className="chip">
-                Length
-                <select value={prefs.lengthPref}
-                        onChange={(e) => prefs.setLengthPref(e.target.value)}
-                        data-testid="opt-length">
-                  {Object.entries(LENGTHS).map(([id, name]) => (
-                    <option key={id} value={id}>{name}</option>
-                  ))}
-                </select>
-              </label>
+            <span className="pref-group-label">Clip setup</span>
+            <div className="choice-stack">
+              <ChoiceButtons
+                label="Number of clips"
+                value={prefs.nClips}
+                className="clip-count-choice"
+                options={clipOptions.map((n) => ({
+                  value: n,
+                  label: n,
+                  locked: n > limits.max_clips,
+                  testid: `opt-nclips-${n}`,
+                }))}
+                onChange={(option) => {
+                  if (option.locked) { onUpgrade("clips"); return; }
+                  prefs.setNClips(option.value);
+                }}
+              />
+              <ChoiceButtons
+                label="Video size"
+                value={prefs.ratio}
+                options={[
+                  { value: "9:16", label: "Vertical 9:16", testid: "opt-ratio-vertical" },
+                  { value: "1:1", label: "Square 1:1", testid: "opt-ratio-square" },
+                  { value: "16:9", label: "Wide 16:9", testid: "opt-ratio-wide" },
+                ]}
+                onChange={(option) => prefs.setRatio(option.value)}
+              />
+              <ChoiceButtons
+                label="Clip length"
+                value={prefs.lengthPref}
+                options={Object.entries(LENGTHS).map(([value, label]) => ({ value, label }))}
+                onChange={(option) => prefs.setLengthPref(option.value)}
+              />
             </div>
           </div>
 
@@ -248,7 +286,7 @@ export default function StudioWizard({
           </div>
 
           <div className="pref-group">
-            <span className="pref-group-label">Template</span>
+            <span className="pref-group-label">Layout</span>
             <div className="template-grid">
               {templates.map((t) => {
                 const locked = lockedTemplates.includes(t);
@@ -268,7 +306,7 @@ export default function StudioWizard({
                       {locked && <LockIcon />}
                     </span>
                     <span className="template-note">
-                      {locked ? "Creator plan" : t.note}
+                      {locked ? "Upgrade to unlock" : t.note}
                     </span>
                     {selected && <span className="template-tick">✓</span>}
                   </button>
@@ -277,13 +315,27 @@ export default function StudioWizard({
             </div>
           </div>
 
+          {prefs.burnSubtitles && (
+            <div className="pref-group caption-pref-group">
+              <span className="pref-group-label">Caption style</span>
+              <p className="pref-help">This style will be used in the generated video. Paid plans can change it later in the editor.</p>
+              <CaptionPresetPicker value={prefs.captionStyle}
+                                   onChange={prefs.setCaptionStyle}
+                                   data={captionData} />
+            </div>
+          )}
+
           <label className="intent-field">
-            <span className="intent-label">
-              Find clip moment <span className="intent-optional">Optional</span>
+            <span className="intent-heading">
+              <span className="intent-label">Looking for a specific moment?</span>
+              <span className="intent-optional">Optional</span>
+            </span>
+            <span className="intent-help">
+              Describe it here. KlipCut will prioritise one strong match and still choose the best moments overall.
             </span>
             <input type="text" value={prefs.intent} data-testid="opt-intent"
                    onChange={(e) => prefs.setIntent(e.target.value)}
-                   placeholder="For example: when he talks about pricing." />
+                   placeholder="For example: when they explain how pricing works" />
           </label>
 
           {/* One strip, at the end of the step. Not a banner per locked control:
@@ -291,12 +343,12 @@ export default function StudioWizard({
           {anyLocked && (
             <div className="unlock-strip" data-testid="unlock-strip">
               <span>
-                <strong>Locked above: gameplay split-screen, pause tightening, mixed language.</strong>
-                <em>Creator also removes the watermark and turns on share pages.</em>
+                <strong>Upgrade to unlock gameplay, pause tightening and mixed-language captions.</strong>
+                <em>Creator includes 100 finished clips each month.</em>
               </span>
               <button className="btn btn-primary btn-sm btn-shine"
-                      onClick={() => onUpgrade()} data-testid="unlock-strip-btn">
-                What's in Creator?
+                      onClick={onViewPlans} data-testid="unlock-strip-btn">
+                View plans
               </button>
             </div>
           )}
@@ -317,7 +369,9 @@ export default function StudioWizard({
               : (source.preview?.title || source.url)} />
             <Row label="Clips" value={`${prefs.nClips} × ${LENGTHS[prefs.lengthPref].toLowerCase()}`} />
             <Row label="Format" value={`${prefs.ratio} · ${templates.find((t) => t.id === prefs.template)?.name || prefs.template}`} />
-            <Row label="Captions" value={prefs.burnSubtitles ? "Burned in, word-timed" : "Off"} />
+            <Row label="Captions" value={prefs.burnSubtitles
+              ? (captionData?.presets?.find((p) => p.id === prefs.captionStyle)?.name || "On")
+              : "Off"} />
             <Row label="Auto-censor" value={prefs.autoCensor ? "On" : "Off"} />
             <Row label="Tighten pauses"
                  value={prefs.tightenPauses && can("tighten_pauses") ? "On" : "Off"}
@@ -334,7 +388,7 @@ export default function StudioWizard({
           {plan.watermarked && (
             <div className="review-note" data-testid="watermark-note">
               <span>
-                Free clips carry a small <strong>Made with Clipper</strong> credit at the
+                Free clips carry a small <strong>Made with KlipCut</strong> credit at the
                 foot of the frame.
               </span>
               <button type="button" className="wiz-limits-link"
@@ -358,13 +412,15 @@ export default function StudioWizard({
         <span className="wiz-nav-count">Step {step} of {STEPS.length}</span>
         {step < 3 ? (
           <button className="btn btn-primary btn-shine" onClick={next}
-                  disabled={step === 1 && !sourceReady}
-                  title={step === 1 && !sourceReady
-                    ? (source.mode === "upload" ? "Choose a video file first"
+                  disabled={step === 1 && (!sourceReady || source.loading || sourceBlocked)}
+                  title={step === 1 && (!sourceReady || source.loading || sourceBlocked)
+                    ? (sourceBlocked ? "Choose a plan for longer videos"
+                      : source.loading ? "Checking the video"
+                      : source.mode === "upload" ? "Choose a video file first"
                                                 : "Paste a video link first")
                     : undefined}
                   data-testid="wizard-next">
-            {step === 1 ? "Choose preferences" : "Review"}
+            {step === 1 ? (signedIn ? "Choose preferences" : "Sign in to continue") : "Review"}
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
               <path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" strokeWidth="2.2"
                     strokeLinecap="round" strokeLinejoin="round" />

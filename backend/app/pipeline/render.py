@@ -248,11 +248,127 @@ def smart_caption_margin_v(plan: dict, out_h: int = OUT_H) -> int:
     Single: the lower third, clear of the platform's own UI. Lower would be
     under the like button; higher would be across the speaker's chest.
     """
+    if plan and plan.get("mode") == "adaptive":
+        # One ASS file is shared by every visual scene. A caption cannot jump
+        # between the seam and lower third without becoming distracting, so the
+        # adaptive composition uses one steady lower-third baseline. It is clear
+        # of faces in a single and sits comfortably inside the lower tile of a
+        # split, matching the placement viewers already expect on podcast clips.
+        return int(out_h * 0.24)
     if plan and plan.get("mode") == "stacked":
         # Just below the seam, so the text sits against the lower tile's top
         # rather than splitting the difference and clipping both.
         return int(out_h * 0.46)
     return int(out_h * (PLATFORM_UI_FRACTION + CAPTION_LIFT))
+
+
+def _even(value: float) -> int:
+    value = max(2, int(round(value)))
+    return value - value % 2
+
+
+def _local_axis(keys, scene_start, axis):
+    """One tile axis on the scene-local FFmpeg timeline."""
+    values = [
+        (max(0.0, point[0] - scene_start), point[axis])
+        for point in keys
+    ]
+    if not values:
+        return "0"
+    if values[0][0] > 0:
+        values.insert(0, (0.0, values[0][1]))
+    return values
+
+
+def _wide_scene_filter(input_label: str, width: int, height: int, tag: str):
+    """The honest no-face fallback, namespaced for an adaptive scene."""
+    half_w, half_h = width // 2, height // 2
+    y = f"max(0\\,min(H-h\\,{PODCAST_CONTENT_BIAS}*H-h/2))"
+    return (
+        f"{input_label}split=2[{tag}bg0][{tag}fg0];"
+        f"[{tag}bg0]scale={half_w}:{half_h}:force_original_aspect_ratio=increase,"
+        f"crop={half_w}:{half_h},gblur=sigma=12,"
+        f"eq=brightness=-0.55:saturation=0.65,scale={width}:{height}[{tag}bg];"
+        f"[{tag}fg0]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"setsar=1[{tag}fg];"
+        f"[{tag}bg][{tag}fg]overlay=(W-w)/2:{y}[{tag}out]"
+    ), f"[{tag}out]"
+
+
+def _adaptive_filter(plan: dict, width: int, height: int) -> str:
+    """Compose camera-aware scenes and concatenate them into one clean timeline."""
+    from app.pipeline import reframe
+
+    scenes = [scene for scene in plan.get("scenes", [])
+              if scene.get("end", 0) - scene.get("start", 0) > 0.02]
+    if not scenes:
+        return podcast_filter(width, height)
+
+    parts = []
+    if len(scenes) > 1:
+        labels = "".join(f"[ps{i}]" for i in range(len(scenes)))
+        parts.append(f"[0:v]split={len(scenes)}{labels};")
+
+    outputs = []
+    for i, scene in enumerate(scenes):
+        source = f"[ps{i}]" if len(scenes) > 1 else "[0:v]"
+        start = max(0.0, float(scene.get("start", 0)))
+        end = max(start + 0.02, float(scene.get("end", start + 0.02)))
+        trimmed = f"[ps{i}trim]"
+        parts.append(
+            f"{source}trim=start={start:.3f}:end={end:.3f},"
+            f"setpts=PTS-STARTPTS{trimmed};"
+        )
+
+        tiles = scene.get("tiles") or []
+        if scene.get("mode") == "wide" or not tiles:
+            fragment, output = _wide_scene_filter(trimmed, width, height, f"ps{i}w")
+            parts.append(fragment + ";")
+            outputs.append(output)
+            continue
+
+        if len(tiles) > 1:
+            labels = "".join(f"[ps{i}in{j}]" for j in range(len(tiles)))
+            parts.append(f"{trimmed}split={len(tiles)}{labels};")
+
+        tile_outputs = []
+        layouts = []
+        for j, tile in enumerate(tiles):
+            tile_in = f"[ps{i}in{j}]" if len(tiles) > 1 else trimmed
+            rx, ry, rw, rh = tile["rect"]
+            tile_w, tile_h = _even(width * rw), _even(height * rh)
+            tile_x, tile_y = _even(width * rx) if rx else 0, _even(height * ry) if ry else 0
+            win_w, win_h = (_even(tile["win"][0]), _even(tile["win"][1]))
+            keys = tile.get("keys") or []
+            x_keys = _local_axis(keys, start, 1)
+            y_keys = _local_axis(keys, start, 2)
+            x = reframe.expr(x_keys, 0, 0) if x_keys != "0" else "0"
+            y = reframe.expr(y_keys, 0, 0) if y_keys != "0" else "0"
+            out = f"[ps{i}tile{j}]"
+            parts.append(
+                f"{tile_in}crop={win_w}:{win_h}:"
+                f"'({x})-{win_w // 2}':'({y})-{win_h // 2}',"
+                f"scale={tile_w}:{tile_h}:flags=lanczos,setsar=1{out};"
+            )
+            tile_outputs.append(out)
+            layouts.append(f"{tile_x}_{tile_y}")
+
+        if len(tile_outputs) == 1:
+            output = tile_outputs[0]
+        else:
+            output = f"[ps{i}out]"
+            parts.append(
+                f"{''.join(tile_outputs)}xstack=inputs={len(tile_outputs)}:"
+                f"layout={'|'.join(layouts)}:fill=black{output};"
+            )
+        outputs.append(output)
+
+    if len(outputs) == 1:
+        # Give the rest of the render pipeline its stable public label.
+        parts.append(f"{outputs[0]}null[framed]")
+    else:
+        parts.append(f"{''.join(outputs)}concat=n={len(outputs)}:v=1:a=0[framed]")
+    return "".join(parts)
 
 
 def smart_filter(plan: dict, width: int, height: int) -> str:
@@ -265,6 +381,12 @@ def smart_filter(plan: dict, width: int, height: int) -> str:
     """
     from app.pipeline import reframe
 
+    if plan.get("mode") == "adaptive":
+        return _adaptive_filter(plan, width, height)
+
+    # Legacy v1 plans are still understood by the renderer. The editor's cache
+    # is versioned and no longer returns them, but keeping this path makes an
+    # in-flight job deploy-safe.
     win_w, win_h = plan["win"]
     # Even dimensions: libx264 rejects odd ones on yuv420p.
     win_w -= win_w % 2
@@ -299,6 +421,42 @@ def smart_filter(plan: dict, width: int, height: int) -> str:
         f"[0:v]crop={win_w}:{win_h}:'({x})-{win_w // 2}':'({y})-{win_h // 2}',"
         f"scale={width}:{height}:flags=lanczos,setsar=1[framed]"
     )
+
+
+def remap_reframe_plan(plan: dict, clip_start: float, segments: list) -> dict:
+    """Move a visual plan onto the pause-tightened output timeline."""
+    if not plan or not segments:
+        return plan
+    from app.pipeline import pacing
+
+    if plan.get("mode") != "adaptive":
+        return dict(plan, windows=[
+            [(pacing.remap_time(clip_start + t, segments), x, y)
+             for t, x, y in keys]
+            for keys in plan["windows"]
+        ])
+
+    duration = sum(end - start for start, end in segments)
+    scenes = []
+    for scene in plan.get("scenes", []):
+        mapped_start = pacing.remap_time(clip_start + scene["start"], segments)
+        mapped_end = pacing.remap_time(clip_start + scene["end"], segments)
+        if mapped_end - mapped_start <= 0.02:
+            continue
+        tiles = []
+        for tile in scene.get("tiles", []):
+            keys = [
+                (pacing.remap_time(clip_start + t, segments), x, y)
+                for t, x, y in tile.get("keys", [])
+            ]
+            tiles.append(dict(tile, keys=keys))
+        scenes.append(dict(scene, start=mapped_start, end=mapped_end, tiles=tiles))
+
+    if not scenes:
+        return None
+    scenes[0]["start"] = 0.0
+    scenes[-1]["end"] = duration
+    return dict(plan, duration=duration, scenes=scenes)
 
 
 def fit_caption_margin_v(src_w: int, src_h: int,
@@ -544,14 +702,8 @@ def render_clip(
         # time, but this filter reads `t` from the stream AFTER the tightening
         # concat -- so on a clip with dead air removed, every crop move fired
         # late by the total removed so far, drifting further out toward the end.
-        plan = reframe_plan
-        if segments:
-            from app.pipeline import pacing
-            plan = dict(plan, windows=[
-                [(pacing.remap_time(start + t, segments), x, y) for t, x, y in keys]
-                for keys in plan["windows"]
-            ])
-        filter_complex = smart_filter(plan, width, height)
+        plan = remap_reframe_plan(reframe_plan, start, segments)
+        filter_complex = smart_filter(plan, width, height) if plan else podcast_filter(width, height)
     elif frame == "podcast":
         # No plan: detection found nothing trackable (a screen share, a wide
         # stage shot, b-roll). The fixed letterbox is the honest answer there --

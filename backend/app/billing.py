@@ -1,9 +1,8 @@
 """Plans, credit pricing, and metering.
 
-No payment provider is wired in yet -- deliberately. Everything a provider needs
-to plug into exists here (plans, a credit balance, a ledger of debits, a checkout
-endpoint that currently only records intent), so adding Polar/Stripe later means
-implementing one webhook that calls `grant_credits`, not restructuring anything.
+Polar checkout and fulfillment live in `polar_catalog.py` and
+`polar_payments.py`. This module remains the provider-independent source of
+truth for plans, prices, entitlements, balances, and the credit ledger.
 
 Credits are priced PER CLIP DELIVERED, not per minute of source video. This is
 a deliberate product position: you pay for output you can post, not for our
@@ -38,7 +37,7 @@ CREDITS_PER_CLIP = 10
 # starts. One clip is the smallest thing anyone can ask for.
 MIN_CHARGE = CREDITS_PER_CLIP
 
-FREE_SIGNUP_CREDITS = 100          # 10 clips to try it with
+FREE_SIGNUP_CREDITS = 20           # 2 finished clips to try it with
 
 # Per-clip pricing decouples revenue from source length, so this is what stops
 # a 6-hour upload costing more to transcribe than the clips are worth. Not a
@@ -55,6 +54,8 @@ PLANS = [
         "credits": FREE_SIGNUP_CREDITS,
         "features": [
             f"{FREE_SIGNUP_CREDITS // CREDITS_PER_CLIP} free clips on signup",
+            "Projects saved for 3 hours",
+            "One edited export",
             "All templates and ratios",
             "Word-accurate captions",
             "Clip trimming",
@@ -75,35 +76,30 @@ PLANS = [
             {"credits": 1000, "monthly_usd": 19, "yearly_usd": 15},
             {"credits": 1500, "monthly_usd": 27, "yearly_usd": 22},
             {"credits": 2000, "monthly_usd": 34, "yearly_usd": 27},
-            {"credits": 3000, "monthly_usd": 48, "yearly_usd": 38},
         ],
         "features": [
-            "100 clips a month, any source length",
-            "Multilingual captions (Hindi + English)",
+            "100 ready-to-post clips each month",
+            "Projects saved for 3 days",
+            "Caption editing",
+            "Multilingual captions",
             "Gameplay split-screen",
             "Pause tightening",
             "Trim and extend any clip",
-            "Priority rendering",
+            "Unlimited edited exports",
         ],
     },
     {
         "id": "pro",
         "name": "Pro",
         "blurb": "For teams and agencies",
-        "credits": 3000,
+        "credits": 1000,
         "monthly_usd": 49,
         "yearly_usd": 39,
-        "tiers": [
-            {"credits": 3000, "monthly_usd": 49, "yearly_usd": 39},
-            {"credits": 5000, "monthly_usd": 75, "yearly_usd": 60},
-            {"credits": 8000, "monthly_usd": 112, "yearly_usd": 90},
-            {"credits": 12000, "monthly_usd": 156, "yearly_usd": 125},
-        ],
         "features": [
             "Everything in Creator",
-            "Bulk exports",
-            "Custom gameplay library",
-            "Team seats",
+            "Longer source videos",
+            "Larger video uploads",
+            "Priority rendering",
         ],
     },
 ]
@@ -120,36 +116,52 @@ PLANS = [
 #   gameplay       -- the split-screen template. Ours to host and ours to keep
 #                     legally clean, and it doubles render time.
 #   tighten_pauses -- cutting dead air; an extra analysis pass and a re-cut.
-#   priority       -- ahead of free jobs in the queue.
 #   branding       -- a logo or handle burned into the clip.
 #   no_watermark   -- free clips carry ours. See WATERMARK_TEXT.
 #   share_pages    -- the public score/hook page per clip.
-#   bulk_export    -- Pro only.
-_PAID = frozenset({"multilingual", "gameplay", "tighten_pauses", "priority",
-                   "branding", "no_watermark", "share_pages"})
+#   caption_editing -- changing caption text, style, colour, size or position.
+#   priority       -- Pro jobs go ahead of the standard queue.
+_PAID = frozenset({"multilingual", "gameplay", "tighten_pauses",
+                   "branding", "no_watermark", "share_pages", "caption_editing"})
 
 ENTITLEMENTS = {
     "free": frozenset(),
     "creator": _PAID,
-    "pro": _PAID | {"bulk_export"},
+    "pro": _PAID | {"priority"},
 }
 
 # Hard numbers, separate from ENTITLEMENTS because a limit is a ceiling rather
 # than an on/off switch. Free is deliberately usable rather than crippled: two
-# real clips off a half-hour video is a genuine trial, and the ceiling is the
+# real clips off a 15-minute video is a genuine trial, and the ceiling is the
 # reason to upgrade -- not a broken experience.
 LIMITS = {
-    "free":    {"max_clips": 2,  "max_source_minutes": 30,
+    "free":    {"max_clips": 2,  "max_source_minutes": 15,
                 "max_upload_mb": 500},
     "creator": {"max_clips": 10, "max_source_minutes": MAX_SOURCE_MINUTES,
                 "max_upload_mb": 2048},
-    "pro":     {"max_clips": 10, "max_source_minutes": MAX_SOURCE_MINUTES,
+    "pro":     {"max_clips": 10, "max_source_minutes": 720,
                 "max_upload_mb": 4096},
 }
 
+# Finished projects remain editable for a short, explicit window. Keeping this
+# next to plan limits makes retention a product rule rather than an accidental
+# consequence of whichever disk happens to fill first.
+RETENTION_HOURS = {
+    "free": 3,
+    "creator": 72,
+    "pro": 72,
+}
+
+
+def retention_hours_for(plan_id: str, email: str = None) -> int:
+    """How long completed media remains available for this account."""
+    if is_admin(email):
+        return RETENTION_HOURS["pro"]
+    return RETENTION_HOURS.get(plan_id or "free", RETENTION_HOURS["free"])
+
 # Burned into free clips. Configurable because the product name is not final,
 # and a watermark is the one string that ends up on someone else's timeline.
-WATERMARK_TEXT = os.environ.get("CLIPPER_WATERMARK", "Made with Clipper")
+WATERMARK_TEXT = os.environ.get("CLIPPER_WATERMARK", "Made with KlipCut")
 
 
 # Accounts that get every capability regardless of plan, for testing the paid
@@ -289,7 +301,12 @@ def charge(user_id: str, amount: int, job_id: str = None, note: str = "") -> boo
 
 
 def grant_credits(user_id: str, amount: int, note: str = "purchase") -> int:
-    """Adds credits. This is the single call a payment webhook needs to make."""
+    """Adds credits for trusted internal/admin flows.
+
+    Payment webhooks use their own transactional idempotency marker before
+    changing a balance; calling this directly from a retried webhook would be
+    unsafe.
+    """
     with SessionLocal() as session:
         user = session.get(User, user_id)
         if not user:

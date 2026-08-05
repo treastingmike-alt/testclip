@@ -5,6 +5,7 @@ pydantic
 python-multipart
 fonttools
 sqlalchemy
+polar-sdk==0.31.7
 
 # Face-aware reframing for the Podcast template (app/pipeline/reframe.py).
 # opencv carries the YuNet detector; the model file itself is an asset rather

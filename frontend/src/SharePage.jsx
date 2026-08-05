@@ -105,7 +105,7 @@ export default function SharePage({ token }) {
 
       <footer className="share-foot">
         <span>
-          <strong>Made with Clipper.</strong> It reads a long video, finds the moments
+          <strong>Made with KlipCut.</strong> It reads a long video, finds the moments
           worth posting, and cuts them vertical with word-accurate captions.
         </span>
         <a className="btn btn-primary btn-shine" href="/" data-testid="share-cta">

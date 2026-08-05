@@ -7,8 +7,10 @@ out. Letterboxing keeps both but shrinks them into a strip with two thirds of
 the canvas left over. Neither is what a human editor would do -- an editor
 crops to the PEOPLE, and if there are two of them, gives each their own frame.
 
-This module works out where the people are, and hands `render` a set of crop
-windows to composite. It does not itself touch ffmpeg.
+This module works out where the people are, and hands `render` a shot-by-shot
+set of crop windows to composite. It does not itself touch ffmpeg. A podcast
+clip is not one layout for forty seconds: edited footage moves between singles,
+two-shots and occasional wide/B-roll shots. The plan mirrors those cuts.
 
 The whole design is about STABILITY. Detection output is jittery -- on real
 footage the same seated speaker's box moves 200px between samples as they lean
@@ -35,6 +37,11 @@ SAMPLE_FPS = 2.0          # detections per second of footage. Faces do not move
 DETECT_WIDTH = 640        # detect on a downscale; boxes are scaled back up.
 MIN_SCORE = 0.55          # below this the box is usually a hand or a poster.
 
+# Increment whenever the JSON plan shape or its composition policy changes.
+# The editor includes this in its on-disk cache name, so an old global stacked
+# plan cannot survive a deployment and keep producing the bug that was fixed.
+PLAN_VERSION = 3
+
 # --- tracking --------------------------------------------------------------
 
 # Two detections belong to the same person if their centres are within this
@@ -55,6 +62,24 @@ MIN_TRACK_COVERAGE = 0.35  # a track seen in fewer than this fraction of samples
 # (co-occurrence near 1.0); cut-based footage has them in none (near 0.0). The
 # gap between those cases is enormous, so this threshold is not delicate.
 MIN_CO_OCCURRENCE = 0.45
+
+# A layout must survive this many consecutive samples before it is allowed to
+# change the composition. At 2fps, five samples is 2.5 seconds: the minimum shot
+# length used by the podcast references, and enough to stop a brief reaction or
+# missed detection from turning into a frantic layout switch.
+MIN_LAYOUT_SAMPLES = 5
+MAX_PEOPLE = 4
+
+# When one diarized speaker owns most of a two-person scene and the source also
+# gives one face more visual emphasis, make that person the main panel and keep
+# the other as a reaction. Audio chooses the editorial mode; vision chooses the
+# face because diarization labels do not identify image coordinates.
+REACTION_SPEECH_SHARE = 0.72
+REACTION_AREA_RATIO = 1.08
+
+# Two people stay in one natural frame only when a true portrait crop can hold
+# both faces with headroom. Otherwise pretending they fit just cuts off both.
+TOGETHER_FILL = 0.86
 
 # A jump larger than this, in one sample step, is a camera CUT rather than a
 # person moving -- nobody crosses a fifth of the frame in half a second. Cuts
@@ -298,6 +323,16 @@ def _clamp_window(centre, size, extent=1.0):
     return min(max(centre, half), extent - half) if size < extent else extent / 2
 
 
+def _clamp_region(centre, size, low, high, extent):
+    """Keep a crop inside a participant's horizontal region where possible."""
+    if high <= low:
+        return _clamp_window(centre, size, extent)
+    if size >= high - low:
+        return _clamp_window((low + high) / 2, size, extent)
+    half = size / 2
+    return min(max(centre, low + half), high - half)
+
+
 def portrait_window(track, src_w, src_h, out_w, out_h):
     """Crop keyframes framing ONE speaker for a vertical canvas.
 
@@ -370,6 +405,256 @@ def stacked_windows(tracks, src_w, src_h, out_w, out_h):
     return win_w, win_h, out
 
 
+def _runs(values):
+    """[(start_index, end_index_exclusive, value), ...]."""
+    if not values:
+        return []
+    out = []
+    start = 0
+    for i in range(1, len(values)):
+        if values[i] != values[start]:
+            out.append((start, i, values[start]))
+            start = i
+    out.append((start, len(values), values[start]))
+    return out
+
+
+def stabilize_layouts(counts, minimum=MIN_LAYOUT_SAMPLES):
+    """Remove brief face-count flickers without delaying real shot changes.
+
+    A detector missing one of two faces for half a second must not make the
+    canvas jump split -> single -> split. Likewise, one false second face in the
+    middle of a single must not duplicate the speaker. Runs shorter than the
+    minimum inherit the surrounding layout; at an edge they inherit the only
+    neighbour. The loop repeats because replacing one run may join two others.
+    """
+    values = [max(0, min(int(v), MAX_PEOPLE)) for v in counts]
+    if not values:
+        return []
+
+    for _ in range(4):
+        runs = _runs(values)
+        changed = False
+        for n, (start, end, value) in enumerate(runs):
+            if end - start >= minimum or len(runs) == 1:
+                continue
+            left = runs[n - 1] if n else None
+            right = runs[n + 1] if n + 1 < len(runs) else None
+            if left and right and left[2] == right[2]:
+                replacement = left[2]
+            elif left and right:
+                left_len = left[1] - left[0]
+                right_len = right[1] - right[0]
+                replacement = left[2] if left_len >= right_len else right[2]
+            elif left:
+                replacement = left[2]
+            elif right:
+                replacement = right[2]
+            else:
+                continue
+            values[start:end] = [replacement] * (end - start)
+            changed = True
+        if not changed:
+            break
+    return values
+
+
+def _track_mean_x(track):
+    return sum(p[1] for p in track["points"]) / len(track["points"])
+
+
+def _track_area(track):
+    return sum(p[3] * p[4] for p in track["points"]) / len(track["points"])
+
+
+def _track_mean_width(track):
+    return sum(p[3] for p in track["points"]) / len(track["points"])
+
+
+def _speaker_share(words, start, end):
+    """How much of this scene belongs to its most frequent diarized speaker."""
+    totals = {}
+    for word in words or []:
+        speaker = word.get("speaker")
+        if speaker is None:
+            continue
+        overlap = max(0.0, min(end, word["end"]) - max(start, word["start"]))
+        if overlap:
+            totals[speaker] = totals.get(speaker, 0.0) + overlap
+    total = sum(totals.values())
+    return max(totals.values()) / total if total else 0.0
+
+
+def _layout_rects(count, mode=None):
+    """Tile rectangles as fractions of the final canvas.
+
+    Three people use one featured full-width tile and two supporting tiles. Four
+    use a balanced grid. These are intentionally a small set of familiar podcast
+    compositions rather than a novel layout for every face count.
+    """
+    if count <= 1:
+        return [(0.0, 0.0, 1.0, 1.0)]
+    if count == 2:
+        if mode == "reaction":
+            return [(0.0, 0.0, 1.0, 0.62), (0.0, 0.62, 1.0, 0.38)]
+        return [(0.0, 0.0, 1.0, 0.5), (0.0, 0.5, 1.0, 0.5)]
+    if count == 3:
+        return [
+            (0.0, 0.0, 1.0, 0.5),
+            (0.0, 0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5, 0.5),
+        ]
+    return [
+        (0.0, 0.0, 0.5, 0.5), (0.5, 0.0, 0.5, 0.5),
+        (0.0, 0.5, 0.5, 0.5), (0.5, 0.5, 0.5, 0.5),
+    ]
+
+
+def _participant_regions(tracks, src_w):
+    """A horizontal ownership region per simultaneously visible participant."""
+    ordered = sorted(tracks, key=_track_mean_x)
+    centres = [_track_mean_x(tr) * src_w for tr in ordered]
+    regions = {}
+    for i, (track, centre) in enumerate(zip(ordered, centres)):
+        low = 0.0 if i == 0 else (centres[i - 1] + centre) / 2
+        high = float(src_w) if i == len(ordered) - 1 else (centre + centres[i + 1]) / 2
+        regions[id(track)] = (low, high)
+    return regions
+
+
+def _together_tile(tracks, start, end, src_w, src_h, out_w, out_h):
+    """One natural two-person frame when a real portrait crop can contain both."""
+    aspect = out_w / max(out_h, 1)
+    win_w = min(float(src_w), src_h * aspect)
+    win_h = win_w / aspect
+    left = min(_track_mean_x(track) - _track_mean_width(track) * 0.7
+               for track in tracks) * src_w
+    right = max(_track_mean_x(track) + _track_mean_width(track) * 0.7
+                for track in tracks) * src_w
+    if right - left > win_w * TOGETHER_FILL:
+        return None
+
+    centre_x = _clamp_window((left + right) / 2, win_w, src_w)
+    # A portrait crop is normally source-height. Keeping its vertical centre
+    # steady preserves the table, microphones and body language that make a
+    # genuine two-person frame worth choosing over a manufactured split.
+    centre_y = _clamp_window(src_h / 2, win_h, src_h)
+    return {
+        "rect": (0.0, 0.0, 1.0, 1.0),
+        "win": (int(win_w), int(win_h)),
+        "keys": [(start, centre_x, centre_y), (end, centre_x, centre_y)],
+    }
+
+
+def tile_window(track, rect, region, src_w, src_h, out_w, out_h):
+    """Crop one participant into one output tile.
+
+    The horizontal ownership region is the important guardrail: even when two
+    crop windows are drawn from the same source frame, one cannot drift over and
+    show the neighbouring participant again. This is what prevents duplicated
+    faces and edge fragments in split layouts.
+    """
+    _, _, rect_w, rect_h = rect
+    tile_w = out_w * rect_w
+    tile_h = out_h * rect_h
+    aspect = tile_w / max(tile_h, 1)
+
+    face_h = sum(p[4] for p in track["points"]) / len(track["points"]) * src_h
+    low, high = region
+    desired_w = min(src_w, src_h * aspect)
+    # Do not cross the midpoint between participants. A little more height than
+    # the face keeps shoulders, hands and microphone in frame instead of making
+    # the result look like a webcam crop.
+    region_w = max(2.0, high - low)
+    win_w = min(desired_w, region_w)
+    win_h = win_w / aspect
+    min_h = min(src_h, face_h * 2.5)
+    if win_h < min_h:
+        win_w = min(src_w, region_w, min_h * aspect)
+        win_h = win_w / aspect
+    if win_h > src_h:
+        win_h = src_h
+        win_w = min(src_w, win_h * aspect)
+
+    xs = smooth(track["points"], key=1)
+    ys = smooth(track["points"], key=2)
+    keys = []
+    for (t, cx), (_, cy) in zip(xs, ys):
+        px, py = cx * src_w, cy * src_h
+        py += (0.5 - EYE_LINE) * win_h
+        py = max(py, face_h * (0.5 + HEAD_ROOM))
+        keys.append((
+            t,
+            _clamp_region(px, win_w, low, high, src_w),
+            _clamp_window(py, win_h, src_h),
+        ))
+    return {
+        "rect": rect,
+        "win": (int(win_w), int(win_h)),
+        "keys": keys,
+    }
+
+
+def _scene(samples, requested_count, start, end, src_w, src_h, out_w, out_h,
+           speaker_words=None):
+    """Build one visual scene, lowering confidence instead of inventing a crop."""
+    if requested_count <= 0:
+        return {"start": start, "end": end, "mode": "wide", "tiles": []}
+
+    if requested_count == 1:
+        points = primary_timeline(samples)
+        if not points:
+            return {"start": start, "end": end, "mode": "wide", "tiles": []}
+        subject = {"points": points}
+        tile = tile_window(subject, _layout_rects(1)[0], (0.0, float(src_w)),
+                           src_w, src_h, out_w, out_h)
+        return {"start": start, "end": end, "mode": "single", "tiles": [tile]}
+
+    tracks = build_tracks(samples)
+    count = min(requested_count, len(tracks), MAX_PEOPLE)
+    if count < 2:
+        return _scene(samples, 1, start, end, src_w, src_h, out_w, out_h,
+                      speaker_words)
+
+    # Keep the most persistent participants, then restore screen order. For a
+    # three-person layout, feature the largest visible participant in the wide
+    # top tile; the others stay in left-to-right order underneath.
+    tracks = sorted(tracks, key=lambda tr: len(tr["points"]), reverse=True)[:count]
+    tracks.sort(key=_track_mean_x)
+
+    if count == 2:
+        together = _together_tile(
+            tracks, start, end, src_w, src_h, out_w, out_h)
+        if together:
+            return {"start": start, "end": end,
+                    "mode": "together", "tiles": [together]}
+
+        by_area = sorted(tracks, key=_track_area)
+        area_ratio = _track_area(by_area[-1]) / max(_track_area(by_area[0]), 1e-6)
+        if (_speaker_share(speaker_words, start, end) >= REACTION_SPEECH_SHARE
+                and area_ratio >= REACTION_AREA_RATIO):
+            # Main speaker first because the first reaction rectangle is the
+            # larger top panel. The second track remains visible as context.
+            tracks = [by_area[-1], by_area[0]]
+            mode = "reaction"
+        else:
+            mode = "split"
+    elif count == 3:
+        featured = max(tracks, key=_track_area)
+        tracks = [featured] + [tr for tr in tracks if tr is not featured]
+        mode = "triple"
+    else:
+        mode = "grid"
+
+    rects = _layout_rects(count, mode)
+    regions = _participant_regions(tracks, src_w)
+    tiles = [
+        tile_window(track, rect, regions[id(track)], src_w, src_h, out_w, out_h)
+        for track, rect in zip(tracks, rects)
+    ]
+    return {"start": start, "end": end, "mode": mode, "tiles": tiles}
+
+
 def expr(keys, index, span):
     """A piecewise-linear ffmpeg expression for one crop coordinate over time.
 
@@ -396,7 +681,7 @@ def expr(keys, index, span):
     return e
 
 
-def plan(video_path, start, end, out_w, out_h):
+def plan(video_path, start, end, out_w, out_h, speaker_words=None):
     """Work out how this clip should be framed.
 
     Returns a dict the renderer can act on, or None to mean "no idea, use the
@@ -408,33 +693,34 @@ def plan(video_path, start, end, out_w, out_h):
     samples, (src_w, src_h) = detect_faces(video_path, start, end)
     if not samples or not src_w:
         return None
-    tracks = build_tracks(samples)
-    if not tracks:
+    if not any(faces for _, faces in samples):
         return None
 
-    # Stacked requires two people VISIBLE TOGETHER, not merely two tracks. The
-    # earlier version asked only for two tracks, and an edit that cuts between
-    # two angles on one speaker satisfies that -- which is how the same man
-    # ended up in both tiles at once, facing two different directions.
-    together = co_occurrence(samples)
-    if len(tracks) >= 2 and together >= MIN_CO_OCCURRENCE:
-        win_w, win_h, windows = stacked_windows(tracks, src_w, src_h, out_w, out_h)
-        mode = "stacked"
-    else:
-        # One person, or an edit that shows them one at a time. Either way the
-        # whole frame belongs to whoever is on screen -- following the dominant
-        # face per sample keeps that true across the cuts.
-        subject = {"points": primary_timeline(samples)}
-        if not subject["points"]:
-            return None
-        win_w, win_h, keys = portrait_window(subject, src_w, src_h, out_w, out_h)
-        windows, mode = [keys], "single"
+    counts = stabilize_layouts([len(faces) for _, faces in samples])
+    scenes = []
+    runs = _runs(counts)
+    for first, last, count in runs:
+        # Camera cuts happen between samples. Put the boundary halfway between
+        # the final old sample and first new one, then cover the exact clip edges.
+        scene_start = start if first == 0 else (samples[first - 1][0] + samples[first][0]) / 2
+        scene_end = end if last == len(samples) else (samples[last - 1][0] + samples[last][0]) / 2
+        scene_samples = samples[first:last]
+        built = _scene(scene_samples, count, scene_start, scene_end,
+                       src_w, src_h, out_w, out_h, speaker_words)
+        scenes.append(built)
 
-    # Detection ran against source timestamps, but the renderer seeks to `start`
-    # first, so inside the filter graph `t` is zero at the clip's first frame.
-    # Rebasing here rather than at the call site keeps the expression builder
-    # honest about what `t` means.
-    windows = [[(t - start, x, y) for t, x, y in keys] for keys in windows]
+    # Detection runs in source time while the renderer seeks to the clip start.
+    # Store one clip-relative timebase for scene boundaries and every crop key.
+    for scene in scenes:
+        scene["start"] -= start
+        scene["end"] -= start
+        for tile in scene["tiles"]:
+            tile["keys"] = [(t - start, x, y) for t, x, y in tile["keys"]]
 
-    return {"mode": mode, "src": (src_w, src_h),
-            "win": (int(win_w), int(win_h)), "windows": windows}
+    return {
+        "version": PLAN_VERSION,
+        "mode": "adaptive",
+        "src": (src_w, src_h),
+        "duration": max(0.0, end - start),
+        "scenes": scenes,
+    }

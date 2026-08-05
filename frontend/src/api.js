@@ -1,12 +1,24 @@
 export const API_BASE = "/api";
 
+/* Keep implementation failures on the server. A creator only needs the next
+   useful action, not the name of the downloader or transcription provider. */
+function friendlyMessage(status, detail, fallback) {
+  if (status === 402) return "This needs a plan with more room.";
+  if (status === 413) return "That file is larger than this plan allows.";
+  if (status >= 500) return "We couldn't finish that right now. Please try again in a moment.";
+  if (/stalled|traffic|rate.?limit|too many requests|yt-dlp|ffmpeg|deepgram|openai|api key|cookie|traceback|exception/i.test(detail)) {
+    return "That link is busy right now. Try again shortly, or upload the video file instead.";
+  }
+  return detail || fallback;
+}
+
 function authHeaders() {
   const token = localStorage.getItem("clipper_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 
-export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, tightenPauses, voice, language, template, ratio, lengthPref, intent }) {
+export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, tightenPauses, voice, language, template, captionStyle, ratio, lengthPref, intent }) {
   const resp = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -21,20 +33,13 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
       voice,
       language,
       template,
+      caption_style: captionStyle,
       ratio,
       length_pref: lengthPref,
       intent,
     }),
   });
-  if (!resp.ok) {
-    let detail = "";
-    try {
-      detail = (await resp.json()).detail || "";
-    } catch {
-      // non-JSON error body -- fall through to the generic message
-    }
-    throw new Error(detail || `Failed to submit job (${resp.status})`);
-  }
+  if (!resp.ok) throw await readError(resp, "We couldn't start that clip yet.");
   return resp.json(); // { job_id }
 }
 
@@ -123,7 +128,7 @@ export async function getTranscript(jobId) {
 export async function rerenderClip(jobId, index, start, end, opts = {}) {
   const resp = await fetch(`${API_BASE}/jobs/${jobId}/clips/${index}/rerender`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({
       start,
       end,
@@ -148,7 +153,10 @@ async function readError(resp, fallback) {
       ? body.detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
       : body.detail || "";
   } catch { /* non-JSON body */ }
-  return new Error(detail || fallback);
+  const error = new Error(friendlyMessage(resp.status, detail, fallback));
+  error.status = resp.status;
+  error.detail = detail;
+  return error;
 }
 
 export async function getPlans() {

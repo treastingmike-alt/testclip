@@ -70,8 +70,36 @@ html[data-theme="dark"] .tl-handle::after {
   color: var(--ink);
 }
 html[data-theme="dark"] .hero-badge { background: rgba(255, 255, 255, 0.04); }
-html[data-theme="dark"] .btn-primary { background: var(--ink); color: #14141a; }
-html[data-theme="dark"] .btn-primary:hover { color: #fff; }
+html[data-theme="dark"] .btn-primary {
+  background: var(--grad-accent);
+  color: #fff;
+  box-shadow: 0 16px 34px -16px rgba(79, 70, 229, 0.72);
+}
+html[data-theme="dark"] .btn-primary:hover {
+  background: linear-gradient(100deg, #8b5cf6 0%, #6366f1 60%, #4f46e5 100%);
+  color: #fff;
+  box-shadow: 0 20px 40px -16px rgba(79, 70, 229, 0.82);
+}
+/* The source action is the product's primary moment. It keeps its violet
+   identity in either theme instead of inheriting the generic dark button. */
+.source-continue:not(:disabled) {
+  background: var(--grad-accent);
+  color: #fff;
+  box-shadow: 0 16px 34px -16px rgba(79, 70, 229, 0.72);
+}
+.source-continue:not(:disabled):hover {
+  background: linear-gradient(100deg, #8b5cf6 0%, #6366f1 60%, #4f46e5 100%);
+  color: #fff;
+  box-shadow: 0 20px 40px -16px rgba(79, 70, 229, 0.82);
+}
+html[data-theme="dark"] .source-continue:not(:disabled),
+html[data-theme="dark"] .source-continue:not(:disabled):hover { color: #fff; }
+.source-continue:disabled,
+html[data-theme="dark"] .source-continue:disabled {
+  background: color-mix(in srgb, var(--surface) 80%, var(--track));
+  color: var(--ink-faint);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
 html[data-theme="dark"] .source-tabs { background: rgba(255, 255, 255, 0.045); }
 html[data-theme="dark"] .source-tabs .tab-thumb { background: var(--ink); }
 html[data-theme="dark"] .source-tabs button.on { color: #14141a; }
@@ -91,6 +119,7 @@ html[data-theme="dark"] .urlbar {
    each becomes the same translucent white wash rather than ten new colours. */
 html[data-theme="dark"] .topup,
 html[data-theme="dark"] .billing-toggle,
+html[data-theme="dark"] .source-limit,
 html[data-theme="dark"] .tl-track,
 html[data-theme="dark"] .lang-warn,
 html[data-theme="dark"] .font-flag {
@@ -123,6 +152,8 @@ html[data-theme="dark"] .chip select {
   color: var(--ink);
 }
 html[data-theme="dark"] select option { background: var(--surface); color: var(--ink); }
+html[data-theme="dark"] .credit-tier-grid button { background: rgba(255, 255, 255, 0.025); }
+html[data-theme="dark"] .credit-tier-grid button.selected { background: var(--violet); color: #fff; }
 /* Enough opacity that the pill stays a pill when backdrop-filter is
    unavailable -- at 0.72 the page ran straight through it. */
 html[data-theme="dark"] .nav-wrap.scrolled .nav-pill { background: rgba(19, 19, 24, 0.92); }

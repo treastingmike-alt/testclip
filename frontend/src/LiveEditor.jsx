@@ -140,7 +140,7 @@ const SECTIONS = [
   { id: "brand",    name: "Brand",    icon: "◎",
     desc: "Logo, handle and overlays" },
   { id: "video",    name: "Video",    icon: "▶",
-    desc: "Speed, audio and more" },
+    desc: "Speed, pacing and audio" },
 ];
 
 /* Mirrors pipeline/overlays.SAFE_* -- the bands Reels/TikTok/Shorts cover with
@@ -152,6 +152,7 @@ const CONTEXT = 30;
 // Mirrors backend pipeline/pacing.py. The editor cannot honestly preview a
 // clip with pauses removed unless it uses the same speech map the renderer uses.
 const TIGHTEN_MAX_PAUSE = 0.35;
+const PODCAST_TIGHTEN_MAX_PAUSE = 1.5;
 const TIGHTEN_HEAD_PAD = 0.08;
 const TIGHTEN_TAIL_PAD = 0.12;
 const TIGHTEN_MIN_SEGMENT = 0.20;
@@ -192,7 +193,7 @@ function wordsForRange(utterances, start, end, lineEdits = {}) {
   return out.sort((a, b) => a.start - b.start);
 }
 
-function planTightSegments(words, clipStart, clipEnd) {
+function planTightSegments(words, clipStart, clipEnd, maxPause = TIGHTEN_MAX_PAUSE) {
   if (!words.length) return [];
 
   const raw = [];
@@ -200,7 +201,7 @@ function planTightSegments(words, clipStart, clipEnd) {
   let prevEnd = words[0].end;
 
   for (const word of words.slice(1)) {
-    if (word.start - prevEnd > TIGHTEN_MAX_PAUSE) {
+    if (word.start - prevEnd > maxPause) {
       raw.push([Math.max(0, segStart), prevEnd + TIGHTEN_TAIL_PAD]);
       segStart = word.start - TIGHTEN_HEAD_PAD;
     }
@@ -222,7 +223,8 @@ function planTightSegments(words, clipStart, clipEnd) {
   return merged;
 }
 
-function buildTimelineMap(transcript, start, end, lineEdits, tighten) {
+function buildTimelineMap(transcript, start, end, lineEdits, tighten,
+                          maxPause = TIGHTEN_MAX_PAUSE) {
   const sourceDuration = Math.max(end - start, 0.001);
   const base = {
     active: false,
@@ -235,7 +237,7 @@ function buildTimelineMap(transcript, start, end, lineEdits, tighten) {
   };
   if (!tighten || !transcript?.utterances?.length || !base.words.length) return base;
 
-  const planned = planTightSegments(base.words, start, end);
+  const planned = planTightSegments(base.words, start, end, maxPause);
   const kept = planned.reduce((sum, [s, e]) => sum + e - s, 0);
   const removed = Math.max(0, sourceDuration - kept);
   if (!planned.length || removed < TIGHTEN_MIN_REMOVED) return base;
@@ -326,7 +328,10 @@ function ColourRow({ value, fallback, onChange, testid }) {
  * is only rendered when the user exports, which is the one operation that costs
  * real time.
  */
-export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
+export default function LiveEditor({
+  job, clip, index, onClose, onSaved, onUpgrade, canEditCaptions = false,
+  canTightenPauses = false,
+}) {
   const [transcript, setTranscript] = useState(null);
   const [loadError, setLoadError] = useState("");
   /* The proxy builds in parallel with the clips, so the editor can open before
@@ -361,7 +366,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     start: initial.start ?? clip.start,
     end: initial.end ?? clip.end,
     ratio: initial.ratio || job.options?.ratio || "9:16",
-    capStyle: initial.caption_style || "classic",
+    capStyle: initial.caption_style || job.options?.caption_style || "classic",
     capFont: initial.caption_font ?? null,
     capSize: initial.caption_size ?? null,       // null = the style's own size
     capPos: initial.caption_pos ?? null,         // null = automatic placement
@@ -374,13 +379,15 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     /* Captions off is a real editing decision, not an absence: plenty of clips
        are posted with the platform's own captions or none at all, and until now
        the only way to get one was to re-run the whole job. */
-    capOn: initial.captions_on !== false,
+    capOn: initial.captions_on ?? (job.options?.burn_subtitles !== false),
     translateTo: initial.translate_to ?? null,
     title: clip.title || "",
     titleStyle: initial.title_style || "plate",
     titleFont: initial.title_font ?? null,
     speed: initial.speed ?? 1,
     speedPitched: Boolean(initial.speed_pitched),
+    tightenPauses: Boolean(canTightenPauses &&
+      (initial.tighten_pauses ?? (job.options?.tighten_pauses === true))),
     background: initial.background || "black",
     overlayList: initial.overlays || [],
     lineEdits: {},
@@ -391,7 +398,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const {
     start, end, ratio, capStyle, capFont, capSize, capPos, capAnim,
     capColor, capActive, capOn,
-    translateTo, title, titleStyle, titleFont, speed, speedPitched, background,
+    translateTo, title, titleStyle, titleFont, speed, speedPitched, tightenPauses,
+    background,
     overlayList, lineEdits,
   } = doc;
 
@@ -435,6 +443,8 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const setTitleFont = (v) => history.apply({ titleFont: v }, { discrete: true });
   const setSpeed = (v) => history.apply({ speed: v }, { discrete: true });
   const setSpeedPitched = (v) => history.apply({ speedPitched: v }, { discrete: true });
+  const setTightenPauses = (v) =>
+    history.apply({ tightenPauses: v }, { discrete: true });
   const setBackground = (v) => history.apply({ background: v }, { discrete: true });
   const setLineEdits = (v, opts = { discrete: true }) =>
     history.apply((p) => ({ ...p, lineEdits: typeof v === "function" ? v(p.lineEdits) : v }),
@@ -513,6 +523,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
   const videoRef = useRef(null);
   const gameplayRef = useRef(null);
   const blurRef = useRef(null);
+  const podcastTileRefs = useRef([]);
   const trackRef = useRef(null);
   const saveTimer = useRef(null);
 
@@ -530,7 +541,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
      mirrors the renderer: off means pitch rides with speed (the meme effect),
      on means atempo-style natural pitch. */
   useEffect(() => {
-    for (const el of [videoRef.current, gameplayRef.current]) {
+    for (const el of [videoRef.current, gameplayRef.current, ...podcastTileRefs.current]) {
       if (!el) continue;
       el.playbackRate = speed || 1;
       el.preservesPitch = !speedPitched;
@@ -622,19 +633,37 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
      clip.start -- not the trim start, which moves as the handles move and would
      slide the preview onto the wrong keyframe the moment anyone trimmed. */
   const smartT = Math.max(0, now - clip.start);
-  const smartTop = smartFrame ? windowAt(smartFrame.windows[0], smartT) : null;
-  const smartBottom = smartFrame && smartFrame.windows[1]
-    ? windowAt(smartFrame.windows[1], smartT) : null;
+  const smartScene = smartFrame?.mode === "adaptive"
+    ? (smartFrame.scenes || []).find((scene, i, all) => (
+        smartT >= scene.start && (smartT < scene.end || i === all.length - 1)
+      ))
+    : null;
+  const smartTiles = smartScene
+    ? (smartScene.tiles || [])
+    : smartFrame?.windows?.map((keys) => ({
+        rect: smartFrame.mode === "stacked"
+          ? [0, keys === smartFrame.windows[0] ? 0 : 0.5, 1, 0.5]
+          : [0, 0, 1, 1],
+        win: smartFrame.win,
+        keys,
+      })) || [];
+  const visibleSmartTiles = smartTiles
+    .map((tile) => ({ ...tile, point: windowAt(tile.keys, smartT) }))
+    .filter((tile) => tile.point);
 
   /* The blurred backdrop is a second decode of the same file, so it has to be
      told where the playhead is. Exact frame-lock is unnecessary -- it is
      blurred at sigma 12 in the export and reads as wallpaper either way. */
   useEffect(() => {
-    const bg = blurRef.current, v = videoRef.current;
-    if (!bg || !v) return;
-    if (Math.abs(bg.currentTime - v.currentTime) > 0.25) bg.currentTime = v.currentTime;
-    bg.playbackRate = speed || 1;
-    if (playing) bg.play().catch(() => {}); else bg.pause();
+    const v = videoRef.current;
+    if (!v) return;
+    const peers = [blurRef.current, ...podcastTileRefs.current]
+      .filter((el, i, all) => el && el !== v && all.indexOf(el) === i);
+    for (const peer of peers) {
+      if (Math.abs(peer.currentTime - v.currentTime) > 0.25) peer.currentTime = v.currentTime;
+      peer.playbackRate = speed || 1;
+      if (playing) peer.play().catch(() => {}); else peer.pause();
+    }
   }, [now, playing, speed]);
 
   useEffect(() => {
@@ -653,15 +682,27 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     return { from: Math.max(0, clip.start - CONTEXT), to: Math.min(total, clip.end + CONTEXT) };
   }, [transcript, clip.start, clip.end]);
 
-  const tightenPauses = job.options?.tighten_pauses !== false;
+  const tightenMaxPause = job.options?.template === "podcast"
+    ? PODCAST_TIGHTEN_MAX_PAUSE : TIGHTEN_MAX_PAUSE;
   const viewMap = useMemo(
-    () => buildTimelineMap(transcript, view.from, view.to, lineEdits, tightenPauses),
-    [transcript, view.from, view.to, lineEdits, tightenPauses],
+    () => buildTimelineMap(
+      transcript, view.from, view.to, lineEdits, tightenPauses, tightenMaxPause),
+    [transcript, view.from, view.to, lineEdits, tightenPauses, tightenMaxPause],
   );
   const clipMap = useMemo(
-    () => buildTimelineMap(transcript, start, end, lineEdits, tightenPauses),
-    [transcript, start, end, lineEdits, tightenPauses],
+    () => buildTimelineMap(
+      transcript, start, end, lineEdits, tightenPauses, tightenMaxPause),
+    [transcript, start, end, lineEdits, tightenPauses, tightenMaxPause],
   );
+  const tightClipMap = useMemo(
+    () => buildTimelineMap(
+      transcript, start, end, lineEdits, true, tightenMaxPause),
+    [transcript, start, end, lineEdits, tightenMaxPause],
+  );
+  const tightenedSeconds = tightClipMap.active
+    ? Math.max(0, (end - start) - tightClipMap.duration)
+    : 0;
+  const tighteningAvailable = canTightenPauses && tightClipMap.active;
   const span = Math.max(viewMap.duration, 0.001);
   const pct = (t) => (viewMap.sourceToOutput(t) / span) * 100;
   const clipNow = clipMap.sourceToOutput(now);
@@ -715,6 +756,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         caption_font: capFont,
         caption_size: capSize,
         caption_pos: capPos,
+        caption_color: capColor,
+        caption_active_color: capActive,
+        captions_on: capOn,
         translate_to: translateTo,
         title: title.trim() || null,
         title_style: titleStyle,
@@ -722,6 +766,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         caption_anim: capAnim,
         speed,
         speed_pitched: speedPitched,
+        tighten_pauses: tightenPauses,
         background,
         lines: Object.keys(lineEdits).length ? lines : null,
         overlays: overlayList.length ? overlayList : null,
@@ -883,6 +928,9 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
     v.currentTime = toProxy(t);
     setNow(t);
     if (blurRef.current) blurRef.current.currentTime = toProxy(t);
+    for (const peer of podcastTileRefs.current) {
+      if (peer) peer.currentTime = toProxy(t);
+    }
   }
 
   function seekClipTime(t) {
@@ -900,9 +948,11 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         setNow(clipMap.outputToSource(0));
       }
       v.play(); g?.play().catch(() => {});
+      for (const peer of podcastTileRefs.current) peer?.play().catch(() => {});
       setPlaying(true);
     } else {
       v.pause(); g?.pause();
+      for (const peer of podcastTileRefs.current) peer?.pause();
       setPlaying(false);
     }
   }
@@ -928,14 +978,15 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         e.preventDefault();
         seek(Math.min(end, now + step));
       } else if (e.key.toLowerCase() === "c") {
-        setCapOn(!capOn);
+        if (canEditCaptions) setCapOn(!capOn);
+        else onUpgrade?.("caption_editing");
       } else if (e.key === "Escape") {
         onClose();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [now, start, end, capOn, playing, clipMap]);
+  }, [now, start, end, capOn, playing, clipMap, canEditCaptions, onUpgrade]);
 
   async function doExport() {
     setExporting(true);
@@ -952,8 +1003,12 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         detail: "Your edit is baked into the file and ready to download.",
         tone: "success" });
     } catch (e) {
-      setExportError(e.message);
-      toast("Export failed", { detail: e.message, tone: "error" });
+      if (e.status === 402) {
+        onUpgrade?.();
+      } else {
+        setExportError(e.message);
+        toast("We couldn't export that edit", { detail: e.message, tone: "error" });
+      }
     } finally {
       setExporting(false);
     }
@@ -1114,50 +1169,34 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                     aria-hidden="true"
                   />
                 </div>
-              ) : smartFrame && smartTop ? (
-                /* Face-aware podcast. The renderer crops to the people and
-                   fills the canvas, so there is no blurred backdrop and no
-                   letterbox to draw -- previewing those was showing a layout
-                   the exported clip is not in. */
-                smartFrame.mode === "stacked" && smartBottom ? (
-                  <>
-                    <div className="stage-tile" style={{ top: 0 }}>
-                      <video
-                        ref={videoRef}
-                        src={proxySrc}
-                        playsInline preload="auto"
-                        onClick={togglePlay}
-                        onLoadedMetadata={onMeta}
-                        style={cropStyle(smartFrame.win[0], smartFrame.win[1],
-                                         smartTop.cx, smartTop.cy, planW, planH)}
-                      />
-                    </div>
-                    <div className="stage-tile" style={{ top: "50%" }}>
-                      {/* Second decode of the same file for the lower speaker,
-                          kept in step by the same effect that drives the blur
-                          layer. Muted so the audio is not doubled. */}
-                      <video
-                        ref={blurRef}
-                        src={proxySrc}
-                        playsInline muted preload="auto" aria-hidden="true"
-                        style={cropStyle(smartFrame.win[0], smartFrame.win[1],
-                                         smartBottom.cx, smartBottom.cy, planW, planH)}
-                      />
-                    </div>
-                  </>
-                ) : (
-                  <div className="stage-tile" style={{ top: 0, height: "100%" }}>
-                    <video
-                      ref={videoRef}
-                      src={proxySrc}
-                      playsInline preload="auto"
-                      onClick={togglePlay}
-                      onLoadedMetadata={onMeta}
-                      style={cropStyle(smartFrame.win[0], smartFrame.win[1],
-                                       smartTop.cx, smartTop.cy, planW, planH)}
-                    />
-                  </div>
-                )
+              ) : smartFrame && visibleSmartTiles.length ? (
+                /* Camera-aware podcast. One face fills the frame; simultaneous
+                   participants get a familiar split/grid. Every tile is another
+                   view of the same proxy and is kept frame-locked above. */
+                <>
+                  {visibleSmartTiles.map((tile, tileIndex) => {
+                    const [x, y, w, h] = tile.rect;
+                    return (
+                      <div key={`${smartScene?.start ?? 0}-${tileIndex}`}
+                           className="stage-tile"
+                           style={{ left: `${x * 100}%`, top: `${y * 100}%`,
+                                    width: `${w * 100}%`, height: `${h * 100}%` }}>
+                        <video
+                          ref={tileIndex === 0
+                            ? videoRef
+                            : (el) => { podcastTileRefs.current[tileIndex - 1] = el; }}
+                          src={proxySrc}
+                          playsInline muted={tileIndex > 0} preload="auto"
+                          aria-hidden={tileIndex > 0 ? "true" : undefined}
+                          onClick={togglePlay}
+                          onLoadedMetadata={tileIndex === 0 ? onMeta : undefined}
+                          style={cropStyle(tile.win[0], tile.win[1],
+                                           tile.point.cx, tile.point.cy, planW, planH)}
+                        />
+                      </div>
+                    );
+                  })}
+                </>
               ) : (
                 <>
                   {/* The default frame is a blurred copy of the source behind
@@ -1225,8 +1264,12 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
                   style={capPos !== null
                     ? { top: `${capPos * 100}%`, bottom: "auto", transform: "translateY(-50%)" }
                     : undefined}
-                  onMouseDown={(e) => { e.stopPropagation(); setDragCaption(true); }}
-                  title="Drag to move captions"
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    if (canEditCaptions) setDragCaption(true);
+                    else onUpgrade?.("caption_editing");
+                  }}
+                  title={canEditCaptions ? "Drag to move captions" : "Upgrade to edit captions"}
                 >
                   <span
                     key={cue.words.join(" ")}
@@ -1390,7 +1433,18 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
           {/* The transcript belongs to Captions: it is where caption TEXT is
               edited, and it doubles as a scrubber. Showing it under Brand or
               Video was just noise between you and the control you came for. */}
-          {section === "captions" && (
+          {section === "captions" && !canEditCaptions && (
+          <div className="caption-editor-lock">
+            <span className="caption-editor-lock-badge">Creator</span>
+            <h3>Your chosen captions are already applied.</h3>
+            <p>Upgrade to change the words, style, colours, size, language or position in the editor.</p>
+            <button className="btn btn-primary btn-sm" onClick={() => onUpgrade?.("caption_editing")}>
+              View plans
+            </button>
+          </div>
+          )}
+
+          {section === "captions" && canEditCaptions && (
           <div className="live-transcript">
             {loadError && <div className="editor-error">{loadError}</div>}
             {!transcript && !loadError && <div className="editor-loading">Loading…</div>}
@@ -1429,7 +1483,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </div>
         )}
 
-        {section === "captions" && (
+        {section === "captions" && canEditCaptions && (
         <div className="live-controls">
           <div className="ctl ctl-block">
             <div className="cap-onoff">
@@ -1452,7 +1506,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </div>
         )}
 
-        {section === "captions" && capOn && (
+        {section === "captions" && canEditCaptions && capOn && (
         <div className="live-controls">
           <div className="ctl ctl-block">
             <span className="ctl-label">Caption style</span>
@@ -1466,7 +1520,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
             design (size, casing, cadence, how the spoken word is marked), and
             people want that design in their own colours rather than a new
             preset per palette. */}
-        {section === "captions" && capOn && (
+        {section === "captions" && canEditCaptions && capOn && (
         <div className="live-controls">
           <div className="ctl">
             <span className="ctl-label">Text colour</span>
@@ -1481,7 +1535,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </div>
         )}
 
-        {section === "captions" && !capOn && (
+        {section === "captions" && canEditCaptions && !capOn && (
           <p className="captions-off-note">
             Caption styling is hidden while captions are off. The transcript
             above still drives the cut, so trims stay word-accurate.
@@ -1491,7 +1545,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         {/* The title is its own design decision, not a second caption -- a
             white plate is right for a talking-head clip and wrong for a gaming
             one, so the look and the typeface are both choices here. */}
-        {section === "captions" && (
+        {section === "captions" && canEditCaptions && (
         <div className="live-controls">
           <div className="ctl">
             <span className="ctl-label">Title look</span>
@@ -1537,7 +1591,7 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
         </div>
         )}
 
-        {section === "captions" && capOn && (
+        {section === "captions" && canEditCaptions && capOn && (
         <div className="live-controls type-bar">
           <div className="ctl">
             <span className="ctl-label">Font</span>
@@ -1572,6 +1626,39 @@ export default function LiveEditor({ job, clip, index, onClose, onSaved }) {
 
         {section === "video" && (
         <div className="live-controls">
+          <div className="ctl ctl-block pacing-control">
+            <div className="pacing-copy">
+              <span className="ctl-label">Pacing</span>
+              <span className="ctl-hint">
+                {!tightClipMap.active
+                  ? "No long pauses found in this clip"
+                  : tightenPauses
+                  ? `${tightenedSeconds.toFixed(1)}s of dead air removed`
+                  : `${tightenedSeconds.toFixed(1)}s of removable dead air`}
+              </span>
+            </div>
+            <div className="pacing-segment" role="group" aria-label="Clip pacing">
+              <button type="button" className={!tightenPauses ? "on" : ""}
+                      aria-pressed={!tightenPauses}
+                      onClick={() => setTightenPauses(false)}>
+                Original
+              </button>
+              <button type="button"
+                      className={`${tightenPauses ? "on" : ""} ${canTightenPauses ? "" : "locked"} ${canTightenPauses && !tightClipMap.active ? "unavailable" : ""}`}
+                      aria-pressed={tightenPauses}
+                      aria-disabled={!tighteningAvailable}
+                      title={canTightenPauses && !tightClipMap.active
+                        ? "This clip has no long pauses to remove"
+                        : undefined}
+                      onClick={() => {
+                        if (tighteningAvailable) setTightenPauses(true);
+                        else if (!canTightenPauses) onUpgrade?.("tighten_pauses");
+                      }}>
+                Tight
+                {!canTightenPauses && <span className="pacing-plan">Creator</span>}
+              </button>
+            </div>
+          </div>
           <div className="ctl">
             <span className="ctl-label">Speed</span>
             {[0.5, 0.75, 1, 1.25, 1.5, 2].map((sp) => (

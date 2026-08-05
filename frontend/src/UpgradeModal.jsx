@@ -9,29 +9,34 @@ import { createPortal } from "react-dom";
  * what they would be buying.
  */
 
-const UNLOCKS = [
-  ["gameplay", "Gameplay split-screen", "Pairs your clip with looping footage down the frame"],
-  ["tighten_pauses", "Pause tightening", "Cuts the dead air so a clip feels edited, not trimmed"],
-  ["multilingual", "Mixed-language captions", "Follows speech that switches language mid-sentence"],
-  ["no_watermark", "No watermark", "Free clips carry a small credit at the foot of the frame"],
-  ["share_pages", "Share pages", "Publish a clip with its score breakdown on its own page"],
-  ["branding", "Your own logo", "Burn a handle or logo into every clip"],
-  ["priority", "Priority rendering", "Your jobs go ahead of the free queue"],
-];
-
-const REASONS = {
-  clips: "More clips per video",
-  gameplay: "Gameplay split-screen",
-  tighten_pauses: "Pause tightening",
-  multilingual: "Mixed-language captions",
-  share_pages: "Share pages",
-  no_watermark: "Watermark-free clips",
-  branding: "Custom branding",
-  length: "Longer source videos",
-  upload: "Bigger uploads",
+const COPY = {
+  length: {
+    title: "Upgrade to process this video.",
+    body: (limits) => `Free supports videos up to ${limits?.max_source_minutes ?? 15} minutes. Creator supports longer videos and includes 100 finished clips each month.`,
+  },
+  upload: {
+    title: "Upgrade to upload this file.",
+    body: () => "Creator gives you more upload room and includes 100 finished clips each month.",
+  },
+  clips: {
+    title: "Upgrade to make more clips.",
+    body: (limits) => `Free includes up to ${limits?.max_clips ?? 2} clips from one video. Creator includes 100 finished clips each month.`,
+  },
+  gameplay: { title: "Upgrade for gameplay split-screen.", body: () => "Unlock this layout plus 100 finished clips each month with Creator." },
+  tighten_pauses: { title: "Upgrade to tighten pauses automatically.", body: () => "Remove dead air automatically and get 100 finished clips each month with Creator." },
+  multilingual: { title: "Upgrade for mixed-language captions.", body: () => "Caption speech that switches languages and get 100 finished clips each month with Creator." },
+  share_pages: { title: "Upgrade to publish a share page.", body: () => "Publish clips on their own pages and get 100 finished clips each month with Creator." },
+  no_watermark: { title: "Upgrade for watermark-free clips.", body: () => "Remove the KlipCut credit and get 100 finished clips each month with Creator." },
+  branding: { title: "Upgrade to add your branding.", body: () => "Add your logo or handle and get 100 finished clips each month with Creator." },
+  caption_editing: { title: "Upgrade to edit captions.", body: () => "Change caption words, style, colour, size and position, plus get 100 finished clips each month with Creator." },
+  editor_export: { title: "Upgrade to export more edits.", body: () => "Free includes one edited export. Creator gives you unlimited edited exports plus 100 finished clips each month." },
 };
 
 export default function UpgradeModal({ reason, limits, onClose, onSeePlans }) {
+  const copy = COPY[reason] || {
+    title: "Upgrade to unlock this option.",
+    body: () => "Creator includes 100 finished clips each month.",
+  };
   return createPortal(
     <div className="upgrade-veil" onClick={onClose} data-testid="upgrade-modal">
       <div className="upgrade-card" onClick={(e) => e.stopPropagation()}
@@ -39,44 +44,21 @@ export default function UpgradeModal({ reason, limits, onClose, onSeePlans }) {
         <button className="upgrade-x" onClick={onClose} aria-label="Close"
                 data-testid="upgrade-close">×</button>
 
-        <span className="upgrade-eyebrow">Creator plan</span>
-        <h3 id="upgrade-title">
-          {reason && REASONS[reason]
-            ? <>{REASONS[reason]} is part of Creator.</>
-            : <>Room to actually post every day.</>}
-        </h3>
-        <p className="upgrade-sub">
-          Free gives you {limits?.max_clips ?? 2} clips per video on sources up to{" "}
-          {limits?.max_source_minutes ?? 30} minutes. Creator lifts all of that and
-          turns on the parts of the editor that do the most work.
-        </p>
-
-        <ul className="upgrade-list">
-          {UNLOCKS.map(([id, name, note]) => (
-            <li key={id} className={reason === id ? "hit" : ""}>
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" aria-hidden="true">
-                <path d="m5 13 4 4L19 7" stroke="currentColor" strokeWidth="2.6"
-                      strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              <span>
-                <strong>{name}</strong>
-                <em>{note}</em>
-              </span>
-            </li>
-          ))}
-        </ul>
+        <span className="upgrade-eyebrow">Creator · 100 clips/month</span>
+        <h3 id="upgrade-title">{copy.title}</h3>
+        <p className="upgrade-sub">{copy.body(limits)}</p>
 
         <div className="upgrade-actions">
           <button className="btn btn-ghost btn-sm" onClick={onClose}
                   data-testid="upgrade-later">
-            Keep the free plan
+            Not now
           </button>
           <button className="btn btn-primary btn-shine" onClick={onSeePlans}
                   data-testid="upgrade-see-plans">
-            See plans and pricing
+            View plans
           </button>
         </div>
-        <p className="upgrade-foot">Nothing changes on your account until you choose a plan.</p>
+        <p className="upgrade-foot">You will review the price before confirming.</p>
       </div>
     </div>,
     document.body,
