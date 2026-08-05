@@ -56,9 +56,22 @@ def create_checkout_session(product, user_id: str, email: str) -> str | None:
     lands in the CHECKOUT SESSION's metadata; relying on it surviving into the
     order is a guess. Setting metadata directly removes the guess.
     """
-    client = _client()
-    if not client or not product or not product.product_id:
+    if not product or not product.product_id:
         return None
+
+    client = _client()
+    if not client:
+        # Say so, once per checkout. Falling back silently is how a deployment
+        # ends up quietly selling through the static link -- payment succeeds,
+        # nobody returns to the app, and no credits are granted, with nothing
+        # in the logs to explain any of it.
+        print("[clipper] POLAR_ACCESS_TOKEN is not set: falling back to the "
+              "static checkout link. Payments will complete on Polar's own "
+              "page with no redirect back and no reference_id for fulfillment.")
+        return None
+    if not APP_ORIGIN:
+        print("[clipper] CLIPPER_APP_ORIGIN is not set: the buyer will not be "
+              "redirected back after paying.")
 
     payload = {
         "products": [product.product_id],

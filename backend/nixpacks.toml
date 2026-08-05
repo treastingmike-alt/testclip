@@ -1,0 +1,17 @@
+# Railway builds this service with Nixpacks, which installs Python packages from
+# requirements.txt and nothing else. Two things this app runs are not Python
+# packages, so without this file they are simply absent in the container:
+#
+#   ffmpeg / ffprobe -- every render, every proxy, every thumbnail
+#                       (app/pipeline/render.py, editing.py, workspace.py)
+#
+# The failure is quiet and misleading. A missing executable makes subprocess
+# raise immediately, so requests come back as fast errors that look like
+# validation problems rather than a broken environment -- the link preview
+# returned 400 in ~5ms, far too quick to have contacted anything.
+#
+# `...` keeps whatever Nixpacks detected on its own (Python, pip) and appends
+# to it rather than replacing the list.
+
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]

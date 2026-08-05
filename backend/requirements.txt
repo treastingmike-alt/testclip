@@ -24,5 +24,16 @@ python-jose==3.5.0
 requests==2.32.5
 uvicorn==0.39.0
 psycopg2-binary>=2.9
-#this is the new file
+
+# Fetches source video and its metadata (app/pipeline/downloader.py shells out
+# to the `yt-dlp` binary this package installs).
+#
+# It was missing here and present locally only because Homebrew had it, so the
+# link preview worked on a laptop and returned 400 in about 5ms on the server --
+# too fast to be a network failure, because the executable simply was not there.
+#
+# Unpinned on purpose: extractors break whenever a video site changes, and the
+# fix always arrives as a new yt-dlp release. A pin here becomes an outage
+# later.
+yt-dlp
 
