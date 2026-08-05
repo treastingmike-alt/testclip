@@ -24,3 +24,5 @@ python-jose==3.5.0
 requests==2.32.5
 uvicorn==0.39.0
 
+#this is the new file
+
