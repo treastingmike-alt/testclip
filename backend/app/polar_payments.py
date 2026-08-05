@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 
 from sqlalchemy.exc import IntegrityError
 
@@ -30,10 +31,27 @@ POLAR_SERVER = os.environ.get("POLAR_SERVER", "production").strip() or "producti
 APP_ORIGIN = os.environ.get("CLIPPER_APP_ORIGIN", "").strip().rstrip("/")
 
 
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                   r"[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
 def _client():
     token = os.environ.get("POLAR_ACCESS_TOKEN", "").strip()
     if not token:
         return None
+
+    # An easy and very confusing mistake: Polar shows the Organization
+    # IDENTIFIER prominently on the settings page, while the access token lives
+    # further down under Developers. Paste the wrong one and everything looks
+    # configured -- the client constructs happily and only fails later, inside
+    # an API call, where the failure is swallowed and checkout quietly reverts
+    # to the static link. Tokens are not UUIDs, so this is worth saying loudly.
+    if _UUID.match(token):
+        print("[clipper] POLAR_ACCESS_TOKEN looks like a UUID, which is the "
+              "shape of your Polar ORGANIZATION ID, not an access token. "
+              "Create one at Polar > Settings > Developers > New Token "
+              "(sandbox and production tokens are separate).")
+
     try:
         from polar_sdk import Polar
     except ImportError as exc:

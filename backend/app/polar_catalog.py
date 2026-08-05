@@ -56,8 +56,8 @@ def _topup(credits: int, checkout_url: str = "",
 # Example configured product:
 PRODUCTS = (
     _subscription("creator", 500, "monthly",
-                  checkout_url="https://sandbox-api.polar.sh/v1/checkout-links/polar_cl_QF8xtQiyLWwVLzIHNwOVy35Vf0IWUjT5QjwNB2vNFNY/redirect",
-                  product_id="2915df55-c401-4ebf-ba90-cef81290199d"),
+                  checkout_url="https://sandbox-api.polar.sh/v1/checkout-links/polar_cl_nLHCZTAf9FXRxjFjra0irLFYxoxSILCb1cQEW4QenX1/redirect",
+                  product_id="ac083162-4d37-4809-9807-d69234a72cab"),
     _subscription("creator", 500, "yearly"),
     _subscription("creator", 1000, "monthly"),
     _subscription("creator", 1000, "yearly"),
