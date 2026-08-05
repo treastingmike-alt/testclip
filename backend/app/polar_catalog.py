@@ -56,7 +56,7 @@ def _topup(credits: int, checkout_url: str = "",
 # Example configured product:
 PRODUCTS = (
     _subscription("creator", 500, "monthly",
-                  checkout_url="https://sandbox.polar.sh/dashboard/klipcut/products/2915df55-c401-4ebf-ba90-cef81290199d",
+                  checkout_url="https://sandbox-api.polar.sh/v1/checkout-links/polar_cl_QF8xtQiyLWwVLzIHNwOVy35Vf0IWUjT5QjwNB2vNFNY/redirect",
                   product_id="2915df55-c401-4ebf-ba90-cef81290199d"),
     _subscription("creator", 500, "yearly"),
     _subscription("creator", 1000, "monthly"),
