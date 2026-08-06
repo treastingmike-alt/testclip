@@ -23,12 +23,13 @@ the job up. Nothing is lost either way.
 
 from app import env  # noqa: F401  -- loads .env before anything reads keys
 
+import os
 import signal
 import sys
 import time
 import traceback
 
-from app import billing, queue, runner
+from app import billing, queue, runner, storage
 from app.db import init_db
 from app.main import run_queued_job
 
@@ -41,7 +42,7 @@ def _run_and_log(job_id: str) -> None:
 # starts promptly, long enough that an idle worker is not hammering the
 # database all day. The API does not notify workers -- polling a table this
 # cheaply is simpler than a listen/notify path that has to survive reconnects.
-IDLE_SLEEP_SECONDS = float(__import__("os").environ.get("CLIPPER_WORKER_IDLE", "2"))
+IDLE_SLEEP_SECONDS = float(os.environ.get("CLIPPER_WORKER_IDLE", "2"))
 
 # How often to look for claims left behind by workers that died.
 REAP_EVERY_SECONDS = 60.0
@@ -83,7 +84,23 @@ def main() -> int:
 
     init_db()
     name = queue.worker_name()
-    print(f"[worker] {name} ready -- polling every {IDLE_SLEEP_SECONDS}s")
+
+    # Say which storage this worker can see. Without it, a worker with no R2
+    # configuration is indistinguishable from a healthy one: it starts, claims
+    # jobs, and reports "running" -- then fails every upload with a message
+    # about a missing file, because it has been looking at its own empty disk
+    # the whole time. The API says the same thing about itself in /health; the
+    # two must agree, and only comparing them shows that they do.
+    print(f"[worker] {name} ready -- polling every {IDLE_SLEEP_SECONDS}s "
+          f"| storage: {storage.driver.name}"
+          + (f" ({os.environ.get('R2_BUCKET')})"
+             if storage.driver.name != "local" else ""))
+    if storage.driver.name == "local":
+        print("[worker] *** WARNING: storage is LOCAL. This worker can only "
+              "reach files written to its own filesystem, so it will fail every "
+              "upload made by an API on another container. Set STORAGE_BACKEND=r2 "
+              "and the R2_* variables on THIS service -- they must match the API "
+              "exactly (same bucket, same account). ***")
 
     last_reap = 0.0
     while not _shutting_down:

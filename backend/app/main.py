@@ -1837,6 +1837,15 @@ def _run_pipeline_locked(job_id: str, req: JobRequest, gameplay_loops: list = No
                        progress_message="Getting your video ready...", percent=0)
             video_path = _await_uploaded_source(job_id, job_dir)
             if not video_path:
+                # Name what was actually looked for. "Upload it again" sent
+                # people to re-upload a file that had uploaded perfectly well,
+                # over and over, when the real cause was this worker reading a
+                # different storage backend than the API wrote to.
+                key = storage.job_key(job_id, "source.mp4")
+                print(f"[worker] {key!r} not found via the {storage.driver.name} "
+                      f"backend after waiting. If the API stored it elsewhere, "
+                      f"the two services disagree about STORAGE_BACKEND / "
+                      f"R2_BUCKET -- compare them.")
                 raise RuntimeError("The uploaded source video is missing. Upload it again.")
             update_job(job_id, status="downloading", progress_message="Getting your video ready...", percent=0)
             workspace.ensure_space(job_dir, os.path.getsize(video_path))
