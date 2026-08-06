@@ -72,29 +72,9 @@ def _reap() -> None:
         # These were charged when their clip count settled and never delivered.
         # The job row is already marked failed by release_stale; this returns
         # the credits, which is the part the user actually cares about.
-        _refund_abandoned(job_id)
-
-
-def _refund_abandoned(job_id: str) -> None:
-    from app.db import SessionLocal
-    from app.models import CreditLedger, Job
-    with SessionLocal() as session:
-        job = session.get(Job, job_id)
-        if not job or not job.user_id:
-            return
-        # What this job actually took, from the ledger -- not recomputed from
-        # its options, which would guess at a clip count the run never reached.
-        spent = (session.query(CreditLedger)
-                 .filter(CreditLedger.job_id == job_id,
-                         CreditLedger.delta < 0).all())
-        owed = -sum(r.delta for r in spent)
-        already_back = (session.query(CreditLedger)
-                        .filter(CreditLedger.job_id == job_id,
-                                CreditLedger.delta > 0).all())
-        owed -= sum(r.delta for r in already_back)
-    if owed > 0:
-        billing.refund(job.user_id, owed, job_id=job_id)
-        print(f"[worker] refunded {owed} credit(s) for abandoned job {job_id}")
+        given = billing.refund_job(job_id)
+        if given:
+            print(f"[worker] refunded {given} credit(s) for abandoned {job_id}")
 
 
 def main() -> int:

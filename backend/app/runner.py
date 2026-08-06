@@ -13,7 +13,7 @@ cycle. It also keeps this file testable with a stub instead of ffmpeg.
 
 import traceback
 
-from app import queue
+from app import billing, queue
 from app.jobs import update_job
 
 
@@ -32,15 +32,39 @@ def work_once(run_one, worker: str = None) -> bool:
         run_one(job_id)
         queue.complete(job_id)
     except Exception:
-        # run_pipeline handles the failures it knows about -- it records the
+        # run_pipeline handles the failures it KNOWS about -- it writes the
         # message the user sees and returns their credits. Reaching here means
-        # something it did not anticipate, and the important part is that the
-        # row does not stay claimed: a claimed row nobody is working on is a job
-        # that sits at "rendering" until the stale-claim reaper notices.
-        print(f"[worker] job {job_id} failed\n{traceback.format_exc()}")
+        # something it did not anticipate: an OOM the process survived, a
+        # dropped database connection, a failure inside its own handler.
+        #
+        # Those are properties of the moment rather than of the job, so this
+        # retries rather than giving up. It used to call queue.fail(), which is
+        # permanent -- making every transient crash a final one, and leaving
+        # the retry machinery to cover only the case where a process died too
+        # hard to reach this code at all.
+        print(f"[worker] job {job_id} crashed\n{traceback.format_exc()}")
         try:
-            update_job(job_id, status="failed",
-                       error="This job stopped unexpectedly. Please try again.")
-        finally:
-            queue.fail(job_id)
+            if queue.retry(job_id):
+                update_job(job_id, status="queued", percent=0,
+                           progress_message="Something interrupted this — retrying...")
+            else:
+                # Out of attempts. Give the money back BEFORE reporting the
+                # failure: a user who reads "we gave up" and still sees the
+                # credits gone has lost twice.
+                given = billing.refund_job(job_id)
+                if given:
+                    print(f"[worker] refunded {given} credit(s) for {job_id}")
+                update_job(
+                    job_id, status="failed",
+                    error=("This kept stopping partway through, so we've given "
+                           "up and returned your credits. Try a different video, "
+                           "or upload the file instead of using a link."))
+        except Exception:
+            # The reporting itself failed -- most likely the same database
+            # problem that caused the crash. Leave the claim in place rather
+            # than swallowing it: release_stale will pick the job up once the
+            # database is reachable again, which is the only thing that can
+            # help here anyway.
+            print(f"[worker] could not record the failure of {job_id}\n"
+                  f"{traceback.format_exc()}")
     return True

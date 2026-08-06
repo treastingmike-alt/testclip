@@ -179,6 +179,37 @@ def fail(job_id: str) -> None:
         session.commit()
 
 
+def retry(job_id: str) -> bool:
+    """Put a crashed job back on the queue. False if it is out of attempts.
+
+    This is the path for a failure the pipeline did not anticipate -- an OOM
+    that the process survived, a dropped database connection, a container being
+    replaced mid-render. Those are properties of the moment, not of the job, and
+    the same input will usually succeed on the next worker.
+
+    release_stale cannot cover this case: it only ever sees claims held by
+    processes that died too hard to report anything. A worker that catches an
+    exception and gives up permanently would have made every retryable crash
+    permanent -- which is what `fail()` was doing before this existed.
+    """
+    with SessionLocal() as session:
+        entry = (session.query(QueuedJob)
+                 .filter(QueuedJob.job_id == job_id).first())
+        if not entry:
+            return False
+        if entry.attempts >= MAX_ATTEMPTS:
+            session.delete(entry)
+            session.commit()
+            return False
+        entry.claimed_at = None
+        entry.claimed_by = None
+        # Backs off by attempt so a job that reliably kills workers does not
+        # immediately take down the next one to pick it up.
+        entry.available_at = _now() + timedelta(minutes=entry.attempts)
+        session.commit()
+        return True
+
+
 def release_stale(older_than_minutes: int = None) -> int:
     """Return abandoned claims to the queue. Returns how many.
 

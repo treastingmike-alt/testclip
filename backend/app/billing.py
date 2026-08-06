@@ -401,6 +401,36 @@ def refund(user_id: str, amount: int, job_id: str = None) -> bool:
         return True
 
 
+def refund_job(job_id: str) -> int:
+    """Return whatever a job took and never delivered. Returns the amount.
+
+    Reads the ledger rather than recomputing a price: a job that crashed part
+    way through may have been charged for a clip count the run never reached,
+    and guessing at it would refund the wrong number in one direction or the
+    other. The ledger is what actually happened.
+
+    Idempotent by construction -- existing refunds for the job are subtracted,
+    so calling it twice returns 0 the second time. That matters because the
+    crash paths that need it can overlap: the pipeline's own handler, the
+    worker's catch-all, and the stale-claim reaper can all reasonably decide a
+    job is owed money.
+    """
+    from app.models import Job
+
+    with SessionLocal() as session:
+        job = session.get(Job, job_id)
+        if not job or not job.user_id:
+            return 0
+        user_id = job.user_id
+        rows = (session.query(CreditLedger)
+                .filter(CreditLedger.job_id == job_id).all())
+        # Charges are negative, refunds positive; anything left is still owed.
+        owed = -sum(r.delta for r in rows)
+    if owed <= 0:
+        return 0
+    return owed if refund(user_id, owed, job_id=job_id) else 0
+
+
 def grant_credits(user_id: str, amount: int, note: str = "purchase") -> int:
     """Adds credits for trusted internal/admin flows.
 
