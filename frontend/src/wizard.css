@@ -318,6 +318,68 @@
   color: var(--ink-faint);
 }
 
+/* Generate, plus the upload track that appears under it.
+   The rule above pushes the last .btn right, but that button is wrapped now,
+   so the wrapper has to carry the push instead -- otherwise `margin-left:auto`
+   applies to a button that already fills its parent and nothing moves. */
+.wiz-generate {
+  margin-left: auto;
+  display: grid;
+  /* Hug the contents rather than absorbing the footer's free space, so the
+     button keeps the width it has when nothing is uploading. Capped because
+     max-content alone measures the note's UNWRAPPED sentence and would stretch
+     the button to match it. */
+  width: max-content;
+  max-width: 302px;
+}
+/* The footer centres its items; once this column is taller than the other
+   controls, centring would drag the button off the shared baseline. */
+.wiz-nav { align-items: flex-start; }
+.wiz-nav > :not(.wiz-generate) { align-self: center; }
+
+.upload-progress {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  /* Wide enough for the sentence to sit on two lines at most, so the footer
+     does not jump in height as the text changes at 100%. */
+  max-width: 300px;
+}
+.upload-bar {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.upload-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--grad-accent);
+  transition: width .2s ease-out;
+}
+/* Unknown total: the browser could not size the body, so show motion rather
+   than invent a number. */
+.upload-bar[data-indeterminate] > span {
+  width: 34%;
+  animation: upload-slide 1.1s ease-in-out infinite;
+}
+@keyframes upload-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(392%); }
+}
+.upload-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-faint);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upload-bar > span { transition: none; }
+  .upload-bar[data-indeterminate] > span { animation: none; width: 100%; opacity: .5; }
+}
+
 /* ---------------- upgrade dialog ---------------- */
 .upgrade-veil {
   position: fixed;

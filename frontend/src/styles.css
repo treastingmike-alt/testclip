@@ -5253,28 +5253,20 @@ body::after {
   opacity: .72;
 }
 
-/* Generate doubles as the upload progress bar. The fill is a background layer
-   sized by --upload-pct, so the label stays put and legible over it rather
-   than being pushed around by a separate bar appearing above the footer. */
+/* Upload progress lives BESIDE the button, not inside it.
+   Filling the button itself looked plausible and wasn't: .btn-shine already
+   owns ::before for its sweep highlight, so the fill inherited its
+   skewX(-20deg) and rendered as a diagonal wedge that spilled past the pill's
+   right edge near 100%. Sharing a pseudo-element with an effect that already
+   exists is the bug; a separate track has room for a real label anyway. */
 .btn-primary[data-uploading] {
-  position: relative;
-  overflow: hidden;
-  /* Disabled dims it, but this button is doing exactly what was asked -- it
-     should read as working, not unavailable. */
+  /* Disabled dims to 45%, but this button is doing exactly what was asked --
+     it should read as working, not unavailable. */
   opacity: 1;
   cursor: progress;
 }
-.btn-primary[data-uploading]::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: var(--upload-pct, 0%);
-  background: rgba(255, 255, 255, .26);
-  transition: width .2s ease-out;
-  pointer-events: none;
-}
-/* Keeps the label above the fill. */
-.btn-primary[data-uploading] > * { position: relative; }
+/* The progress track itself lives in wizard.css, beside .wiz-nav, since its
+   layout is bound to that footer. */
 
 /* Borrows .pacing-control's two-column layout but offers a single action, not a
    choice: the watermark follows the plan, so there is no second state to

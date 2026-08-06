@@ -70,8 +70,10 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
     pushing a 500 MB file that is the difference between a progress bar and
     several silent minutes that look like a hang -- and the plan ceilings mean
     the biggest allowed upload is 4 GB, so this is the normal case, not an edge
-    one. `onProgress` receives 0..1, or null when the browser cannot tell
-    (a stream of unknown length). */
+    one. `onProgress` receives 0..1, or -1 when the browser cannot size the
+    body. Deliberately not null for that case: null is the caller's "no upload
+    in flight" signal, so reusing it would make the bar disappear mid-upload on
+    exactly the connections least able to spare the reassurance. */
 export function uploadJob(file, options, onProgress) {
   const body = new FormData();
   body.append("file", file);
@@ -83,7 +85,7 @@ export function uploadJob(file, options, onProgress) {
     for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
 
     xhr.upload.onprogress = (e) => {
-      onProgress?.(e.lengthComputable ? e.loaded / e.total : null);
+      onProgress?.(e.lengthComputable ? e.loaded / e.total : -1);
     };
     /* The bytes are gone but the server has not answered yet -- transcoding
        checks, the duration gate. Report 1 so the bar completes rather than

@@ -427,20 +427,42 @@ export default function StudioWizard({
             </svg>
           </button>
         ) : (
-          // While a file is going up, the button IS the progress bar: the fill
-          // tracks the bytes sent. A separate bar elsewhere would put the
-          // feedback somewhere other than the control just pressed.
-          <button className="btn btn-primary btn-shine" onClick={onGenerate}
-                  disabled={submitting} data-testid="wizard-generate"
-                  style={uploadPct != null
-                    ? { "--upload-pct": `${Math.round(uploadPct * 100)}%` }
-                    : undefined}
-                  data-uploading={uploadPct != null ? "" : undefined}>
-            {uploadPct != null
-              ? (uploadPct >= 1 ? "Processing..." : `Uploading ${Math.round(uploadPct * 100)}%`)
-              : submitting ? "Starting..."
-              : `Generate ${prefs.nClips} clip${prefs.nClips === 1 ? "" : "s"}`}
-          </button>
+          <div className="wiz-generate">
+            <button className="btn btn-primary btn-shine" onClick={onGenerate}
+                    disabled={submitting} data-testid="wizard-generate"
+                    data-uploading={uploadPct != null ? "" : undefined}>
+              {uploadPct == null
+                ? (submitting ? "Starting..."
+                   : `Generate ${prefs.nClips} clip${prefs.nClips === 1 ? "" : "s"}`)
+                : uploadPct >= 1 ? "Processing..."
+                /* -1 means the browser could not size the body. Running the
+                   percentage arithmetic on it would render "Uploading -100%". */
+                : uploadPct < 0 ? "Uploading..."
+                : `Uploading ${Math.round(uploadPct * 100)}%`}
+            </button>
+
+            {uploadPct != null && (
+              <div className="upload-progress" data-testid="upload-progress"
+                   role="status" aria-live="polite">
+                <div className="upload-bar"
+                     data-indeterminate={uploadPct < 0 ? "" : undefined}
+                     role="progressbar" aria-valuemin={0} aria-valuemax={100}
+                     aria-valuenow={uploadPct >= 0 ? Math.round(uploadPct * 100) : undefined}>
+                  <span style={{ width: `${Math.round(Math.max(uploadPct, 0) * 100)}%` }} />
+                </div>
+                {/* Says what governs the wait, honestly. This leg is the file
+                    leaving THIS device, so it is bound by the upstream link --
+                    not by the plan, and not by anything a faster server would
+                    help with. Blaming the plan here would be a lie that costs
+                    trust exactly when someone is watching a slow bar. */}
+                <p className="upload-note">
+                  {uploadPct >= 1
+                    ? "Upload complete — checking the video before we start."
+                    : "Sending from this device. Speed depends on your connection, not your plan."}
+                </p>
+              </div>
+            )}
+          </div>
         )}
       </footer>
     </div>
