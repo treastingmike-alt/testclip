@@ -154,4 +154,18 @@ def purge_old_jobs(storage_dir: str, max_age_hours: int = DEFAULT_MAX_AGE_HOURS)
                 session.commit()
         except Exception:
             pass
+
+        # Object storage does not expire on its own, and nothing else ever
+        # revisits these keys -- so without this, retention would delete the
+        # local scratch copy while quietly paying to store the real one until
+        # the end of time.
+        try:
+            from app import storage
+            if storage.driver.name != "local":
+                for job_id in removed_ids:
+                    storage.driver.delete_prefix(job_id)
+        except Exception as exc:
+            # Never fail a sweep over this: leaked objects cost money, a crashed
+            # sweep leaks the whole disk.
+            print(f"[clipper] storage purge failed: {exc}")
     return len(removed_ids)

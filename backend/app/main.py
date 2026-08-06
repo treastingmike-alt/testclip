@@ -25,7 +25,8 @@ from urllib.parse import urlparse
 
 from fastapi import (BackgroundTasks, Depends, FastAPI, File, Form, HTTPException,
                      Request, UploadFile)
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import (FileResponse, RedirectResponse, Response,
+                               StreamingResponse)
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
@@ -33,7 +34,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import auth, billing, editing, polar_payments, workspace
+from app import auth, billing, editing, polar_payments, storage, workspace
 from app.db import SessionLocal, get_session, init_db
 from app.jobs import (create_job, expire_due_jobs, get_job, get_job_transcript,
                       list_jobs, update_job)
@@ -571,8 +572,18 @@ def read_share_video(token: str, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="This share link is not valid.")
     clip = (session.query(Clip)
             .filter(Clip.job_id == row.job_id, Clip.index == row.clip_index).first())
-    path = os.path.join(STORAGE_DIR, row.job_id, clip.file if clip else "")
-    if not clip or not os.path.exists(path):
+    if not clip:
+        raise HTTPException(status_code=404, detail="This clip is no longer available.")
+
+    if storage.driver.serves_redirects:
+        key = storage.job_key(row.job_id, os.path.basename(clip.file))
+        if not storage.driver.exists(key):
+            raise HTTPException(status_code=404,
+                                detail="This clip is no longer available.")
+        return RedirectResponse(storage.driver.url(key), status_code=302)
+
+    path = os.path.join(STORAGE_DIR, row.job_id, clip.file)
+    if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="This clip is no longer available.")
     return FileResponse(path, media_type="video/mp4")
 
@@ -727,6 +738,23 @@ def job_preview(job_id: str, request: Request, clip: int = None):
     forever and the loading veil never lifted -- over a video that was in fact
     playing underneath it.
     """
+    # On object storage, hand the browser a signed URL and get out of the way.
+    # Range requests are what makes scrubbing work, and R2 already implements
+    # them correctly -- proxying the bytes here would mean re-implementing that
+    # by hand AND paying egress on every scrub.
+    if storage.driver.serves_redirects:
+        name = f"preview_{clip}.mp4" if clip is not None else "preview.mp4"
+        key = storage.job_key(job_id, name)
+        if not storage.driver.exists(key):
+            key = storage.job_key(job_id, "preview.mp4")   # pre-windowing jobs
+        if storage.driver.exists(key):
+            if request.method == "HEAD":
+                # The editor polls HEAD to know when the proxy is ready; it
+                # only needs the status, so do not mint a URL for it.
+                return Response(status_code=200, media_type="video/mp4")
+            return RedirectResponse(storage.driver.url(key), status_code=302)
+        raise HTTPException(status_code=404, detail="No editor preview for this job.")
+
     job_dir = os.path.join(STORAGE_DIR, job_id)
     path = os.path.join(job_dir, "preview.mp4")
     if clip is not None:
@@ -1367,7 +1395,39 @@ def job_status(job_id: str):
 
 
 @app.get("/clips/{job_id}/{filename}")
-def get_clip_file(job_id: str, filename: str):
+def get_clip_file(job_id: str, filename: str, download: str = None):
+    # A filename from the URL must never be able to walk out of the job's own
+    # namespace -- on object storage that would sign a URL for someone else's
+    # key, which is a far worse outcome than the local `..` traversal it also
+    # prevents.
+    filename = os.path.basename(filename)
+
+    # Expiry has to be enforced here, not only by the sweep that deletes files.
+    # On local disk the two were the same thing: the bytes were gone, so the
+    # request 404'd on its own. With a bucket, the delete and this request are
+    # independent -- a sweep that has not run yet, or that failed on one key,
+    # would otherwise keep serving a clip the user was told had expired.
+    job = get_job(job_id)
+    if job and job.get("status") == "expired":
+        raise HTTPException(
+            status_code=410,
+            detail="These clips have expired. Re-run the video to make them again.",
+        )
+
+    if storage.driver.serves_redirects:
+        key = storage.job_key(job_id, filename)
+        if not storage.driver.exists(key):
+            raise HTTPException(status_code=404, detail="Clip not found")
+        # 302 rather than streaming: the bytes go from R2 straight to the
+        # browser, so this process pays no egress and stays free for real work.
+        #
+        # `download` carries the name the user should get. It has to be signed
+        # into the URL because the browser drops the <a download> filename the
+        # moment a request redirects cross-origin.
+        return RedirectResponse(
+            storage.driver.url(key, filename=os.path.basename(download or "")),
+            status_code=302)
+
     path = os.path.join(STORAGE_DIR, job_id, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Clip not found")
@@ -1395,6 +1455,12 @@ def _build_proxies_quietly(job_id: str, video_path: str, job_dir: str,
         out_path = os.path.join(job_dir, f"preview_{i}.mp4")
         try:
             render.make_proxy(video_path, out_path, start=lo, end=hi)
+            # Published here, one at a time, rather than in a batch when the job
+            # finishes: this thread outlives the pipeline, so a batch upload at
+            # job-done would race whichever encode was still running and silently
+            # ship a proxy that is not there. Publishing on completion means each
+            # one is available exactly when it is genuinely ready.
+            storage.publish(job_id, job_dir, [f"preview_{i}.mp4"])
             print(f"[clipper] editor preview ready for {job_id} clip {i} "
                   f"({lo:.0f}s-{hi:.0f}s)")
         except (RuntimeError, OSError) as e:
@@ -1688,6 +1754,25 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                 "voiceover_script": clip.get("voiceover_script"),
                 "words": clip_words,
             })
+
+        # Publish BEFORE marking the job done. The status is what makes clips
+        # downloadable in the UI, so flipping it first opens a window where a
+        # user can click a clip that is not in storage yet -- and on object
+        # storage that is a 404 on the thing they just paid for. A publish
+        # failure must fail the job, for the same reason.
+        #
+        # The source and proxies go too: an edit re-cuts from the source, and on
+        # a worker that did not render this job -- or after any redeploy -- it
+        # is not on local disk. `storage.ensure_local` fetches it back.
+        # Proxies are NOT in this list -- they publish themselves as each one
+        # finishes, on a thread that outlives this function.
+        published = storage.publish(job_id, job_dir, [
+            *[clip["file"] for clip in results],
+            "source.mp4",
+        ])
+        if published:
+            print(f"[clipper] job {job_id}: published {published} file(s) to "
+                  f"{storage.driver.name}")
 
         # The clips are the deliverable; the source video is often several hundred
         # MB and is worthless once they exist.

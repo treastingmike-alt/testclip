@@ -25,6 +25,12 @@ requests==2.32.5
 uvicorn==0.39.0
 psycopg2-binary>=2.9
 
+# S3 API client, used for Cloudflare R2 (app/storage.py). Only needed when
+# STORAGE_BACKEND=r2; the local filesystem driver imports nothing. Installed
+# unconditionally so a deployment cannot be one missing package away from
+# having nowhere to put the clips it just spent money rendering.
+boto3
+
 # Fetches source video and its metadata (app/pipeline/downloader.py shells out
 # to the `yt-dlp` binary this package installs).
 #

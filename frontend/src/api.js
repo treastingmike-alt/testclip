@@ -124,9 +124,18 @@ export async function getShare(token) {
 /* `version` is the rendered file's mtime. Re-exporting rewrites the same
    filename, so without it the browser keeps showing the cached pre-edit video
    -- the reason an edited title updated on the card but not in the picture. */
-export function clipUrl(jobId, filename, version) {
+export function clipUrl(jobId, filename, version, download) {
   const base = `${API_BASE}/clips/${jobId}/${filename}`;
-  return version ? `${base}?v=${version}` : base;
+  const params = new URLSearchParams();
+  if (version) params.set("v", version);
+  /* The name the user should see when saving. It has to travel to the server
+     rather than living only in the <a download> attribute, because a browser
+     DISCARDS that attribute as soon as the request redirects to another origin
+     -- which is exactly what happens once clips are served from object storage.
+     The server signs it into the URL instead, so the file arrives named. */
+  if (download) params.set("download", download);
+  const query = params.toString();
+  return query ? `${base}?${query}` : base;
 }
 
 export async function getTranscript(jobId) {

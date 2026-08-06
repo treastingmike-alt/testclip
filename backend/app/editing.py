@@ -17,6 +17,7 @@ import os
 
 from app.db import SessionLocal
 from app.models import Clip, Job
+from app import storage
 from app.pipeline import (censor, downloader, pacing, reframe, render,
                           subtitles, transcriber, translation)
 
@@ -43,10 +44,29 @@ def words_in_range(transcript: dict, start: float, end: float) -> list:
 
 
 def ensure_source(job: Job, job_dir: str, on_progress=None) -> str:
-    """Returns a path to the source video, re-downloading it if it was cleaned."""
+    """A local path to the source video, fetched back if it is not on disk.
+
+    Three places it can be, in descending order of preference:
+
+      1. This container's disk -- free.
+      2. Object storage -- a copy we already paid to fetch once.
+      3. The original URL -- last resort, and increasingly unreliable: YouTube
+         now often demands a sign-in, so an edit that falls through to here can
+         fail on a clip the user already has.
+
+    Step 2 is what makes editing survive a redeploy or a job being edited on a
+    worker that never rendered it. Without it every such edit went straight to
+    step 3 and gambled the user's work on a download."""
     path = os.path.join(job_dir, "source.mp4")
     if os.path.exists(path):
         return path
+
+    restored = storage.ensure_local(job.id, job_dir, "source.mp4")
+    if restored:
+        print(f"[clipper] restored source for {job.id} from "
+              f"{storage.driver.name} storage")
+        return restored
+
     os.makedirs(job_dir, exist_ok=True)
     return downloader.download_video(job.url, path, on_progress=on_progress)
 
@@ -317,6 +337,10 @@ def rerender_clip(job_id: str, index: int, start: float, end: float,
             watermark=options.get("watermark") or None,
         )
         os.replace(tmp_path, final_path)
+        # The edit is only real once it is in storage. Skipping this left the
+        # new version on one container's disk while every other request -- and
+        # every future container -- kept serving the version before the edit.
+        storage.publish(job.id, job_dir, [out_name])
 
         # The source is deliberately cleaned up after rendering. Keep the
         # already-computed composition so reopening the editor previews the

@@ -325,6 +325,66 @@ def _collect_candidates(utterances: list, on_progress=None, intent: str = "",
     return candidates
 
 
+# A clip assembled without the model's help aims for this much material. Long
+# enough to carry a complete thought, short enough that a sparse video can
+# actually produce one.
+FALLBACK_TARGET_SECONDS = 30.0
+
+# A silence this long is a scene change, not a breath. Never build a fallback
+# clip across one: the two sides are unrelated, and stitching them produces a
+# clip that jumps mid-thought.
+FALLBACK_MAX_GAP_SECONDS = 6.0
+
+
+def _fallback_candidates(utterances: list) -> list:
+    """Mechanically built candidates, for when the model nominates nothing.
+
+    The nomination prompt is deliberately strict -- it is told to be
+    discriminating and to skip intro chatter -- which is right for a rich
+    podcast and wrong as a last word. On a sparse video (a short vlog, a mostly
+    silent gameplay recording, a talk with long pauses) it can legitimately
+    return nothing, and the pipeline then failed the whole job with "nothing
+    scored well enough". The user is left with no clips, having already paid for
+    transcription.
+
+    A worse clip is worth more than no clip. So when the model declines, group
+    consecutive speech into runs of roughly FALLBACK_TARGET_SECONDS, never
+    bridging a long silence, and let the normal comparison and refinement passes
+    sort them out.
+
+    Scored at the bottom of the scale on purpose: these must never outrank a
+    real nomination if any exist.
+    """
+    spans = []
+    start = 0
+    while start < len(utterances):
+        end = start
+        while end + 1 < len(utterances):
+            gap = utterances[end + 1]["start"] - utterances[end]["end"]
+            if gap > FALLBACK_MAX_GAP_SECONDS:
+                break                       # a scene change, not a breath
+            if _duration(utterances, start, end) >= FALLBACK_TARGET_SECONDS:
+                break
+            end += 1
+
+        if _duration(utterances, start, end) >= MIN_USABLE_SECONDS:
+            spans.append((start, end))
+        start = end + 1
+
+    return [{
+        "start_index": lo,
+        "end_index": hi,
+        "title": (utterances[lo].get("transcript") or "Moment").strip()[:80],
+        "hook": "",
+        "intent_match": False,
+        "scores": {},
+        # Below any real nomination's floor, so this can only ever be a
+        # last resort rather than competition for a genuine pick.
+        "score": 1.0,
+        "fallback": True,
+    } for lo, hi in spans]
+
+
 def _measure(utterances: list, clip: dict) -> dict:
     """Attaches the clip's real duration. Deliberately does not alter the range.
 
@@ -648,6 +708,15 @@ def pick_clips(utterances: list, n_clips: int, on_progress=None,
         intent=intent,
         length_guidance=LENGTH_PREFS.get(length_pref, ""),
     )
+
+    if not candidates:
+        # The model found nothing it considered strong. That is a judgement, not
+        # an error -- but failing the job over it hands the user nothing after
+        # they have already paid for transcription. Build something usable
+        # instead and let the later passes pick the best of it.
+        candidates = _fallback_candidates(utterances)
+        print(f"[clipper] model nominated no moments; falling back to "
+              f"{len(candidates)} speech run(s)")
 
     # Overlapping windows nominate the same moment twice; dedupe on identical ranges.
     seen = set()

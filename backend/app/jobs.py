@@ -16,7 +16,7 @@ import os
 import shutil
 from typing import Optional
 
-from app import billing
+from app import billing, storage
 from app.db import SessionLocal
 from app.models import Clip, Job, User, _iso_utc
 
@@ -132,6 +132,22 @@ def expire_due_jobs(user_id: str = None, now: datetime = None) -> int:
             if retention_deadline(job) > now:
                 continue
             shutil.rmtree(os.path.join(STORAGE_DIR, job.id), ignore_errors=True)
+
+            # Object storage as well, and for two separate reasons. Cost is the
+            # obvious one -- nothing else ever revisits these keys, so a bucket
+            # would grow forever. The sharper one is that expiry is a PROMISE:
+            # the local delete is what used to make an expired clip actually
+            # gone, and once media lives in a bucket, deleting an empty local
+            # directory leaves the clip fully downloadable by anyone who can
+            # reach it. Retention would have become a label rather than a fact.
+            try:
+                if storage.driver.name != "local":
+                    storage.driver.delete_prefix(job.id)
+            except Exception as exc:
+                # Do not abandon the sweep: one unreachable key must not stop
+                # every later job from expiring.
+                print(f"[clipper] could not purge storage for {job.id}: {exc}")
+
             job.status = "expired"
             job.progress_message = "Expired"
             expired.append(job.id)

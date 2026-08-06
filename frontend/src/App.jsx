@@ -1518,7 +1518,8 @@ export default function App() {
                       </button>
                       <a
                         className="btn btn-primary btn-shine clip-download"
-                        href={clipUrl(job.id, clip.file, clip.version)}
+                        href={clipUrl(job.id, clip.file, clip.version,
+                                      downloadName(clip.title, i))}
                         download={downloadName(clip.title, i)}
                         data-testid={`clip-download-${i}`}
                       >
