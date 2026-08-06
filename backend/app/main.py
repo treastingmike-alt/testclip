@@ -252,8 +252,22 @@ def health():
     cannot log in, and because none of it is sensitive -- counts only, no job
     ids, no users.
     """
-    return {"ok": True, "queue": queue.stats(),
-            "inline_worker": INLINE_WORKER}
+    # `storage` is here because the split only works when it is shared. A
+    # deployment with workers but a local driver looks completely healthy from
+    # every other angle -- the queue moves, jobs get claimed -- and fails every
+    # upload with a message that points at the file rather than the config.
+    split_without_shared_storage = (not INLINE_WORKER
+                                    and storage.driver.name == "local")
+    return {
+        "ok": not split_without_shared_storage,
+        "queue": queue.stats(),
+        "inline_worker": INLINE_WORKER,
+        "storage": storage.driver.name,
+        **({"error": "Workers render on other containers but STORAGE_BACKEND is "
+                     "not set on this one, so uploads cannot reach them. Set "
+                     "STORAGE_BACKEND=r2 and the R2_* variables here."}
+           if split_without_shared_storage else {}),
+    }
 
 
 @app.get("/templates")
@@ -414,6 +428,14 @@ INLINE_WORKER = os.environ.get("CLIPPER_INLINE_WORKER", "1").lower() not in (
 def _start_inline_worker() -> None:
     if not INLINE_WORKER:
         print("[clipper] inline worker off -- run worker.py to process jobs")
+        # Named at boot rather than discovered through a failed upload two
+        # minutes into a job on another container.
+        if storage.driver.name == "local":
+            print("[clipper] *** MISCONFIGURED: jobs render on separate workers "
+                  "but STORAGE_BACKEND is not set here, so nothing this service "
+                  "stores is reachable by them. Every upload will fail with "
+                  "'The uploaded source video is missing'. Set STORAGE_BACKEND=r2 "
+                  "and the R2_* variables on this service. ***")
         return
 
     from app import runner
@@ -1645,17 +1667,22 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
     try:
         update_job(job_id, progress_message="Storing your video...")
         storage.publish(job_id, final_dir, ["source.mp4"])
-        # Confirmed rather than assumed. publish() is a deliberate no-op on the
-        # local driver, so an API container with STORAGE_BACKEND unset stores
-        # nothing and reports success -- and the only symptom is the worker,
-        # elsewhere, failing every upload with a message about a missing file.
-        # Checking the key turns that into one honest error here.
+        # The invariant is that the source is in SHARED storage, not merely
+        # that it exists. Those differ in the one case that matters: on the
+        # local driver publish() is a no-op and exists() then checks this
+        # container's own disk, finds the file it just wrote, and reports
+        # success -- while the worker, elsewhere, has no way to reach it.
+        # Checking the file was therefore self-confirming and caught nothing.
+        if not INLINE_WORKER and storage.driver.name == "local":
+            raise RuntimeError(
+                "This API has no shared storage configured (STORAGE_BACKEND is "
+                "not set) but renders on a separate worker, so an upload saved "
+                "here is unreachable from there. Set STORAGE_BACKEND=r2 and the "
+                "R2_* variables on THIS service, matching the worker.")
         if not storage.driver.exists(storage.job_key(job_id, "source.mp4")):
             raise RuntimeError(
                 f"source.mp4 is not readable at its key after publishing "
-                f"(storage backend: {storage.driver.name}). If this API is "
-                f"deployed separately from its worker, both need the same R2 "
-                f"configuration.")
+                f"(storage backend: {storage.driver.name}).")
     except Exception as exc:
         traceback.print_exc()
         update_job(job_id, status="failed",
