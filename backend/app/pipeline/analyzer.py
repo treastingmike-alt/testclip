@@ -40,9 +40,44 @@ import requests
 from app.pipeline import energy
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-# Editorial judgement is the whole job here, so this defaults to a full-size
-# model rather than a mini one. Override if you want to trade quality for cost.
-OPENAI_MODEL = os.environ.get("CLIPPER_MODEL", "gpt-4o")
+
+# ---------------------------------------------------------------------------
+# The two analysis tiers. Editorial judgement is the whole job here, so both
+# are plain model ids you can repoint from the environment without a deploy:
+#
+#   CLIPPER_MODEL_STANDARD=<id>    every job, unless it pays to upgrade
+#   CLIPPER_MODEL_ADVANCED=<id>    jobs that opt in (billing.ADVANCED_MODEL_PER_JOB)
+#
+# Nothing else in the codebase names a model, so changing these two lines of
+# env is the whole switch.
+#
+# CLIPPER_MODEL is still read as the standard tier for compatibility: it is
+# what every job used before tiering existed, and an existing deploy that sets
+# only that must keep behaving exactly as it did rather than silently landing
+# on some new default.
+STANDARD_MODEL = (os.environ.get("CLIPPER_MODEL_STANDARD")
+                  or os.environ.get("CLIPPER_MODEL")
+                  or "gpt-4o")
+
+# Falls back to the standard model rather than to a guessed id: an unset
+# ADVANCED then means "no benefit", which is a disappointing upgrade but a
+# working one. A wrong id would fail every upgraded job outright.
+ADVANCED_MODEL = os.environ.get("CLIPPER_MODEL_ADVANCED") or STANDARD_MODEL
+
+# Retained under the old name because _openai_chat falls back to it, and
+# because "the model, unqualified" still means the one everyone gets.
+OPENAI_MODEL = STANDARD_MODEL
+
+
+def model_for(advanced: bool = False) -> str:
+    """Which model this job analyses with."""
+    return ADVANCED_MODEL if advanced else STANDARD_MODEL
+
+
+def tiers() -> dict:
+    """Both configured ids, for startup logging and diagnostics."""
+    return {"standard": STANDARD_MODEL, "advanced": ADVANCED_MODEL,
+            "advanced_configured": ADVANCED_MODEL != STANDARD_MODEL}
 
 # How many selection passes to run, so the three can be A/B'd on the same video
 # without a code change:
@@ -102,16 +137,20 @@ FILLER_OPENERS = {
 _MODEL_REJECTS_TEMPERATURE = set()
 
 
-def _openai_chat(prompt: str, retries: int = 2, temperature: float = 0.4) -> dict:
+def _openai_chat(prompt: str, retries: int = 2, temperature: float = 0.4,
+                 model: str = None) -> dict:
+    # Passed down from the job rather than read from the module, so two jobs on
+    # different tiers cannot end up sharing whichever one set it last.
+    model = model or OPENAI_MODEL
     last_error = None
     for attempt in range(retries + 1):
         try:
             payload = {
-                "model": OPENAI_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"},
             }
-            if OPENAI_MODEL not in _MODEL_REJECTS_TEMPERATURE:
+            if model not in _MODEL_REJECTS_TEMPERATURE:
                 payload["temperature"] = temperature
 
             resp = requests.post(
@@ -124,8 +163,8 @@ def _openai_chat(prompt: str, retries: int = 2, temperature: float = 0.4) -> dic
 
             if resp.status_code == 400 and "temperature" in resp.text:
                 # Learn it and retry immediately; costs one wasted call per process.
-                _MODEL_REJECTS_TEMPERATURE.add(OPENAI_MODEL)
-                print(f"[clipper] {OPENAI_MODEL} does not accept a custom "
+                _MODEL_REJECTS_TEMPERATURE.add(model)
+                print(f"[clipper] {model} does not accept a custom "
                       f"temperature -- using the model default from here on.")
                 continue
             if resp.status_code in (401, 403):
@@ -278,7 +317,7 @@ This is advisory only. A stronger complete moment outside the range still wins.
 
 
 def _collect_candidates(utterances: list, on_progress=None, intent: str = "",
-                        length_guidance: str = "") -> list:
+                        length_guidance: str = "", model: str = None) -> list:
     spans = _windows(len(utterances))
     candidates = []
     intent_block = INTENT_TEMPLATE.format(intent=intent) if intent else ""
@@ -294,7 +333,7 @@ def _collect_candidates(utterances: list, on_progress=None, intent: str = "",
             intent=intent_block,
             length=length_block,
             transcript=_numbered_slice(utterances, lo, hi),
-        ))
+        ), model=model)
 
         for c in data.get("candidates", []):
             try:
@@ -501,7 +540,7 @@ def _balance_intent_selection(chosen: list, shortlist: list, n_clips: int,
 
 
 def _final_selection(utterances: list, shortlist: list, n_clips: int,
-                     intent: str = "") -> list:
+                     intent: str = "", model: str = None) -> list:
     """Head-to-head comparison of finalists. Falls back to score order."""
     if len(shortlist) <= n_clips:
         return shortlist
@@ -516,7 +555,7 @@ def _final_selection(utterances: list, shortlist: list, n_clips: int,
     try:
         intent_block = SELECT_INTENT_TEMPLATE.format(intent=intent) if intent else ""
         data = _openai_chat(SELECT_PROMPT.format(
-            n=n_clips, intent=intent_block, candidates=blocks))
+            n=n_clips, intent=intent_block, candidates=blocks), model=model)
         chosen = []
         for entry in data.get("chosen", []):
             idx = int(entry["id"])
@@ -620,7 +659,7 @@ def _utterance_index_at(utterances: list, t: float) -> int:
     return len(utterances) - 1
 
 
-def _refine_boundaries(utterances: list, clips: list) -> list:
+def _refine_boundaries(utterances: list, clips: list, model: str = None) -> list:
     """One batched call to move every clip's cut points to real sentence edges."""
     if not clips:
         return clips
@@ -652,7 +691,7 @@ def _refine_boundaries(utterances: list, clips: list) -> list:
     try:
         # Boundary surgery wants precision, not creativity -- sample near-greedy.
         data = _openai_chat(REFINE_PROMPT.format(blocks="\n\n".join(blocks)),
-                            temperature=0.1)
+                            temperature=0.1, model=model)
     except RuntimeError:
         return clips
 
@@ -693,7 +732,8 @@ def _refine_boundaries(utterances: list, clips: list) -> list:
 
 
 def pick_clips(utterances: list, n_clips: int, on_progress=None,
-               intent: str = "", length_pref: str = "") -> list:
+               intent: str = "", length_pref: str = "",
+               model: str = None) -> list:
     """Three passes: nominate per window, compare finalists, refine boundaries.
 
     intent:      free-text steer from the user ("when he talks about pricing")
@@ -707,6 +747,7 @@ def pick_clips(utterances: list, n_clips: int, on_progress=None,
         on_progress,
         intent=intent,
         length_guidance=LENGTH_PREFS.get(length_pref, ""),
+        model=model,
     )
 
     if not candidates:
@@ -747,12 +788,13 @@ def pick_clips(utterances: list, n_clips: int, on_progress=None,
     if SELECTION_PASSES >= 2:
         if on_progress:
             on_progress(-1, len(shortlist))      # signals the comparison stage
-        chosen = _final_selection(utterances, shortlist, n_clips, intent=intent)
+        chosen = _final_selection(utterances, shortlist, n_clips, intent=intent,
+                                  model=model)
     else:
         chosen = shortlist[:n_clips]
 
     if SELECTION_PASSES >= 3:
-        chosen = _refine_boundaries(utterances, chosen)
+        chosen = _refine_boundaries(utterances, chosen, model=model)
 
     # Refinement can nudge two clips into each other; keep the stronger one.
     deduped = []

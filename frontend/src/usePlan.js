@@ -47,6 +47,12 @@ export function usePlan(user) {
       limits,
       credits: user?.credits ?? null,
       creditsPerClip: catalogue?.credits_per_clip ?? 10,
+      /* Surcharge rates from the server, so the studio quotes what billing.py
+         will actually charge. The fallbacks only cover the first render before
+         the catalogue lands; the pre-flight 402 is the real backstop if the
+         two ever disagree. */
+      highQualityPerClip: catalogue?.extras?.high_quality_per_clip ?? 5,
+      advancedModelPerJob: catalogue?.extras?.advanced_model_per_job ?? 10,
       can,
     };
   }, [user, catalogue]);

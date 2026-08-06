@@ -517,6 +517,11 @@ export default function App() {
   const [lengthPref, setLengthPref] = useState("any");
   const [intent, setIntent] = useState("");
   const [tightenPauses, setTightenPauses] = useState(false);
+  /* Paid extras. Both default off: the cheaper path is what every job has
+     always had, and defaulting either on would charge for something nobody
+     chose. Priced in credits rather than gated, so Free can try them. */
+  const [highQuality, setHighQuality] = useState(false);
+  const [advancedModel, setAdvancedModel] = useState(false);
   // The studio is a 3-step wizard now: 1 source, 2 preferences, 3 review.
   const [step, setStep] = useState(1);
   // The feature someone just reached for, so the upgrade dialog can name it.
@@ -883,6 +888,8 @@ export default function App() {
         ratio,
         lengthPref,
         intent: intent.trim(),
+        highQuality,
+        advancedModel,
       };
       const result = sourceMode === "upload"
         ? await uploadJob(uploadFile, {
@@ -900,6 +907,8 @@ export default function App() {
             ratio: options.ratio,
             length_pref: options.lengthPref,
             intent: options.intent,
+            high_quality: options.highQuality,
+            advanced_model: options.advancedModel,
           }, setUploadPct)
         : await submitJob({ url: url.trim(), ...options });
       const { job_id } = result;
@@ -1409,6 +1418,8 @@ export default function App() {
                   multilingual, setMultilingual, tightenPauses, setTightenPauses,
                   template, setTemplate, intent, setIntent,
                   captionStyle, setCaptionStyle,
+                  highQuality, setHighQuality,
+                  advancedModel, setAdvancedModel,
                 }}
                 plan={plan}
                 templates={TEMPLATES}

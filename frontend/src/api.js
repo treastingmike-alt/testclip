@@ -36,7 +36,7 @@ function authHeaders() {
 }
 
 
-export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, tightenPauses, voice, language, template, captionStyle, ratio, lengthPref, intent }) {
+export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, multilingual, tightenPauses, voice, language, template, captionStyle, ratio, lengthPref, intent, highQuality, advancedModel }) {
   const resp = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -55,6 +55,8 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
       ratio,
       length_pref: lengthPref,
       intent,
+      high_quality: highQuality === true,
+      advanced_model: advancedModel === true,
     }),
   });
   if (!resp.ok) throw await readError(resp, "We couldn't start that clip yet.");

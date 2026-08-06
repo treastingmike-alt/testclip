@@ -150,8 +150,11 @@ ENTITLEMENTS = {
 # real clips off a 15-minute video is a genuine trial, and the ceiling is the
 # reason to upgrade -- not a broken experience.
 LIMITS = {
+    # 200 MB pairs with the 15-minute ceiling: a quarter-hour of ordinary
+    # 1080p lands well inside it, so the two limits bite at roughly the same
+    # point instead of one silently overriding the other.
     "free":    {"max_clips": 2,  "max_source_minutes": 15,
-                "max_upload_mb": 500},
+                "max_upload_mb": 200},
     "creator": {"max_clips": 10, "max_source_minutes": MAX_SOURCE_MINUTES,
                 "max_upload_mb": 2048},
     "pro":     {"max_clips": 10, "max_source_minutes": 720,
@@ -257,6 +260,66 @@ TOPUPS = [
 def credits_for_clips(n_clips: int) -> int:
     """What n finished clips cost. Source length does not enter into it."""
     return max(0, int(n_clips or 0)) * CREDITS_PER_CLIP
+
+
+# Optional extras, priced where the cost actually falls.
+#
+# Quality rides on the RENDER, which runs once per clip -- a slower preset and
+# a lower CRF cost real encoder time for each one, so it is priced per clip.
+#
+# The advanced model rides on the ANALYSIS, which runs ONCE for the whole job
+# however many clips come out of it. Pricing that per clip would bill several
+# times over for a single API call, so it is a flat per-job charge.
+#
+# Neither is gated on a plan. They are paid for in credits, which means a Free
+# account can try either on its signup grant and find out whether the better
+# output is worth it -- the same reasoning that moved caption editing out of
+# _PAID. What Free gets is the cheaper DEFAULT, not a locked door.
+HIGH_QUALITY_PER_CLIP = 5
+ADVANCED_MODEL_PER_JOB = 10
+
+
+def credits_for_job(n_clips: int, high_quality: bool = False,
+                    advanced_model: bool = False) -> int:
+    """Total credits for a job, including any extras it opted into."""
+    n = max(0, int(n_clips or 0))
+    total = credits_for_clips(n)
+    if high_quality:
+        total += HIGH_QUALITY_PER_CLIP * n
+    if advanced_model:
+        total += ADVANCED_MODEL_PER_JOB
+    return total
+
+
+def cost_breakdown(n_clips: int, high_quality: bool = False,
+                   advanced_model: bool = False) -> dict:
+    """The same total, itemised, for the review step to render.
+
+    Built here rather than in the client so the number someone agrees to and
+    the number they are charged come from one place. A review screen that
+    computes its own total will eventually disagree with the ledger, and the
+    user will be right and the invoice wrong.
+    """
+    n = max(0, int(n_clips or 0))
+    lines = [{
+        "label": f"{n} clip{'' if n == 1 else 's'}",
+        "detail": f"{CREDITS_PER_CLIP} credits each",
+        "credits": credits_for_clips(n),
+    }]
+    if high_quality:
+        lines.append({
+            "label": "High quality",
+            "detail": f"{HIGH_QUALITY_PER_CLIP} credits per clip",
+            "credits": HIGH_QUALITY_PER_CLIP * n,
+        })
+    if advanced_model:
+        lines.append({
+            "label": "Advanced model",
+            "detail": "charged once per job",
+            "credits": ADVANCED_MODEL_PER_JOB,
+        })
+    return {"lines": lines,
+            "total": credits_for_job(n, high_quality, advanced_model)}
 
 
 def get_plan(plan_id: str) -> dict:

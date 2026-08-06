@@ -687,6 +687,7 @@ def render_clip(
     background: str = None,
     reframe_plan: dict = None,
     watermark: str = None,
+    high_quality: bool = False,
 ) -> str:
     duration = max(end - start, 1)
     width, height = RATIOS.get(ratio, RATIOS["9:16"])
@@ -835,8 +836,17 @@ def render_clip(
         # they arrive at the encoder already soft with no detail to spare, and
         # every later recompression starts from that. Measured side by side, the
         # preset barely moved -- crf did, so only crf moves here.
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "19" if reframe_plan else "20",
+        #
+        # High quality buys a slower preset and a lower crf. It is a paid option
+        # precisely BECAUSE the note above is true for most clips: it costs real
+        # encoder time for a difference the platforms usually recompress away.
+        # Worth it for footage that will be re-cut or archived, not worth it by
+        # default -- which is why the default did not change.
+        *(["-c:v", "libx264", "-preset", "slow",
+           "-crf", "17" if reframe_plan else "18"]
+          if high_quality else
+          ["-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "19" if reframe_plan else "20"]),
         # Bounded on purpose. x264 allocates per-thread frame buffers sized from
         # the CPU count it can see, and in a container that is the HOST's count
         # -- 48 on Railway against 8 on a laptop -- while the memory ceiling

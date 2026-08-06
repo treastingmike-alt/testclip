@@ -291,6 +291,12 @@ class JobRequest(BaseModel):
     # Transcribe speech that switches language mid-sentence with the model that
     # can follow it. Off by default and gated on the plan -- see billing.allows.
     multilingual: bool = False
+    # Paid-for extras, priced in credits rather than gated on a plan, so a Free
+    # account can spend its signup grant finding out whether either is worth it.
+    # Both default off: the cheaper path is what everyone already gets, and an
+    # opt-out surcharge would be a charge nobody chose.
+    high_quality: bool = False       # slower preset, lower CRF -- per clip
+    advanced_model: bool = False     # the better analysis model -- per job
 
 
 class SourcePreviewRequest(BaseModel):
@@ -360,8 +366,14 @@ def on_startup():
                   f"Add it to backend/.env")
 
     from app.pipeline import downloader as _dl
-    print(f"[clipper] model: {os.environ.get('CLIPPER_MODEL', 'gpt-4o')} | "
-          f"youtube session: {_dl.cookie_source()}")
+    # Read from the analyzer rather than the environment: this used to repeat
+    # both the variable name and its default, so it would have kept printing
+    # "gpt-4o" while jobs actually ran on something else.
+    _tiers = analyzer.tiers()
+    print(f"[clipper] models: standard={_tiers['standard']} "
+          f"advanced={_tiers['advanced']}"
+          f"{'' if _tiers['advanced_configured'] else ' (same -- set CLIPPER_MODEL_ADVANCED)'}"
+          f" | youtube session: {_dl.cookie_source()}")
     removed = expire_due_jobs()
     if removed:
         print(f"[clipper] expired {removed} finished project(s)")
@@ -413,6 +425,13 @@ def plans():
         # needs before anyone has an account.
         "limits": billing.LIMITS,
         "entitlements": {k: sorted(v) for k, v in billing.ENTITLEMENTS.items()},
+        # Surcharge rates, so the studio can price a selection as it changes
+        # without a round trip per keystroke -- and without hardcoding numbers
+        # that would drift from billing.py the first time either one moves.
+        "extras": {
+            "high_quality_per_clip": billing.HIGH_QUALITY_PER_CLIP,
+            "advanced_model_per_job": billing.ADVANCED_MODEL_PER_JOB,
+        },
     }
 
 
@@ -441,8 +460,20 @@ def estimate(body: dict):
     correct answer for the default clip count instead of an error.
     """
     n_clips = int(body.get("n_clips") or 1)
-    return {"credits": billing.credits_for_clips(n_clips),
-            "credits_per_clip": billing.CREDITS_PER_CLIP}
+    high_quality = bool(body.get("high_quality"))
+    advanced_model = bool(body.get("advanced_model"))
+    breakdown = billing.cost_breakdown(n_clips, high_quality, advanced_model)
+    return {
+        # `credits` stays the total, so a client that only reads this field
+        # still quotes the right number when extras are on.
+        "credits": breakdown["total"],
+        "credits_per_clip": billing.CREDITS_PER_CLIP,
+        "lines": breakdown["lines"],
+        "extras": {
+            "high_quality_per_clip": billing.HIGH_QUALITY_PER_CLIP,
+            "advanced_model_per_job": billing.ADVANCED_MODEL_PER_JOB,
+        },
+    }
 
 
 class CheckoutRequest(BaseModel):
@@ -1264,13 +1295,20 @@ def _prepare_job(req: JobRequest, user: User = None, uploaded: bool = False) -> 
     # so the gate can be exact instead of "has any credit at all". Charged for
     # real once the analysis settles the actual clip count, which may be lower.
     if user:
-        want = billing.credits_for_clips(req.n_clips)
+        want = billing.credits_for_job(req.n_clips, req.high_quality,
+                                       req.advanced_model)
         have = billing.balance(user.id)
         if have < want:
+            # Name the extras when they are what pushed it over, so the fix on
+            # offer is "turn one off", not only "buy more".
+            extras = [n for n, on in (("High quality", req.high_quality),
+                                      ("Advanced model", req.advanced_model)) if on]
+            with_extras = f" with {' and '.join(extras)}" if extras else ""
             raise HTTPException(
                 status_code=402,
-                detail=(f"{req.n_clips} clips cost {want} credits and you have "
-                        f"{have}. Ask for fewer clips, top up, or upgrade."),
+                detail=(f"{req.n_clips} clips{with_extras} cost {want} credits and "
+                        f"you have {have}. Ask for fewer clips, turn off an extra, "
+                        f"top up, or upgrade."),
             )
 
     # Paid capability, enforced here rather than trusted from the client.
@@ -1636,6 +1674,8 @@ def _run_pipeline_locked(job_id: str, req: JobRequest, gameplay_loops: list = No
             req.n_clips,
             intent=req.intent,
             length_pref=req.length_pref,
+            # From the frozen options, so the tier billed for is the tier run.
+            model=analyzer.model_for(bool(job_options.get("advanced_model"))),
             on_progress=lambda n, total: update_job(
                 job_id,
                 percent=100 if n < 0 else round(n / total * 100),
@@ -1658,7 +1698,15 @@ def _run_pipeline_locked(job_id: str, req: JobRequest, gameplay_loops: list = No
         # a lie. Still ahead of the render, which is where the compute goes.
         # Anonymous jobs are free while metering is unenforced.
         if job_user_id:
-            cost = billing.credits_for_clips(len(resolved_clips))
+            # Extras come from the OPTIONS frozen onto the job at creation, not
+            # from `req`, for the same reason the watermark and plan limits do:
+            # what someone agreed to at the review screen is what they get
+            # billed for, whatever has changed since.
+            cost = billing.credits_for_job(
+                len(resolved_clips),
+                bool(job_options.get("high_quality")),
+                bool(job_options.get("advanced_model")),
+            )
             # Remembered so the failure handler can give it back. Everything
             # after this point can still fail -- the source download is the
             # likeliest, since YouTube can refuse it long after the transcript
@@ -1834,6 +1882,7 @@ def _run_pipeline_locked(job_id: str, req: JobRequest, gameplay_loops: list = No
                 mute_spans=mute_spans,
                 reframe_plan=clip_plan,
                 watermark=options_watermark,
+                high_quality=bool(job_options.get("high_quality")),
             )
 
             # Raw scores rank the clips; these are what gets shown. The mapping

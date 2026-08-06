@@ -138,7 +138,31 @@ export default function StudioWizard({
     || !can("tighten_pauses") || !can("multilingual");
 
   const clipOptions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-  const cost = prefs.nClips * plan.creditsPerClip;
+  /* Mirrors billing.credits_for_job: quality is per clip because a render runs
+     once per clip, the model is per job because the analysis runs once however
+     many clips come out of it. The rates come from the server (see usePlan) so
+     only this shape is duplicated, not the numbers -- and the pre-flight 402 is
+     what catches it if even the shape drifts. */
+  const costLines = [{
+    label: `${prefs.nClips} clip${prefs.nClips === 1 ? "" : "s"}`,
+    detail: `${plan.creditsPerClip} credits each`,
+    credits: prefs.nClips * plan.creditsPerClip,
+  }];
+  if (prefs.highQuality) {
+    costLines.push({
+      label: "High quality",
+      detail: `${plan.highQualityPerClip} credits per clip`,
+      credits: plan.highQualityPerClip * prefs.nClips,
+    });
+  }
+  if (prefs.advancedModel) {
+    costLines.push({
+      label: "Advanced model",
+      detail: "charged once per job",
+      credits: plan.advancedModelPerJob,
+    });
+  }
+  const cost = costLines.reduce((sum, line) => sum + line.credits, 0);
 
   function next() {
     if (step === 1 && !sourceReady) return;
@@ -273,6 +297,25 @@ export default function StudioWizard({
             </div>
           </div>
 
+          {/* Priced in credits, not locked behind a plan -- so these carry a
+              cost badge rather than a padlock, and the total they feed sits on
+              the Review step where it is agreed to before anything is spent. */}
+          <div className="pref-group">
+            <span className="pref-group-label">Output quality</span>
+            <div className="options-row">
+              <ToggleChip label={`High quality  +${plan.highQualityPerClip}/clip`}
+                          on={prefs.highQuality}
+                          onChange={prefs.setHighQuality}
+                          testid="opt-high-quality"
+                          title="Sharper picture: a slower encode that keeps more detail. Does not change which moments are chosen. Most platforms recompress the difference away, so this is for footage you will re-cut or archive." />
+              <ToggleChip label={`Advanced model  +${plan.advancedModelPerJob}`}
+                          on={prefs.advancedModel}
+                          onChange={prefs.setAdvancedModel}
+                          testid="opt-advanced-model"
+                          title="Better choices: a stronger model reads the transcript and decides which moments to cut and where each one starts and ends. Does not change picture quality. Charged once per job, however many clips it finds." />
+            </div>
+          </div>
+
           <div className="pref-group">
             <span className="pref-group-label">Pacing</span>
             <div className="options-row">
@@ -380,6 +423,23 @@ export default function StudioWizard({
                  value={prefs.multilingual && can("multilingual") ? "On" : "Off"}
                  muted={!can("multilingual")} />
             {prefs.intent.trim() && <Row label="Looking for" value={prefs.intent.trim()} />}
+            <Row label="Quality" value={prefs.highQuality ? "High" : "Standard"} />
+            <Row label="Model" value={prefs.advancedModel ? "Advanced" : "Standard"} />
+
+            {/* Itemised only when something was added to the base rate. With no
+                extras this is one line restating the total, which is noise --
+                and the extras are the whole reason the total is not simply
+                clips x 10, so they are what has to be shown. */}
+            {costLines.length > 1 && (
+              <div className="review-costlines" data-testid="cost-breakdown">
+                {costLines.map((line) => (
+                  <div className="review-costline" key={line.label}>
+                    <span>{line.label}<em>{line.detail}</em></span>
+                    <strong>{line.credits}</strong>
+                  </div>
+                ))}
+              </div>
+            )}
             <Row label="Cost" value={plan.credits == null
               ? `${cost} credits`
               : `${cost} of your ${plan.credits} credits`} />

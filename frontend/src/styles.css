@@ -2364,6 +2364,27 @@ body::after {
 .clip-actions .clip-edit { flex: 0 0 auto; padding-inline: 16px; }
 .clip-actions .clip-download { flex: 1; }
 
+/* On a phone the row is Trim + Share + Download, and the rules above forbid
+   all three from shrinking (`flex: 0 0 auto`) while pinning Download to a
+   148px floor. Three rigid buttons do not fit ~360px of viewport, so Download
+   ran off the right edge with its label cut in half.
+   Two on the top row, Download full width beneath -- it is the primary action
+   and deserves the wider tap target anyway. */
+@media (max-width: 560px) {
+  .clip-actions { flex-wrap: wrap; }
+  .clip-actions .clip-edit,
+  .clip-actions .clip-share {
+    flex: 1 1 0;
+    min-width: 0;
+    padding-inline: 12px;
+  }
+  /* Beats the 148px floor set in the desktop rule. */
+  .clip-actions .clip-download {
+    flex: 1 0 100%;
+    min-width: 0;
+  }
+}
+
 /* ---------- Clip editor ---------- */
 .editor-backdrop {
   position: fixed;
