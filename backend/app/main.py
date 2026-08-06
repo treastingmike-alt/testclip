@@ -11,6 +11,7 @@ Endpoints:
 """
 
 from app import env  # noqa: F401  -- loads .env BEFORE anything reads keys
+import contextlib
 import json
 import os
 import uuid
@@ -83,6 +84,56 @@ GAMEPLAY_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "gameplay
 # a production host with object storage or a stricter reverse-proxy limit.
 MAX_UPLOAD_BYTES = int(os.environ.get("CLIPPER_MAX_UPLOAD_BYTES", 1024 * 1024 * 1024))
 VIDEO_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+
+# How many renders may run at once in THIS process.
+#
+# Nothing used to limit this: BackgroundTasks starts every submitted job
+# immediately, and the editor's export renders inline on the request thread. Two
+# people pressing Export at the same moment therefore put two ffmpeg processes
+# in one container, and since a single render already peaks near 800 MB of a
+# 1 GB limit, the second one does not fail politely -- the kernel kills both.
+#
+# One at a time is the honest capacity of a 2-vCPU container: ffmpeg already
+# saturates both cores, so a second concurrent render buys no throughput and
+# only adds memory pressure. Raise this only alongside the memory limit.
+MAX_CONCURRENT_RENDERS = max(1, int(os.environ.get("CLIPPER_MAX_CONCURRENT_RENDERS", "1")))
+_RENDER_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_RENDERS)
+
+# How long a REQUEST-time render (the editor's export) will wait for a slot
+# before giving up. A queued background job can wait forever because the user
+# is watching a progress bar, but an HTTP request cannot: holding the
+# connection past a proxy's idle timeout turns a busy server into a mystery
+# 502. Better to say "busy, try again" honestly and quickly.
+EXPORT_SLOT_WAIT_SECONDS = float(os.environ.get("CLIPPER_EXPORT_SLOT_WAIT", "20"))
+
+
+@contextlib.contextmanager
+def _render_slot(job_id: str = None, wait: float = None):
+    """Hold one of the render slots for the duration of the block.
+
+    With `wait` set, gives up after that many seconds and raises 503 -- for
+    request-time renders. Without it, waits indefinitely and marks the job
+    "queued" so a waiting user sees a queue rather than a stall.
+    """
+    acquired = _RENDER_SLOTS.acquire(blocking=False)
+    if not acquired:
+        if wait is not None:
+            acquired = _RENDER_SLOTS.acquire(timeout=wait)
+            if not acquired:
+                raise HTTPException(
+                    status_code=503,
+                    detail="We're finishing another render right now. Try again in a moment.",
+                    headers={"Retry-After": "30"},
+                )
+        else:
+            if job_id:
+                update_job(job_id, status="queued", percent=0,
+                           progress_message="Waiting for a free render slot...")
+            _RENDER_SLOTS.acquire()
+    try:
+        yield
+    finally:
+        _RENDER_SLOTS.release()
 
 
 # Templates provide framing defaults. Caption styling is chosen separately in
@@ -1074,27 +1125,31 @@ def export_clip(job_id: str, index: int,
     loops = _gameplay_loops() if tpl and tpl["frame"] == "gameplay" else []
     reservation_id = _reserve_editor_export(job_id, index, user)
     try:
-        result = editing.rerender_clip(
-            job_id, index, start, end, STORAGE_DIR, TEMPLATES, loops,
-            caption_style=recipe.get("caption_style"),
-            caption_lines=recipe.get("lines"),
-            caption_font=recipe.get("caption_font"),
-            translate_to=recipe.get("translate_to"),
-            ratio=recipe.get("ratio"),
-            overlay_list=resolved,
-            caption_size=recipe.get("caption_size"),
-            caption_pos=recipe.get("caption_pos"),
-            caption_anim=recipe.get("caption_anim"),
-            caption_color=recipe.get("caption_color"),
-            caption_active_color=recipe.get("caption_active_color"),
-            captions_on=recipe.get("captions_on", True),
-            speed=recipe.get("speed"),
-            speed_pitched=bool(recipe.get("speed_pitched")),
-            background=recipe.get("background"),
-            title_style=recipe.get("title_style"),
-            title_font=recipe.get("title_font"),
-            tighten_pauses=recipe.get("tighten_pauses"),
-        )
+        # Renders on the request thread, so it competes for memory with any
+        # pipeline job already running. Bounded wait rather than an open-ended
+        # one: the caller is a browser holding a connection open.
+        with _render_slot(wait=EXPORT_SLOT_WAIT_SECONDS):
+            result = editing.rerender_clip(
+                job_id, index, start, end, STORAGE_DIR, TEMPLATES, loops,
+                caption_style=recipe.get("caption_style"),
+                caption_lines=recipe.get("lines"),
+                caption_font=recipe.get("caption_font"),
+                translate_to=recipe.get("translate_to"),
+                ratio=recipe.get("ratio"),
+                overlay_list=resolved,
+                caption_size=recipe.get("caption_size"),
+                caption_pos=recipe.get("caption_pos"),
+                caption_anim=recipe.get("caption_anim"),
+                caption_color=recipe.get("caption_color"),
+                caption_active_color=recipe.get("caption_active_color"),
+                captions_on=recipe.get("captions_on", True),
+                speed=recipe.get("speed"),
+                speed_pitched=bool(recipe.get("speed_pitched")),
+                background=recipe.get("background"),
+                title_style=recipe.get("title_style"),
+                title_font=recipe.get("title_font"),
+                tighten_pauses=recipe.get("tighten_pauses"),
+            )
         with SessionLocal() as session:
             clip = (session.query(Clip)
                     .filter(Clip.job_id == job_id, Clip.index == index).first())
@@ -1109,6 +1164,11 @@ def export_clip(job_id: str, index: int,
     except RuntimeError as e:
         _release_editor_export(reservation_id)
         raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+    except HTTPException:
+        # A deliberate status (the busy-slot 503) must survive the catch-all
+        # below, which would otherwise flatten it to a generic 500.
+        _release_editor_export(reservation_id)
+        raise
     except Exception:
         _release_editor_export(reservation_id)
         print(f"[clipper] unexpected editor export failure\n{traceback.format_exc()}")
@@ -1129,19 +1189,26 @@ def rerender_clip(job_id: str, index: int, body: ClipEdit,
     loops = _gameplay_loops() if tpl and tpl["frame"] == "gameplay" else []
     reservation_id = _reserve_editor_export(job_id, index, user)
     try:
-        return editing.rerender_clip(
-            job_id, index, body.start, body.end, STORAGE_DIR, TEMPLATES, loops,
-            caption_style=body.caption_style,
-            caption_lines=[l.dict() for l in body.caption_lines] if body.caption_lines else None,
-            caption_font=body.caption_font,
-            translate_to=body.translate_to,
-        )
+        with _render_slot(wait=EXPORT_SLOT_WAIT_SECONDS):
+            return editing.rerender_clip(
+                job_id, index, body.start, body.end, STORAGE_DIR, TEMPLATES, loops,
+                caption_style=body.caption_style,
+                caption_lines=[l.dict() for l in body.caption_lines] if body.caption_lines else None,
+                caption_font=body.caption_font,
+                translate_to=body.translate_to,
+            )
     except ValueError as e:
         _release_editor_export(reservation_id)
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         _release_editor_export(reservation_id)
         raise HTTPException(status_code=500, detail=f"Re-render failed: {e}")
+    except HTTPException:
+        # Already a considered answer -- the 503 from a busy render slot, say.
+        # Without this the catch-all below would rewrite it into a generic 500
+        # and lose both the real status and the Retry-After.
+        _release_editor_export(reservation_id)
+        raise
     except Exception:
         _release_editor_export(reservation_id)
         print(f"[clipper] unexpected re-render failure\n{traceback.format_exc()}")
@@ -1468,6 +1535,22 @@ def _build_proxies_quietly(job_id: str, video_path: str, job_dir: str,
 
 def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
                  job_user_id: str = None, uploaded_source: bool = False):
+    """Runs one job end to end. Holds a render slot for its whole duration.
+
+    The slot covers transcription as well as rendering, which costs some
+    throughput -- transcription waits on Deepgram rather than the CPU, so a
+    finer-grained lock could overlap it with someone else's render. That is not
+    worth the complexity here: the source file, the proxy and the working set
+    all stay resident for the whole job, so it is memory, not CPU, that decides
+    how many jobs fit -- and by that measure the answer on this container is
+    one. Overlapping the stages would only make the peak arrive sooner.
+    """
+    with _render_slot(job_id=job_id):
+        _run_pipeline_locked(job_id, req, gameplay_loops, job_user_id, uploaded_source)
+
+
+def _run_pipeline_locked(job_id: str, req: JobRequest, gameplay_loops: list = None,
+                         job_user_id: str = None, uploaded_source: bool = False):
     gameplay_loops = gameplay_loops or []
     tpl = TEMPLATES.get(req.template, TEMPLATES["classic"])
     job_dir = os.path.join(STORAGE_DIR, job_id)

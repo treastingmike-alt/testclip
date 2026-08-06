@@ -5253,10 +5253,70 @@ body::after {
   opacity: .72;
 }
 
+/* Generate doubles as the upload progress bar. The fill is a background layer
+   sized by --upload-pct, so the label stays put and legible over it rather
+   than being pushed around by a separate bar appearing above the footer. */
+.btn-primary[data-uploading] {
+  position: relative;
+  overflow: hidden;
+  /* Disabled dims it, but this button is doing exactly what was asked -- it
+     should read as working, not unavailable. */
+  opacity: 1;
+  cursor: progress;
+}
+.btn-primary[data-uploading]::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--upload-pct, 0%);
+  background: rgba(255, 255, 255, .26);
+  transition: width .2s ease-out;
+  pointer-events: none;
+}
+/* Keeps the label above the fill. */
+.btn-primary[data-uploading] > * { position: relative; }
+
+/* Borrows .pacing-control's two-column layout but offers a single action, not a
+   choice: the watermark follows the plan, so there is no second state to
+   switch to. Sized to match .pacing-segment so the two rows line up. */
+.pacing-segment-solo {
+  min-width: 104px;
+  min-height: 44px;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 750;
+  cursor: pointer;
+  transition: background .16s, color .16s, border-color .16s;
+}
+.pacing-segment-solo:hover {
+  color: var(--ink);
+  border-color: var(--violet);
+  background: color-mix(in srgb, var(--violet) 10%, var(--surface));
+}
+/* Already paid for: a settled fact, so it states rather than invites. */
+.pacing-state {
+  font-size: 12px;
+  font-weight: 750;
+  color: var(--success);
+  white-space: nowrap;
+}
+
+/* A divider under the last row would rule off against empty panel. */
+.live-controls > .pacing-control:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
 @media (max-width: 620px) {
   .pacing-control { grid-template-columns: 1fr; }
   .pacing-segment { width: 100%; }
   .pacing-segment button { min-width: 0; }
+  .pacing-segment-solo { width: 100%; }
 }
 
 /* A caveat attached to a control -- something the export will do differently

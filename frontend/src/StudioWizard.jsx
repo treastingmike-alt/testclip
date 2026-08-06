@@ -122,7 +122,7 @@ function ChoiceButtons({ label, value, options, onChange, className = "" }) {
 export default function StudioWizard({
   step, setStep, source, prefs, plan, templates, previewManifest,
   TemplatePreview, SourceTabs, DropZone, SourcePreview,
-  submitting, submitError, onGenerate, onUpgrade, onViewPlans,
+  submitting, submitError, onGenerate, onUpgrade, onViewPlans, uploadPct,
   signedIn, onRequireAuth,
 }) {
   const [maxReached, setMaxReached] = useState(step);
@@ -427,9 +427,19 @@ export default function StudioWizard({
             </svg>
           </button>
         ) : (
+          // While a file is going up, the button IS the progress bar: the fill
+          // tracks the bytes sent. A separate bar elsewhere would put the
+          // feedback somewhere other than the control just pressed.
           <button className="btn btn-primary btn-shine" onClick={onGenerate}
-                  disabled={submitting} data-testid="wizard-generate">
-            {submitting ? "Starting..." : `Generate ${prefs.nClips} clip${prefs.nClips === 1 ? "" : "s"}`}
+                  disabled={submitting} data-testid="wizard-generate"
+                  style={uploadPct != null
+                    ? { "--upload-pct": `${Math.round(uploadPct * 100)}%` }
+                    : undefined}
+                  data-uploading={uploadPct != null ? "" : undefined}>
+            {uploadPct != null
+              ? (uploadPct >= 1 ? "Processing..." : `Uploading ${Math.round(uploadPct * 100)}%`)
+              : submitting ? "Starting..."
+              : `Generate ${prefs.nClips} clip${prefs.nClips === 1 ? "" : "s"}`}
           </button>
         )}
       </footer>

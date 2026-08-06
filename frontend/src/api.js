@@ -15,6 +15,14 @@ export const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 function friendlyMessage(status, detail, fallback) {
   if (status === 402) return "This needs a plan with more room.";
   if (status === 413) return "That file is larger than this plan allows.";
+  /* 503 is the server saying "busy, come back", which is a queue rather than a
+     fault, and it arrives with a specific explanation worth keeping. The
+     blanket 5xx line below exists to avoid leaking internals from crashes --
+     but this detail is written for users, so flattening it into the same
+     apology would throw away the one message that tells them retrying works. */
+  if (status === 503) {
+    return detail || "We're finishing another render right now. Try again in a moment.";
+  }
   if (status >= 500) return "We couldn't finish that right now. Please try again in a moment.";
   if (/stalled|traffic|rate.?limit|too many requests|yt-dlp|ffmpeg|deepgram|openai|api key|cookie|traceback|exception/i.test(detail)) {
     return "That link is busy right now. Try again shortly, or upload the video file instead.";
@@ -55,18 +63,59 @@ export async function submitJob({ url, nClips, mode, burnSubtitles, autoCensor, 
 
 /** Uploads a local source video, then starts the exact same clipping pipeline.
     The options travel as JSON in multipart form so the video never needs to be
-    held in browser memory or encoded as base64. */
-export async function uploadJob(file, options) {
+    held in browser memory or encoded as base64.
+
+    XMLHttpRequest rather than fetch, purely for `upload.onprogress`: fetch
+    still cannot report how much of a request body has gone out. On a phone
+    pushing a 500 MB file that is the difference between a progress bar and
+    several silent minutes that look like a hang -- and the plan ceilings mean
+    the biggest allowed upload is 4 GB, so this is the normal case, not an edge
+    one. `onProgress` receives 0..1, or null when the browser cannot tell
+    (a stream of unknown length). */
+export function uploadJob(file, options, onProgress) {
   const body = new FormData();
   body.append("file", file);
   body.append("options", JSON.stringify(options));
-  const resp = await fetch(`${API_BASE}/jobs/upload`, {
-    method: "POST",
-    headers: authHeaders(),
-    body,
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE}/jobs/upload`);
+    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
+
+    xhr.upload.onprogress = (e) => {
+      onProgress?.(e.lengthComputable ? e.loaded / e.total : null);
+    };
+    /* The bytes are gone but the server has not answered yet -- transcoding
+       checks, the duration gate. Report 1 so the bar completes rather than
+       resting at 99% through a wait that has nothing to do with uploading. */
+    xhr.upload.onload = () => onProgress?.(1);
+
+    xhr.onload = () => {
+      let detail = "";
+      try {
+        const parsed = JSON.parse(xhr.responseText);
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(parsed);
+        detail = Array.isArray(parsed.detail)
+          ? parsed.detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
+          : parsed.detail || "";
+      } catch {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          return reject(new Error("The upload finished but the reply was unreadable."));
+        }
+      }
+      // Same shape readError produces, so callers can treat both identically.
+      const err = new Error(friendlyMessage(
+        xhr.status, detail, `Could not upload video (${xhr.status})`));
+      err.status = xhr.status;
+      err.detail = detail;
+      reject(err);
+    };
+    xhr.onerror = () => reject(new Error(
+      "The upload was interrupted. Check your connection and try again."));
+    xhr.onabort = () => reject(new Error("Upload cancelled."));
+
+    xhr.send(body);
   });
-  if (!resp.ok) throw await readError(resp, `Could not upload video (${resp.status})`);
-  return resp.json();
 }
 
 export async function getSourcePreview(url, signal) {

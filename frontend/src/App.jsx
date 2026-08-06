@@ -752,6 +752,11 @@ export default function App() {
   }, []);
   const [job, setJob] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  /* 0..1 while a local file is going up, null when nothing is uploading or the
+     browser cannot size the body. Kept apart from `submitting` because the
+     upload is only the first part of starting a job -- the gates and probes
+     that follow have no percentage, and conflating them would strand the bar. */
+  const [uploadPct, setUploadPct] = useState(null);
   const [submitError, setSubmitError] = useState(null);
   const [scrolled, setScrolled] = useState(false);
   const [startedAt, setStartedAt] = useState(Date.now());
@@ -895,7 +900,7 @@ export default function App() {
             ratio: options.ratio,
             length_pref: options.lengthPref,
             intent: options.intent,
-          })
+          }, setUploadPct)
         : await submitJob({ url: url.trim(), ...options });
       const { job_id } = result;
       const fresh = await getJob(job_id);
@@ -909,6 +914,7 @@ export default function App() {
       }
     } finally {
       setSubmitting(false);
+      setUploadPct(null);
     }
   }
 
@@ -1412,6 +1418,7 @@ export default function App() {
                 DropZone={DropZone}
                 SourcePreview={SourcePreview}
                 submitting={submitting}
+                uploadPct={uploadPct}
                 submitError={submitError}
                 onGenerate={handleSubmit}
                 onUpgrade={requestUpgrade}
@@ -1575,6 +1582,7 @@ export default function App() {
                 index={editing.index}
                 canEditCaptions={plan.can("caption_editing")}
                 canTightenPauses={plan.can("tighten_pauses")}
+                canRemoveWatermark={plan.can("no_watermark")}
                 onUpgrade={(reason) => requestUpgrade(reason || "editor_export")}
                 onClose={() => setEditing(null)}
                 onSaved={(index, updated) =>

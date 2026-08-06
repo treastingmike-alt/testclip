@@ -330,7 +330,7 @@ function ColourRow({ value, fallback, onChange, testid }) {
  */
 export default function LiveEditor({
   job, clip, index, onClose, onSaved, onUpgrade, canEditCaptions = false,
-  canTightenPauses = false,
+  canTightenPauses = false, canRemoveWatermark = false,
 }) {
   const [transcript, setTranscript] = useState(null);
   const [loadError, setLoadError] = useState("");
@@ -1005,6 +1005,14 @@ export default function LiveEditor({
     } catch (e) {
       if (e.status === 402) {
         onUpgrade?.();
+      } else if (e.status === 503) {
+        /* The render slots are full, which is a queue, not a failure. Saying
+           "we couldn't export that edit" would read as though the edit were at
+           fault and send someone hunting for what they did wrong. Nothing is
+           lost here -- the recipe is saved, and the same click works shortly. */
+        setExportError(e.message);
+        toast("Still busy — try again in a moment", {
+          detail: e.message, tone: "info" });
       } else {
         setExportError(e.message);
         toast("We couldn't export that edit", { detail: e.message, tone: "error" });
@@ -1674,6 +1682,38 @@ export default function LiveEditor({
                     title="Let pitch move with speed — the chipmunk/deep meme effect">
               {speedPitched ? "Pitch: meme" : "Pitch: natural"}
             </button>
+          </div>
+
+          {/* Deliberately NOT a toggle. The server decides the watermark from
+              the plan alone (see main.py), which is the only safe place for it
+              to be decided -- a switch here that the renderer ignored would be
+              a lie, and one it obeyed would hand the watermark off to anyone.
+              So this reports the real state, and for Free it is the upgrade
+              path. It sits in Video because that is where someone looks when
+              they are deciding what the exported file will look like.
+
+              The preview never shows the watermark either way: it plays the
+              proxy, and the credit is burned at export. Hence "exports", not
+              "this clip". */}
+          <div className="ctl ctl-block pacing-control">
+            <div className="pacing-copy">
+              <span className="ctl-label">Watermark</span>
+              <span className="ctl-hint">
+                {canRemoveWatermark
+                  ? "Your exports have no KlipCut credit"
+                  : "Free exports carry a small KlipCut credit"}
+              </span>
+            </div>
+            {canRemoveWatermark ? (
+              <span className="pacing-state" data-testid="watermark-clear">Removed ✓</span>
+            ) : (
+              <button type="button" className="pacing-segment-solo"
+                      data-testid="watermark-upgrade"
+                      onClick={() => onUpgrade?.("no_watermark")}>
+                Remove it
+                <span className="pacing-plan">Creator</span>
+              </button>
+            )}
           </div>
         </div>
         )}

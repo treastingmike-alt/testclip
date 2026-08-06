@@ -11,11 +11,45 @@ import subprocess
 
 OUT_W, OUT_H = 1080, 1920
 
+def _container_cpus() -> int:
+    """How many CPUs this process may actually use, not how many the host has.
+
+    os.cpu_count() reports the HOST's processors, which inside a container is
+    the wrong number in the expensive direction: a 2-vCPU service on a 48-core
+    host sees 48. cgroups is where the real quota lives, so read it.
+    """
+    for quota_path, period_path in (
+        ("/sys/fs/cgroup/cpu.max", None),                    # v2: "200000 100000"
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",              # v1: two files
+         "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+    ):
+        try:
+            raw = open(quota_path).read().split()
+            if period_path:
+                quota, period = int(raw[0]), int(open(period_path).read().strip())
+            else:
+                if raw[0] == "max":                          # v2, explicitly uncapped
+                    continue
+                quota, period = int(raw[0]), int(raw[1])
+            if quota > 0 and period > 0:
+                # Round up: a 1.5-CPU quota should still use 2 threads.
+                return max(1, -(-quota // period))
+        except Exception:
+            continue
+    return os.cpu_count() or 1
+
+
 # Ceiling on encoder threads. Left unset, x264 scales its thread count -- and so
 # its memory -- to whatever CPU count it can see, which inside a container is the
-# host's rather than the one the memory limit was sized for. Configurable
-# because the right number depends on the plan the service runs on.
-FFMPEG_THREADS = max(1, int(os.environ.get("CLIPPER_FFMPEG_THREADS", "4")))
+# host's rather than the one the memory limit was sized for.
+#
+# Defaulting this to a constant had the same bug in miniature: 4 threads on a
+# 2-vCPU service buys no throughput (there are only 2 cores to run on) while
+# still paying for 4 sets of x264 frame buffers, against a memory limit sized
+# for the smaller box. Track the actual quota instead, and let the env var win
+# for the cases where a human knows better.
+FFMPEG_THREADS = max(1, int(os.environ.get("CLIPPER_FFMPEG_THREADS", "0"))
+                     or _container_cpus())
 
 # The background is blurred at quarter size and then scaled back up. Blurring is
 # per-pixel work, so doing it at 540x960 instead of 1080x1920 is ~4x cheaper --

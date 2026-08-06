@@ -258,6 +258,14 @@ _FAILURES = [
      "This is a live stream that hasn't finished -- clip it after it ends."),
     ("is not a valid URL",
      "That doesn't look like a valid video link -- check the URL and try again."),
+    # Kick sits behind Cloudflare's bot protection, which refuses datacenter
+    # traffic outright -- every kick.com request from a hosted backend is turned
+    # away before it reaches a video, whatever the User-Agent says. yt-dlp
+    # recognises these links perfectly well; it simply never gets an answer. Say
+    # so plainly, because "try again shortly" would be a lie here.
+    ("[kick:",
+     "Kick blocks downloads from servers, so this link can't be fetched here. "
+     "Save the video from Kick and upload the file instead."),
 ]
 
 
@@ -269,11 +277,20 @@ def _friendly_error(log_text: str) -> str:
 
 
 def _public_failure(log_text: str) -> str:
-    """A useful next step for creators; detailed provider output stays in logs."""
-    friendly = _friendly_error(log_text)
-    if friendly:
-        return "We couldn't access this video. Check that it is public, or upload the video file instead."
-    return "This link is busy or unavailable right now. Try again shortly, or upload the video file instead."
+    """A useful next step for creators; detailed provider output stays in logs.
+
+    The point of _FAILURES is that "this video is private" and "this video is
+    age-restricted" need DIFFERENT next steps. This used to match one and then
+    return a single generic line regardless, so all of that resolved to "try
+    again shortly" -- advice that is simply wrong for a private video, and that
+    sends people into retry loops over something no retry can fix. The entries
+    are hand-written strings, not provider output, so passing them through
+    leaks nothing; the raw log still stays server-side.
+    """
+    return _friendly_error(log_text) or (
+        "This link is busy or unavailable right now. Try again shortly, or "
+        "upload the video file instead."
+    )
 
 
 def _is_auth_failure(log_text: str) -> bool:
