@@ -206,6 +206,56 @@ class FreeEditorExport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class QueuedJob(Base):
+    """One piece of pending work, and which worker has it.
+
+    A separate table rather than columns on Job, for the reason
+    FreeEditorExport gives: create_all can adopt a new table on an existing
+    database, and there is no migration tool here. It is also the honest shape.
+    A Job is the thing a user owns and keeps; this row is scheduling state that
+    exists only until the work is done, and then is deleted. Nothing here needs
+    to outlive the run.
+
+    Everything needed to RUN the job already lives on Job.options, frozen at
+    submission -- so this row carries no copy of it. One source of truth for
+    what was asked for, which is the same reason billing reads the frozen
+    options rather than the live request.
+    """
+
+    __tablename__ = "job_queue"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # Unique: a job is queued once. The claim is what makes it exclusive, and
+    # two rows for one job would let two workers each claim "their" row and
+    # render the same thing twice.
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("jobs.id"), unique=True, index=True
+    )
+
+    # Higher runs first. Pro accounts get lifted above the queue -- the only
+    # thing that makes billing's "priority" entitlement mean anything.
+    priority: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
+    # Retries exist for the crash case, not the rejection case: a container
+    # restart mid-render should be picked up again, while a private video will
+    # fail identically every time and must not be retried into a loop. run()
+    # decides which is which.
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # When this becomes eligible to run. Moves forward on retry so a failing
+    # job backs off instead of spinning against the front of the queue.
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, index=True
+    )
+
+    # Null means unclaimed. Set together, always.
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    claimed_by: Mapped[str] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Share(Base):
     """A public page for one clip.
 

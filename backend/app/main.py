@@ -19,6 +19,7 @@ import subprocess
 import random
 import secrets
 import threading
+import time
 import traceback
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import auth, billing, editing, polar_payments, storage, workspace
+from app import auth, billing, editing, polar_payments, queue, storage, workspace
 from app.db import SessionLocal, get_session, init_db
 from app.jobs import (create_job, expire_due_jobs, get_job, get_job_transcript,
                       list_jobs, update_job)
@@ -241,6 +242,20 @@ def _ass_colour_to_css(value: str) -> str:
     return f"#{rr}{gg}{bb}"
 
 
+@app.get("/health")
+def health():
+    """Liveness plus queue depth.
+
+    Depth is the number that decides when to add a worker: `waiting` climbing
+    while `running` stays flat means the workers are saturated, and no amount
+    of API capacity will help. Unauthenticated because a platform health check
+    cannot log in, and because none of it is sensitive -- counts only, no job
+    ids, no users.
+    """
+    return {"ok": True, "queue": queue.stats(),
+            "inline_worker": INLINE_WORKER}
+
+
 @app.get("/templates")
 def list_templates():
     """Lets the UI render the picker from one source of truth."""
@@ -377,6 +392,53 @@ def on_startup():
     removed = expire_due_jobs()
     if removed:
         print(f"[clipper] expired {removed} finished project(s)")
+
+    _start_inline_worker()
+
+
+# Whether this API process should also render.
+#
+# In production it should not: that is the entire point of the split, and a
+# worker sharing the web server's CPU and memory limit is what the queue was
+# introduced to stop. Set CLIPPER_INLINE_WORKER=0 on the API service and run
+# worker.py as its own service.
+#
+# Locally it should, because otherwise `make dev` starts a server that accepts
+# jobs and never runs them -- a broken-looking app and a second terminal to
+# remember. Defaulting ON keeps development a single command, and the
+# production deploy turns it off explicitly.
+INLINE_WORKER = os.environ.get("CLIPPER_INLINE_WORKER", "1").lower() not in (
+    "0", "false", "no", "off")
+
+
+def _start_inline_worker() -> None:
+    if not INLINE_WORKER:
+        print("[clipper] inline worker off -- run worker.py to process jobs")
+        return
+
+    from app import runner
+
+    def loop():
+        name = f"inline:{queue.worker_name()}"
+        last_reap = 0.0
+        while True:
+            try:
+                now = time.monotonic()
+                if now - last_reap > 60:
+                    queue.release_stale()
+                    last_reap = now
+                if not runner.work_once(run_queued_job, name):
+                    time.sleep(2)
+            except Exception:
+                # A daemon thread that raises dies silently, taking job
+                # processing with it and leaving a server that looks healthy
+                # and quietly does nothing.
+                print(f"[clipper] inline worker error\n{traceback.format_exc()}")
+                time.sleep(5)
+
+    threading.Thread(target=loop, name="clipper-inline-worker",
+                     daemon=True).start()
+    print("[clipper] inline worker started (CLIPPER_INLINE_WORKER=0 to disable)")
 
 
 @app.post("/auth/register")
@@ -1360,9 +1422,61 @@ def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
         + timedelta(hours=billing.retention_hours_for(plan_id, email))
     ).isoformat()
     job_id = create_job(req.url, options, user_id=user.id if user else None)
-    background_tasks.add_task(run_pipeline, job_id, req, gameplay_loops,
-                              user.id if user else None, uploaded)
+    # Onto the queue rather than into this process. BackgroundTasks ran the
+    # render inside the web server, so a redeploy or an OOM kill lost every job
+    # in flight with no record they had ever started -- and the user had already
+    # been charged. A claimed row can be released and picked up again.
+    #
+    # `background_tasks` is still accepted so the signature is unchanged for
+    # callers; nothing is scheduled on it any more.
+    queue.enqueue(job_id, priority=_job_priority(user))
     return job_id
+
+
+def _job_priority(user: User = None) -> int:
+    """Where this job enters the queue.
+
+    The first thing that makes billing's "priority" entitlement real: until
+    now it was declared on the Pro plan, advertised as "Priority rendering",
+    and used precisely nowhere.
+    """
+    if user and billing.allows(user.plan, "priority", user.email):
+        return queue.PRIORITY_PRO
+    return 0
+
+
+def run_queued_job(job_id: str) -> None:
+    """Run one claimed job. The worker's only entry point into the pipeline.
+
+    Everything needed is rebuilt from what was frozen onto the job at
+    submission, never from live state: the worker may be a different process on
+    a different machine running days later, and the job must render as it was
+    agreed to, not as the account looks now.
+    """
+    with SessionLocal() as session:
+        row = session.get(Job, job_id)
+        if not row:
+            print(f"[worker] job {job_id} vanished before it ran")
+            return
+        options = dict(row.options or {})
+        job_user_id = row.user_id
+        url = row.url
+
+    # Only the fields JobRequest actually declares: options also carries the
+    # frozen plan decisions (watermark, retention, ceilings), which are read
+    # directly by the pipeline and would be rejected as unknown fields here.
+    fields = set(JobRequest.model_fields)
+    req = JobRequest(**{k: v for k, v in options.items() if k in fields},
+                     url=url)
+
+    uploaded = options.get("input_type") == "upload"
+    # Re-resolved rather than carried: the loops are files on the worker's own
+    # disk, and a path from whichever machine accepted the request means
+    # nothing here.
+    tpl = TEMPLATES.get(req.template, TEMPLATES["classic"])
+    gameplay_loops = _gameplay_loops() if tpl["frame"] == "gameplay" else []
+
+    run_pipeline(job_id, req, gameplay_loops, job_user_id, uploaded)
 
 
 @app.post("/sources/preview")
@@ -1487,6 +1601,17 @@ def job_status(job_id: str):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # How many jobs are ahead, while this one is still waiting. A wait you can
+    # watch shrink is a queue; the same wait with no number is indistinguishable
+    # from the app being broken, which is what people close the tab over.
+    if job.get("status") == "queued":
+        ahead = queue.position(job_id)
+        if ahead is not None:
+            job["queue_position"] = ahead
+            job["progress_message"] = (
+                "Starting now..." if ahead == 0
+                else f"Waiting — {ahead} job{'' if ahead == 1 else 's'} ahead of you"
+            )
     return job
 
 

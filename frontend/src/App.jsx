@@ -218,8 +218,14 @@ function ProcessingStudio({ job, startedAt, onCancel }) {
     0
   );
   const failed = job.status === "failed";
+  /* Waiting for a worker is not step one. Rendering it as "Getting your video
+     ready" claimed work that had not started, so a queue of three looked like
+     a job frozen at the first stage -- the exact reading that makes someone
+     reload, resubmit, and pay twice. */
+  const queued = job.status === "queued";
+  const ahead = job.queue_position;
   const stageBase = (STAGE_ORDER.indexOf(job.status) - 1) / STAGES.length;
-  const overall = failed
+  const overall = failed || queued
     ? 0
     : Math.min(99, Math.max(0, stageBase * 100 + (job.percent || 0) / STAGES.length));
 
@@ -230,11 +236,20 @@ function ProcessingStudio({ job, startedAt, onCancel }) {
 
         <div className="studio-head">
           <span className="studio-eyebrow">
-            {failed ? "Something went wrong" : `Step ${currentIdx + 1} of ${STAGES.length}`}
+            {failed ? "Something went wrong"
+              : queued ? "In the queue"
+              : `Step ${currentIdx + 1} of ${STAGES.length}`}
           </span>
-          <h3>{failed ? "We couldn't finish this one" : STAGES[currentIdx].label}</h3>
+          <h3>
+            {failed ? "We couldn't finish this one"
+              : queued ? (ahead ? `${ahead} job${ahead === 1 ? "" : "s"} ahead of you`
+                                : "Starting now")
+              : STAGES[currentIdx].label}
+          </h3>
           <p className="studio-blurb">
-            {failed ? "The details are below — most of the time it's an unsupported or speechless video." : STAGES[currentIdx].blurb}
+            {failed ? "The details are below — most of the time it's an unsupported or speechless video."
+              : queued ? "Your place is saved. You can close this page — we'll keep it and add the clips to your Library."
+              : STAGES[currentIdx].blurb}
           </p>
           <div className="studio-meta">
             <span className="studio-live">
