@@ -17,6 +17,8 @@ import os
 import re
 import subprocess
 import threading
+import urllib.parse
+import urllib.request
 
 # "[download]  46.3% of ..." -- yt-dlp emits one of these per line with --newline
 _PERCENT_RE = re.compile(r"\[download\]\s+([\d.]+)%")
@@ -83,6 +85,103 @@ PROXY = os.environ.get("CLIPPER_PROXY", "").strip()
 # This is mitigation, not a fix. Which clients work changes every few weeks, so
 # treat it as buying time rather than solving the problem.
 PLAYER_CLIENTS = ("default", "android", "ios", "tv")
+
+
+# ---------------------------------------------------------------------------
+# Metadata through YouTube's official API
+# ---------------------------------------------------------------------------
+# METADATA and MEDIA BYTES are two different problems with two different
+# answers, and treating them as one is why a blocked IP currently breaks the
+# preview as well as the download:
+#
+#   bytes    -- only a better IP helps. See the note on PROXY above.
+#   metadata -- YouTube publishes this through the Data API, which authenticates
+#               by API KEY and never judges the caller's IP. It answers in about
+#               200ms against yt-dlp's ~8s on a good address (and minutes on a
+#               blocked one, since that walks every client before giving up).
+#               Free to 10,000 units/day; a videos.list call costs 1.
+#
+# So the preview -- the only thing between pasting a link and seeing the video,
+# and the whole reason links beat uploads -- becomes instant and reliable even
+# where the download would still be refused. With no key set this is skipped
+# and yt-dlp handles metadata exactly as before.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+
+_YT_ID_RE = re.compile(
+    r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/|v/))"
+    r"([A-Za-z0-9_-]{11})"
+)
+
+
+def _youtube_id(url: str) -> str:
+    """The 11-character video id, or "" when this is not one YouTube video."""
+    match = _YT_ID_RE.search(url)
+    return match.group(1) if match else ""
+
+
+def _iso8601_seconds(text: str):
+    """PT1H2M3S -> 3723.0. The Data API reports length only in this form."""
+    match = re.fullmatch(r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+                         text or "")
+    if not match:
+        return None
+    days, hours, minutes, seconds = (int(g or 0) for g in match.groups())
+    return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+
+
+def _youtube_api_metadata(url: str):
+    """Title, creator, duration and thumbnail straight from YouTube.
+
+    Returns None whenever it cannot answer -- no key, not a YouTube link, quota
+    exhausted, network trouble -- so the caller falls through to yt-dlp. This is
+    an accelerator and must never become a new way for a preview to fail.
+    """
+    video_id = _youtube_id(url)
+    if not (YOUTUBE_API_KEY and video_id):
+        return None
+
+    query = urllib.parse.urlencode({
+        "id": video_id,
+        "key": YOUTUBE_API_KEY,
+        "part": "snippet,contentDetails",
+    })
+    try:
+        with urllib.request.urlopen(
+                f"https://www.googleapis.com/youtube/v3/videos?{query}",
+                timeout=10) as response:
+            payload = json.load(response)
+    except Exception as exc:              # quota, network, bad key
+        print(f"[clipper] YouTube Data API unavailable, falling back to "
+              f"yt-dlp: {exc}")
+        return None
+
+    items = payload.get("items") or []
+    if not items:
+        # An authoritative "no such video" -- private, deleted, or a wrong id.
+        # yt-dlp would spend seconds reaching the same conclusion.
+        raise RuntimeError(
+            "YouTube has no video at that link. It may be private or deleted, "
+            "or the URL may be wrong."
+        )
+
+    item = items[0]
+    snippet = item.get("snippet") or {}
+    if (snippet.get("liveBroadcastContent") or "none") != "none":
+        raise RuntimeError(
+            "This stream is still live. Clip it once the stream has ended and "
+            "the replay is up."
+        )
+
+    thumbs = (snippet.get("thumbnails") or {}).values()
+    best = max(thumbs, key=lambda t: t.get("width", 0), default={})
+    return {
+        "title": snippet.get("title") or "Untitled video",
+        "creator": snippet.get("channelTitle"),
+        "duration": _iso8601_seconds(
+            (item.get("contentDetails") or {}).get("duration")),
+        "thumbnail": best.get("url"),
+        "platform": "YouTube",
+    }
 
 
 def _cookie_args() -> list:
@@ -306,6 +405,13 @@ def estimate_video_bytes(url: str) -> int:
 
 def inspect_url(url: str) -> dict:
     """Read public video metadata without downloading its media streams."""
+    # Ask YouTube directly first. It is roughly 40x faster than yt-dlp here and,
+    # more importantly, works from an address yt-dlp is refused from -- so the
+    # preview keeps working on a server whose downloads do not.
+    from_api = _youtube_api_metadata(url)
+    if from_api:
+        return from_api
+
     log = ""
     proc = None
     # Try each client in turn: a bot challenge is per-client, so the one that
@@ -347,6 +453,25 @@ def inspect_url(url: str) -> dict:
         info = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("The video site did not return usable preview data.") from exc
+
+    # A stream that is still running reports no duration and has no end. Two
+    # things go wrong if it gets through: the download never terminates, and
+    # _gate_source_duration sees a null length and blames the user's PLAN --
+    # "we couldn't confirm this video's length on the Free plan" -- for what is
+    # really "come back when it's over". Kick channel URLs are the common way in,
+    # since kick.com/<name> IS the live URL, but this is per-site behaviour that
+    # YouTube and Twitch share.
+    live = info.get("live_status")
+    if info.get("is_live") or live == "is_live":
+        raise RuntimeError(
+            "This stream is still live. Clip it once the stream has ended and "
+            "the replay is up."
+        )
+    if live == "post_live":
+        raise RuntimeError(
+            "This stream just ended and the replay is still being processed. "
+            "Try again in a few minutes."
+        )
 
     thumbs = info.get("thumbnails") or []
     thumb = info.get("thumbnail") or next(

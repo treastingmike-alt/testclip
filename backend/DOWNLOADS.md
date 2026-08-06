@@ -70,9 +70,39 @@ fails there — cheaply, before Deepgram is called. The expensive case is a link
 that passes the audio fetch and is then refused for the video, which is why the
 refund exists.
 
+## Metadata is not bytes
+
+These are two problems, and treating them as one is what makes a blocked IP
+look worse than it is:
+
+| | Blocked by IP? | Cost | How |
+|---|---|---|---|
+| Metadata (title, length, thumbnail) | **No** | Free to 10k/day | YouTube Data API |
+| Media bytes | **Yes** | Proxy, ~$1–5/GB | yt-dlp |
+
+Set `YOUTUBE_API_KEY` and the preview stops going through yt-dlp entirely. It
+answers in ~200ms instead of ~8s, and it answers *from a server whose downloads
+are refused* — because the Data API authenticates by key and never looks at the
+caller's address.
+
+That is worth doing on its own merits. Pasting a link and seeing the video
+appear instantly is the reason links beat uploads; routing that through a
+scraper that a datacenter IP gets throttled on gave the slowest, least reliable
+version of the product's best moment. Get a key from the Google Cloud console
+(enable "YouTube Data API v3"). Without one, nothing changes — yt-dlp handles
+metadata as before.
+
+It does **not** fix downloads. Only the IP does that.
+
 ## Recommendation
 
-Ship **upload** as the reliable path and links as convenience. Uploads have no
-IP problem, no cookie decay, and no dependency on a third party's tolerance.
-If links are core to the product, budget for a residential proxy — that is the
-real answer, and it costs money.
+Links are the product — paste-and-go is the pitch, and a two-hour podcast is a
+multi-GB upload nobody will sit through. So:
+
+1. **Set `YOUTUBE_API_KEY`.** Free, and it makes the preview instant and
+   IP-proof. Do this first.
+2. **Budget for a residential proxy** if link downloads matter, which they do.
+   This is the actual fix for the actual problem, and it costs money. Every
+   commercial clipper is paying it.
+3. **Keep upload** as the escape hatch for when a link is refused anyway —
+   which will still happen, to everyone, including the competition.

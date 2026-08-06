@@ -39,9 +39,9 @@ from app.db import SessionLocal, get_session, init_db
 from app.jobs import (create_job, expire_due_jobs, get_job, get_job_transcript,
                       list_jobs, update_job)
 from app.models import Clip, FreeEditorExport, Job, Share, User, _iso_utc
-from app.pipeline import (analyzer, caption_presets, censor, energy, downloader,
-                          pacing, reframe, render, scoring, subtitles,
-                          transcriber, voiceover)
+from app.pipeline import (analyzer, caption_emoji, caption_presets, censor,
+                          energy, downloader, pacing, reframe, render, scoring,
+                          subtitles, transcriber, voiceover)
 from app.polar_catalog import checkout_url as polar_static_checkout_url
 from app.polar_catalog import subscription_product, topup_product
 
@@ -233,6 +233,10 @@ class JobRequest(BaseModel):
     intent: str = ""                # free-text steer, e.g. "when he talks about pricing"
     tighten_pauses: bool = True     # cut dead air so the clip does not feel merely trimmed
     auto_censor: bool = True        # mute profanity and star it in captions
+    # Let the model mark the cues that earn an emoji. Off by default: it costs
+    # one extra model call per clip, and emoji suit some channels and actively
+    # cheapen others, so this is a choice rather than a default.
+    auto_emoji: bool = False
     # Transcribe speech that switches language mid-sentence with the model that
     # can follow it. Off by default and gated on the plan -- see billing.allows.
     multilingual: bool = False
@@ -1710,13 +1714,22 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
             if req.mode == "original":
                 if req.burn_subtitles and clip_words:
                     subtitle_path = os.path.join(job_dir, f"clip_{i}.ass")
+                    caption_preset_id = caption_presets.get(req.caption_style)["id"]
+                    # Planned here rather than inside build_ass so the renderer
+                    # stays free of network calls. Returns {} on any failure --
+                    # a clip without emoji is worth far more than a failed job.
+                    cue_emoji = (
+                        caption_emoji.plan(caption_words, caption_preset_id)
+                        if req.auto_emoji else {}
+                    )
                     subtitles.build_ass(caption_words,
                                         0.0 if segments else clip["start"], subtitle_path,
                                         clip_margin_v,
-                                        style=caption_presets.get(req.caption_style)["id"],
+                                        style=caption_preset_id,
                                         play_res=(out_w, out_h),
                                         title=clip.get("title", ""),
-                                        keywords=clip.get("keywords"))
+                                        keywords=clip.get("keywords"),
+                                        cue_emoji=cue_emoji)
                 end_time = clip["end"]
             else:
                 script_text = voiceover.write_narration_script(

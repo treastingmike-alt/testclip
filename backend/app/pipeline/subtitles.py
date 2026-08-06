@@ -357,6 +357,23 @@ def emoji_spans(text: str) -> str:
     return "".join(out)
 
 
+def emoji_tail(mark: str, back_to: str) -> str:
+    r"""An emoji appended to a caption cue, without disturbing the cue's styling.
+
+    emoji_spans closes its override with \r, which is why it was confined to
+    titles: \r resets to the style default and would wipe the karaoke colour
+    overrides a caption line is carrying, turning the highlight off partway
+    through. Naming the caption face explicitly on the way back out closes the
+    font override and nothing else, so the same trick becomes safe on cues.
+
+    Returns "" when no emoji face is installed, so callers need no guard.
+    """
+    face = emoji_font()
+    if not mark or not face:
+        return ""
+    return " {\\fn%s}%s{\\fn%s}" % (face["family"], mark, back_to)
+
+
 def _word_text(word: dict) -> str:
     return word.get("punctuated_word") or word.get("word") or ""
 
@@ -690,7 +707,8 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
               font: str = None, size_px: int = None,
               animation: str = None,
               color: str = None, active_color: str = None,
-              title_style: str = None, title_font: str = None) -> str:
+              title_style: str = None, title_font: str = None,
+              cue_emoji: dict = None) -> str:
     """Writes an ASS file whose timings are relative to the clip's own start.
 
     words:           Deepgram word objects with absolute 'start'/'end' seconds
@@ -724,6 +742,14 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
         rendered = [_escape(_word_text(w)) for w in cue]
         if st["uppercase"]:
             rendered = [t.upper() for t in rendered]
+
+        # AFTER uppercasing, which would otherwise turn \fn into \FN and the
+        # family name with it, leaving a tag libass does not recognise. Attached
+        # to the cue's last word rather than to the finished line so it travels
+        # through karaoke, phrase and typewriter output alike.
+        mark = (cue_emoji or {}).get(ci)
+        if mark and rendered:
+            rendered[-1] += emoji_tail(mark, st["font"])
 
         # Where the following cue takes over. The last word of this cue must not
         # outlive it, or two different lines are on screen at once.
