@@ -5,9 +5,17 @@ and keeps the original audio track by default.
 
 import json
 import os
+import re
+import signal
 import subprocess
 
 OUT_W, OUT_H = 1080, 1920
+
+# Ceiling on encoder threads. Left unset, x264 scales its thread count -- and so
+# its memory -- to whatever CPU count it can see, which inside a container is the
+# host's rather than the one the memory limit was sized for. Configurable
+# because the right number depends on the plan the service runs on.
+FFMPEG_THREADS = max(1, int(os.environ.get("CLIPPER_FFMPEG_THREADS", "4")))
 
 # The background is blurred at quarter size and then scaled back up. Blurring is
 # per-pixel work, so doing it at 540x960 instead of 1080x1920 is ~4x cheaper --
@@ -795,6 +803,16 @@ def render_clip(
         # preset barely moved -- crf did, so only crf moves here.
         "-c:v", "libx264", "-preset", "veryfast",
         "-crf", "19" if reframe_plan else "20",
+        # Bounded on purpose. x264 allocates per-thread frame buffers sized from
+        # the CPU count it can see, and in a container that is the HOST's count
+        # -- 48 on Railway against 8 on a laptop -- while the memory ceiling
+        # belongs to the container. At 1080x1920 through this filter graph that
+        # is enough allocation to get the process OOM-killed, which arrives as
+        # SIGKILL with an empty error and looks like a mystery. make_proxy
+        # survives the same machine only because it scales the frames down
+        # first. Costs little at veryfast, where the encoder is not the
+        # bottleneck.
+        "-threads", str(FFMPEG_THREADS),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
         *extra,
@@ -804,7 +822,7 @@ def render_clip(
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError("ffmpeg failed:\n" + proc.stderr[-2000:])
+        raise RuntimeError(ffmpeg_failure("clip render", cmd, proc))
     return out_path
 
 
@@ -834,6 +852,73 @@ def proxy_window(start: float, end: float, duration: float = None) -> tuple:
     if duration:
         hi = min(hi, float(duration))
     return lo, max(hi, lo + 1.0)
+
+
+# ffmpeg reports progress on STDERR, continuously, one line per update. So the
+# last N characters of a failed run are nearly always "frame= 19 fps=5.4 ..."
+# and the line that actually explains the failure has long since scrolled past.
+# Tailing the buffer was hiding the diagnosis in every single report.
+_FFMPEG_NOISE = re.compile(
+    r"^\s*(frame=|size=|video:|audio:|Press \[q\]|built with|configuration:|"
+    r"lib(av|sw|postproc)\w*\s|\[libx264|Output #|Input #|Stream #|Stream map|"
+    r"Metadata:|Side data:|encoder\s*:|handler_name\s*:|vendor_id\s*:|"
+    r"major_brand|minor_version|compatible_brands|cpb:|Duration:|"
+    r"Last message repeated)"
+)
+
+
+def ffmpeg_failure(what: str, cmd: list, proc) -> str:
+    """A message that names the cause, instead of echoing the progress meter.
+
+    Three things go in, in order of how often they turn out to be the answer:
+
+    1. THE EXIT CODE, which was previously computed and thrown away. A negative
+       code means the kernel killed the process, and that is a completely
+       different problem from ffmpeg rejecting its input -- it needs saying,
+       because a killed process writes no error at all and the stderr simply
+       stops mid-sentence, which reads like a truncated log rather than a
+       diagnosis.
+    2. The real error lines, filtered out of the progress spam.
+    3. The command, so the filter graph can be reproduced by hand.
+
+    The full stderr goes to the server console; only the summary travels.
+    """
+    code = proc.returncode
+    lines = [l.rstrip() for l in (proc.stderr or "").splitlines() if l.strip()]
+
+    # Unabridged, to the console. Whatever the summary decides to highlight, the
+    # complete output has to be somewhere -- the summary is a guess about what
+    # mattered, and a guess is a bad thing to be stuck with at 2am.
+    print(f"[clipper] {what} failed (exit {code}). Full ffmpeg output:\n"
+          + "\n".join(lines[-80:]))
+
+    if code < 0:
+        sig = -code
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        detail = (
+            f"{what} was KILLED by the system ({name}, exit {code}) rather than "
+            f"failing on its own -- so ffmpeg never got to report anything, "
+            f"which is why the log just stops."
+        )
+        if sig == signal.SIGKILL:
+            detail += (
+                "\n\nSIGKILL almost always means the container ran out of "
+                "memory. x264 sizes its per-thread buffers from the CPU count "
+                "it can see, and inside a container that is the HOST's count, "
+                "while the memory ceiling is the container's -- so the same "
+                "code that fits on a laptop can be killed on a bigger machine. "
+                "CLIPPER_FFMPEG_THREADS caps it; raise the service's memory if "
+                "it persists."
+            )
+        return detail
+
+    errors = [l for l in lines if not _FFMPEG_NOISE.match(l)]
+    body = "\n".join(errors[-12:]) if errors else "(ffmpeg printed no error text)"
+    return (f"{what} failed with exit code {code}:\n{body}\n\n"
+            f"command: {' '.join(cmd[:40])}")
 
 
 def make_proxy(video_path: str, out_path: str,
@@ -877,11 +962,11 @@ def make_proxy(video_path: str, out_path: str,
     span = (["-t", f"{max(0.1, float(end) - float(start)):.3f}"]
             if start is not None and end is not None else [])
 
-    proc = subprocess.run(
-        ["ffmpeg", "-y", *seek, "-i", video_path, *span,
+    cmd = ["ffmpeg", "-y", *seek, "-i", video_path, *span,
          "-vf", f"scale={PROXY_WIDTH}:-2",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", str(PROXY_CRF),
          "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+         "-threads", str(FFMPEG_THREADS),
          "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "96k",
          "-movflags", "+faststart",
@@ -891,14 +976,13 @@ def make_proxy(video_path: str, out_path: str,
          # introduced. That is why the editor sat on "Preparing the editor
          # preview" indefinitely -- there was never a file coming.
          "-f", "mp4",
-         part_path],
-        capture_output=True, text=True,
-    )
+         part_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         try:
             os.remove(part_path)
         except OSError:
             pass
-        raise RuntimeError("proxy render failed:\n" + proc.stderr[-1200:])
+        raise RuntimeError(ffmpeg_failure("editor preview", cmd, proc))
     os.replace(part_path, out_path)
     return out_path
