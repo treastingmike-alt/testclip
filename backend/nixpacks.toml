@@ -1,3 +1,11 @@
+# NOTE: Railway now defaults to RAILPACK, the successor to Nixpacks, and Railpack
+# does not read this file -- see railpack.json beside it, which is what actually
+# takes effect. A deploy built by Railpack showed Python under /mise/installs/
+# and still had no ffprobe, while this file sat here looking correct.
+#
+# Kept because the builder is a per-service setting: anything still on Nixpacks
+# needs this, and the two are cheap to hold in step.
+#
 # Railway builds this service with Nixpacks, which installs Python packages from
 # requirements.txt and nothing else. Two things this app runs are not Python
 # packages, so without this file they are simply absent in the container:

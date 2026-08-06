@@ -1575,6 +1575,12 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         # Anonymous jobs are free while metering is unenforced.
         if job_user_id:
             cost = billing.credits_for_clips(len(resolved_clips))
+            # Remembered so the failure handler can give it back. Everything
+            # after this point can still fail -- the source download is the
+            # likeliest, since YouTube can refuse it long after the transcript
+            # was paid for -- and a user billed for clips they never received
+            # is the worst bug this file can have.
+            charged_credits = cost
             if not billing.charge(job_user_id, cost, job_id=job_id,
                                   note=f"{len(resolved_clips)} clip(s)"):
                 have = billing.balance(job_user_id)
@@ -1786,6 +1792,17 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
         # RuntimeErrors are raised by us with messages written for humans; for
         # anything else, still show only the message, not the stack.
         traceback.print_exc()
+
+        # Give the credits back before anything else. The charge happens once
+        # the clip count is known but before rendering, so every failure past
+        # that point had been leaving the user paying for clips that do not
+        # exist -- and the commonest one, YouTube refusing the download, is not
+        # remotely their fault.
+        if charged_credits and job_user_id:
+            if billing.refund(job_user_id, charged_credits, job_id=job_id):
+                print(f"[clipper] refunded {charged_credits} credits for "
+                      f"failed job {job_id}")
+
         raw = str(e) or e.__class__.__name__
         if "No speech was found" in raw or "Nothing in this video scored" in raw:
             message = raw

@@ -65,12 +65,55 @@ if COOKIES_FILE and not os.path.exists(COOKIES_FILE):
 COOKIES_BROWSER = os.environ.get("CLIPPER_COOKIES_BROWSER", "").strip()
 
 
+# A residential proxy, if you have one. This is the only thing that reliably
+# fixes "Sign in to confirm you're not a bot" at scale: the block is on the IP,
+# not the request. Datacenter ranges -- Railway, Render, AWS, GCP -- are
+# pre-flagged, and no combination of headers, clients or cookies changes which
+# network the packets came from. Cookies help, but YouTube invalidates them
+# faster when it sees them used from a datacenter, so they decay in exactly the
+# environment that needs them most.
+PROXY = os.environ.get("CLIPPER_PROXY", "").strip()
+
+# YouTube applies the bot challenge per client. When the default web client is
+# challenged, another often is not -- so a failure is worth retrying as a
+# different client before giving up. Ordered by how much detail they return:
+# web carries the richest metadata, the mobile clients are the ones that tend to
+# still work from a blocked IP.
+#
+# This is mitigation, not a fix. Which clients work changes every few weeks, so
+# treat it as buying time rather than solving the problem.
+PLAYER_CLIENTS = ("default", "android", "ios", "tv")
+
+
 def _cookie_args() -> list:
     if COOKIES_FILE:
         return ["--cookies", COOKIES_FILE]
     if COOKIES_BROWSER:
         return ["--cookies-from-browser", COOKIES_BROWSER]
     return []
+
+
+def _network_args() -> list:
+    return ["--proxy", PROXY] if PROXY else []
+
+
+def _client_args(client: str) -> list:
+    """Extractor args for one player client, or nothing for yt-dlp's default."""
+    if client == "default":
+        return []
+    return ["--extractor-args", f"youtube:player_client={client}"]
+
+
+def _is_bot_block(log_text: str) -> bool:
+    """YouTube refusing the IP rather than the video being unavailable.
+
+    Worth separating because the two want opposite responses: a blocked IP is
+    retryable with a different client and is a configuration problem to report,
+    while a private or deleted video will fail identically no matter what.
+    """
+    markers = ("Sign in to confirm", "confirm you're not a bot",
+               "confirm you’re not a bot", "not a bot")
+    return any(m in log_text for m in markers)
 
 
 
@@ -263,18 +306,42 @@ def estimate_video_bytes(url: str) -> int:
 
 def inspect_url(url: str) -> dict:
     """Read public video metadata without downloading its media streams."""
-    try:
-        proc = subprocess.run(
-            ["yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
-             "--no-warnings", *_cookie_args(), url],
-            capture_output=True, text=True, timeout=45,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        raise RuntimeError("Could not check that video link. Try again or upload the file.") from exc
+    log = ""
+    proc = None
+    # Try each client in turn: a bot challenge is per-client, so the one that
+    # fails is often not the one that would have worked.
+    for client in PLAYER_CLIENTS:
+        try:
+            proc = subprocess.run(
+                ["yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
+                 "--no-warnings", *_cookie_args(), *_network_args(),
+                 *_client_args(client), url],
+                capture_output=True, text=True, timeout=45,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(
+                "Could not check that video link. Try again or upload the file."
+            ) from exc
 
-    if proc.returncode != 0:
+        if proc.returncode == 0:
+            if client != "default":
+                print(f"[clipper] metadata needed the {client} client "
+                      f"(the default was blocked)")
+            break
+
         log = proc.stderr + proc.stdout
+        if not _is_bot_block(log):
+            break        # private, deleted or unsupported -- another client won't help
+
+    if proc is None or proc.returncode != 0:
         print("[clipper] source preview failure:\n" + log)
+        if _is_bot_block(log):
+            # Say what is actually wrong. "Try a public video link" sent users
+            # hunting for a problem with their video when the video was fine and
+            # the server's IP was the thing being refused.
+            print("[clipper] YouTube refused this server's IP. Set CLIPPER_PROXY "
+                  "to a residential proxy, or CLIPPER_COOKIES_FILE to a fresh "
+                  "cookies.txt. See DOWNLOADS.md.")
         raise RuntimeError(_public_failure(log))
     try:
         info = json.loads(proc.stdout)

@@ -300,6 +300,29 @@ def charge(user_id: str, amount: int, job_id: str = None, note: str = "") -> boo
         return True
 
 
+def refund(user_id: str, amount: int, job_id: str = None) -> bool:
+    """Returns credits for work that was charged and then could not be delivered.
+
+    Charging happens once the clip count is known but before rendering, so any
+    later failure -- most often the source download being refused after the
+    transcript was already paid for -- used to leave the user billed for
+    nothing. The ledger keeps both rows so the history still shows what
+    happened rather than quietly rewriting it.
+    """
+    if not user_id or amount <= 0:
+        return False
+    with SessionLocal() as session:
+        user = session.get(User, user_id)
+        if not user:
+            return False
+        user.credits += amount
+        session.add(CreditLedger(user_id=user_id, delta=amount,
+                                 balance_after=user.credits, job_id=job_id,
+                                 note="refund: job failed"))
+        session.commit()
+        return True
+
+
 def grant_credits(user_id: str, amount: int, note: str = "purchase") -> int:
     """Adds credits for trusted internal/admin flows.
 
