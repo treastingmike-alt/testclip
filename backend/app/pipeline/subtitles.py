@@ -212,21 +212,71 @@ def _is_devanagari(text: str) -> bool:
     return any(0x0900 <= ord(c) <= 0x097F for c in text)
 
 
-def devanagari_family(preferred: str = None) -> str:
-    """A shipped family that can draw Devanagari, or None if none can.
+def devanagari_font() -> tuple:
+    """(font id, family) of a shipped face that can draw Devanagari.
 
-    Missing Devanagari is not a soft fallback the way a missing weight is: libass
-    reports "failed to find any fallback with glyph 0x939", ffmpeg exits non-zero
-    and render_clip raises, so a Hindi clip fails outright rather than rendering
-    in the wrong face. The per-font coverage flag already exists (see
-    _discover_fonts) and was only ever reported to the editor -- this is what
+    Both halves are needed because the two styles resolve fonts differently: a
+    caption style stores a FAMILY directly, while the title goes through
+    title_look -> resolve_font, which expects an ID. Handing a family name to
+    the ID path silently resolves to nothing and falls back to the very font
+    that could not draw the text.
+
+    Missing Devanagari is not a soft fallback the way a missing weight is:
+    libass reports "failed to find any fallback with glyph 0x939", ffmpeg exits
+    non-zero, and render_clip raises -- so a Hindi clip fails outright instead
+    of rendering in the wrong face. The per-font coverage flag already exists
+    (see _discover_fonts) and was only ever reported to the editor; this is what
     makes it decide something.
     """
-    if preferred and any(e["family"] == preferred and e.get("devanagari")
-                         for e in FONTS.values()):
-        return preferred
-    return next((e["family"] for e in FONTS.values() if e.get("devanagari")),
-                None)
+    for key, entry in FONTS.items():
+        if entry.get("devanagari"):
+            return key, entry["family"]
+    return None, None
+
+
+def _covers_devanagari(family: str) -> bool:
+    return any(e["family"] == family and e.get("devanagari")
+               for e in FONTS.values())
+
+
+def _fit_devanagari(st: dict, caption_text: str, title: str,
+                    title_font: str) -> tuple:
+    """(style, title_font) adjusted so each can draw the text it carries.
+
+    Caption and title are judged on their OWN text and swapped independently,
+    because they are separate ASS styles fed from separate sources. The analyzer
+    writes titles in the video's language, so a Hindi source gets a Hindi title
+    even when the speech is romanised and the captions are pure ASCII -- a clip
+    whose captions are fine and whose title alone fails the render.
+
+    Shared by both ASS builders. build_ass_lines is the translated-subtitle
+    path, where asking for Hindi guarantees Devanagari, so it needs this at
+    least as much as the karaoke one does.
+    """
+    caption_needs = _is_devanagari(caption_text)
+    title_needs = _is_devanagari(title or "")
+    if not (caption_needs or title_needs):
+        return st, title_font
+
+    font_id, family = devanagari_font()
+    if not family:
+        # Nothing shipped can draw it. Let it fail loudly at ffmpeg rather than
+        # silently swapping to another face that also cannot.
+        print("[clipper] text needs Devanagari but no shipped font provides it")
+        return st, title_font
+
+    if caption_needs and not _covers_devanagari(st["font"]):
+        print(f"[clipper] captions contain Devanagari; using {family} instead "
+              f"of {st['font']}, which cannot draw it")
+        st = {**st, "font": family}
+
+    title_now = resolve_font(title_font) or TITLE_STYLE["font"]
+    if title_needs and not _covers_devanagari(title_now):
+        print(f"[clipper] title contains Devanagari; using {family} instead of "
+              f"{title_now}, which cannot draw it")
+        title_font = font_id
+
+    return st, title_font
 
 
 def _discover_fonts() -> dict:
@@ -748,17 +798,11 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
     st = _recolour(st, color, active_color)
 
-    # Swap the whole caption face when the speech is Devanagari and the chosen
-    # one cannot draw it. Whole-style rather than per-run: mixing two faces
-    # inside a line looks like a bug, and the alternative -- naming the Hindi
-    # face around each run -- means emitting \fn overrides into cues that are
-    # already carrying karaoke colour state.
-    if _is_devanagari("".join(_word_text(w) for w in words)):
-        family = devanagari_family(st["font"])
-        if family and family != st["font"]:
-            print(f"[clipper] captions contain Devanagari; using {family} "
-                  f"instead of {st['font']}, which cannot draw it")
-            st = {**st, "font": family}
+    # Whole style rather than per-run: mixing two faces inside a line looks like
+    # a bug, and naming the Hindi face around each run would mean emitting \fn
+    # overrides into cues already carrying karaoke colour state.
+    st, title_font = _fit_devanagari(
+        st, "".join(_word_text(w) for w in words), title, title_font)
 
     lines = [_header(margin_v, st, play_res, title_style, title_font)]
     lines.append(_title_events(title, play_res, title_style))
@@ -919,6 +963,9 @@ def build_ass_lines(caption_lines: list, out_path: str,
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
     st = _recolour(st, color, active_color)
+    st, title_font = _fit_devanagari(
+        st, " ".join((l.get("text") or "") for l in caption_lines),
+        title, title_font)
 
     out = [_header(margin_v, st, play_res, title_style, title_font),
            _title_events(title, play_res, title_style)]
