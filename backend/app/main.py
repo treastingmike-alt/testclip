@@ -879,23 +879,6 @@ CAPTION_RECIPE_DEFAULTS = {
 }
 
 
-def _caption_recipe_changed(job: Job, previous: dict, incoming: dict) -> bool:
-    """Whether this save changes a caption-specific part of the recipe."""
-    options = ((job.get("options") if isinstance(job, dict) else job.options)
-               or {})
-    template = TEMPLATES.get(options.get("template", "classic"), TEMPLATES["classic"])
-    defaults = {
-        **CAPTION_RECIPE_DEFAULTS,
-        "caption_style": options.get("caption_style") or template["caption_style"],
-        "captions_on": options.get("burn_subtitles", True),
-    }
-    current = {**defaults, **(previous or {})}
-    return any(
-        key in incoming and incoming[key] != current.get(key)
-        for key in defaults
-    )
-
-
 @app.put("/jobs/{job_id}/clips/{index}/edit")
 def save_clip_edit(job_id: str, index: int, body: ClipRecipe,
                    user: User = Depends(auth.current_user_required)):
@@ -915,9 +898,13 @@ def save_clip_edit(job_id: str, index: int, body: ClipRecipe,
             raise HTTPException(status_code=403, detail="That clip belongs to another account.")
 
         incoming = body.dict(exclude_unset=True)
-        if _caption_recipe_changed(job, clip.edit or {}, incoming):
-            _gate(user, "caption_editing",
-                  "Changing caption text and styling is available on Creator and Pro.")
+        # Caption editing is deliberately NOT gated here. This endpoint stores a
+        # JSON recipe -- it renders nothing -- and the editor draws its preview
+        # in the browser over the proxy, so a free account experimenting with
+        # captions costs exactly one database row. Gating it meant someone on
+        # Free could never find out what the editor does before being asked to
+        # pay for it. The limit that matters is _reserve_editor_export, which
+        # every rendering path goes through.
         if incoming.get("tighten_pauses") is True:
             _gate(user, "tighten_pauses",
                   "Automatic pause tightening is available on Creator and Pro.")
@@ -1057,9 +1044,11 @@ def export_clip(job_id: str, index: int,
         if not clip:
             raise HTTPException(status_code=404, detail="Clip not found")
         recipe = dict(clip.edit or {})
-        if _caption_recipe_changed(job, {}, recipe):
-            _gate(user, "caption_editing",
-                  "Changing caption text and styling is available on Creator and Pro.")
+        # The one export included with Free renders what the user actually
+        # built, captions and all. Spending that single allowance only to
+        # receive the unedited clip -- with the changes they had just made
+        # silently dropped -- would be the worst possible first impression.
+        # _reserve_editor_export below is what holds the line.
         if recipe.get("tighten_pauses", (job.get("options") or {}).get(
                 "tighten_pauses", True)):
             _gate(user, "tighten_pauses",
@@ -1133,11 +1122,9 @@ def rerender_clip(job_id: str, index: int, body: ClipEdit,
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if any((body.caption_style, body.caption_font, body.translate_to,
-            body.caption_lines)):
-        _gate(user, "caption_editing",
-              "Changing caption text and styling is available on Creator and Pro.")
-
+    # Same reasoning as the export path: this re-cut is metered by
+    # _reserve_editor_export a few lines down, so the caption settings riding
+    # along with it need no separate gate of their own.
     tpl = TEMPLATES.get((job.get("options") or {}).get("template", "classic"))
     loops = _gameplay_loops() if tpl and tpl["frame"] == "gameplay" else []
     reservation_id = _reserve_editor_export(job_id, index, user)

@@ -55,6 +55,7 @@ PLANS = [
         "features": [
             f"{FREE_SIGNUP_CREDITS // CREDITS_PER_CLIP} free clips on signup",
             "Projects saved for 3 hours",
+            "Full caption editing in the editor",
             "One edited export",
             "All templates and ratios",
             "Word-accurate captions",
@@ -80,7 +81,7 @@ PLANS = [
         "features": [
             "100 ready-to-post clips each month",
             "Projects saved for 3 days",
-            "Caption editing",
+            "Unlimited edited exports, no watermark",
             "Multilingual captions",
             "Gameplay split-screen",
             "Pause tightening",
@@ -119,15 +120,29 @@ PLANS = [
 #   branding       -- a logo or handle burned into the clip.
 #   no_watermark   -- free clips carry ours. See WATERMARK_TEXT.
 #   share_pages    -- the public score/hook page per clip.
-#   caption_editing -- changing caption text, style, colour, size or position.
 #   priority       -- Pro jobs go ahead of the standard queue.
 _PAID = frozenset({"multilingual", "gameplay", "tighten_pauses",
-                   "branding", "no_watermark", "share_pages", "caption_editing"})
+                   "branding", "no_watermark", "share_pages"})
+
+# On every plan, Free included.
+#
+#   caption_editing -- changing caption text, style, colour, size or position.
+#
+# This one is here rather than in _PAID because editing captions RENDERS
+# NOTHING: the editor previews in the browser over the proxy, and the save is a
+# JSON recipe. Charging for it meant a Free account could never discover what
+# the editor does before being asked to pay for it -- the strongest argument the
+# product has, hidden behind the paywall it was supposed to sell.
+#
+# Metering lives at the export instead, where the compute actually is. A Free
+# account still gets exactly one edited export, still watermarked; what changed
+# is that the export now contains the work they did.
+_EVERYONE = frozenset({"caption_editing"})
 
 ENTITLEMENTS = {
-    "free": frozenset(),
-    "creator": _PAID,
-    "pro": _PAID | {"priority"},
+    "free": _EVERYONE,
+    "creator": _PAID | _EVERYONE,
+    "pro": _PAID | _EVERYONE | {"priority"},
 }
 
 # Hard numbers, separate from ENTITLEMENTS because a limit is a ceiling rather
