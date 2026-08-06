@@ -12,7 +12,7 @@ backend/.env
 
 # backend runtime data / assets
 backend/storage
-backend/assets/gameplay
+ 
 
 # python
 venv/
@@ -24,7 +24,7 @@ __pycache__/
 node_modules/
 
 # build output
-frontend/dist/
+ 
 
 # large / partial media downloads
 *.part

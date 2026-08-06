@@ -1,0 +1,23 @@
+{
+ "classic": [
+  "classic.mp4"
+ ],
+ "fitvideo": [
+  "fitvideo.mp4"
+ ],
+ "tech": [
+  "tech.mp4"
+ ],
+ "business": [
+  "business.mp4"
+ ],
+ "gameplay": [
+  "gameplay.mp4",
+  "gameplay-1.mp4",
+  "gameplay-2.mp4",
+  "gameplay-3.mp4"
+ ],
+ "podcast": [
+  "podcast.mp4"
+ ]
+}
