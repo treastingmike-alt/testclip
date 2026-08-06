@@ -1474,6 +1474,9 @@ def run_pipeline(job_id: str, req: JobRequest, gameplay_loops: list = None,
     tpl = TEMPLATES.get(req.template, TEMPLATES["classic"])
     job_dir = os.path.join(STORAGE_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+    # Nothing has been billed yet. Set before the try so the failure handler can
+    # always read it, including for a failure that happens before the charge.
+    charged_credits = 0
     # Frozen at creation by _start_job -- see the note there.
     job_options = (get_job(job_id) or {}).get("options") or {}
     options_watermark = job_options.get("watermark") or None
