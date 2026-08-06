@@ -90,19 +90,6 @@ def enqueue(job_id: str, priority: int = 0) -> None:
         session.commit()
 
 
-def dequeue(job_id: str) -> None:
-    """Withdraw a job that was enqueued but cannot run after all.
-
-    Distinct from fail() only in intent: this is for the submitting request
-    giving up between enqueue and commit -- an upload whose bytes never reached
-    storage, say -- where leaving the row would hand a worker a job whose input
-    does not exist.
-    """
-    with SessionLocal() as session:
-        session.query(QueuedJob).filter(QueuedJob.job_id == job_id).delete()
-        session.commit()
-
-
 def claim(worker: str = None) -> str | None:
     """Take the next eligible job, or None. Returns the job_id.
 

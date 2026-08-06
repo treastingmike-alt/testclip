@@ -1404,7 +1404,8 @@ def _gate_source_duration(duration_seconds: Optional[float], user: User = None) 
 
 
 def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
-               user: User = None, uploaded: bool = False, gameplay_loops: list = None) -> str:
+               user: User = None, uploaded: bool = False, gameplay_loops: list = None,
+               enqueue: bool = True) -> str:
     options = req.dict()
     options["frame"] = TEMPLATES.get(req.template, TEMPLATES["classic"])["frame"]
     options["input_type"] = "upload" if uploaded else "link"
@@ -1429,7 +1430,12 @@ def _start_job(req: JobRequest, background_tasks: BackgroundTasks,
     #
     # `background_tasks` is still accepted so the signature is unchanged for
     # callers; nothing is scheduled on it any more.
-    queue.enqueue(job_id, priority=_job_priority(user))
+    #
+    # Uploads defer this: their source is not reachable by the worker until it
+    # has been published, and a queued job whose input does not exist yet is a
+    # job a worker can claim and fail. See submit_uploaded_job.
+    if enqueue:
+        queue.enqueue(job_id, priority=_job_priority(user))
     return job_id
 
 
@@ -1619,30 +1625,46 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
     finally:
         await file.close()
 
+    # Created but NOT queued yet: the job id is the storage key, so the row has
+    # to exist before the file can be published, and the file has to exist
+    # before any worker may see the job.
     job_id = _start_job(req, background_tasks, user, uploaded=True,
-                        gameplay_loops=gameplay_loops)
+                        gameplay_loops=gameplay_loops, enqueue=False)
     final_dir = os.path.join(STORAGE_DIR, job_id)
     os.replace(job_dir, final_dir)
 
     # The API and the worker are different containers with different disks, so
     # a file sitting here is invisible to whichever worker picks the job up.
-    # Publishing it makes the source fetchable by key; the worker pulls it back
+    # Publishing makes the source fetchable by key; the worker pulls it back
     # with storage.ensure_local.
     #
-    # Before _start_job would be wrong: publishing takes as long as the upload
-    # again for a large file, and the request is already holding the client
-    # open. This ordering costs a small race -- a worker can claim the job
-    # before the bytes land -- which is why the worker waits for the source
-    # rather than failing on a miss.
+    # This MUST finish before the job is queued. Publishing afterwards left a
+    # window where a worker claimed the job, looked for a source that was still
+    # uploading, and failed it -- and on a container with an idle worker that
+    # window is hit every time, not occasionally.
     try:
+        update_job(job_id, progress_message="Storing your video...")
         storage.publish(job_id, final_dir, ["source.mp4"])
+        # Confirmed rather than assumed. publish() is a deliberate no-op on the
+        # local driver, so an API container with STORAGE_BACKEND unset stores
+        # nothing and reports success -- and the only symptom is the worker,
+        # elsewhere, failing every upload with a message about a missing file.
+        # Checking the key turns that into one honest error here.
+        if not storage.driver.exists(storage.job_key(job_id, "source.mp4")):
+            raise RuntimeError(
+                f"source.mp4 is not readable at its key after publishing "
+                f"(storage backend: {storage.driver.name}). If this API is "
+                f"deployed separately from its worker, both need the same R2 "
+                f"configuration.")
     except Exception as exc:
+        traceback.print_exc()
         update_job(job_id, status="failed",
                    error="We couldn't store your upload. Please try again.")
-        queue.dequeue(job_id)
         raise HTTPException(
             status_code=502,
             detail="We couldn't store your upload. Please try again.") from exc
+
+    queue.enqueue(job_id, priority=_job_priority(user))
     return {"job_id": job_id}
 
 

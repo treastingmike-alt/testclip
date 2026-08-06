@@ -228,15 +228,33 @@ def cookie_source() -> str:
 # yt-dlp failure signatures -> what the user should actually be told. The raw
 # log is for the server console; a person who pasted a link deserves a sentence.
 def _cookie_hint() -> str:
-    """Advice that matches how this install is actually configured."""
+    """What to tell the PERSON who pasted the link.
+
+    Deliberately says nothing about cookies, scripts or configuration. This
+    text reaches a creator in a browser, and it used to tell them to "run
+    ./refresh-cookies.sh on this machine" -- a machine they have never heard of
+    and cannot log into. Advice someone cannot act on reads as being blamed for
+    an outage that is not theirs.
+
+    The operator's version of this is _cookie_operator_hint, which goes to the
+    server log where the person who CAN fix it will see it.
+    """
+    return (" Uploading the video file works and skips YouTube entirely.")
+
+
+def _cookie_operator_hint() -> str:
+    """The same failure, described for whoever runs this deployment."""
     if COOKIES_FILE:
-        return (" The saved YouTube session has gone stale -- YouTube rotates these "
-                "regularly. Refresh it with: ./refresh-cookies.sh")
+        return (f"The YouTube session in {os.path.basename(COOKIES_FILE)} has gone "
+                f"stale -- YouTube rotates these regularly. Regenerate it and "
+                f"redeploy.")
     if COOKIES_BROWSER:
-        return (f" The {COOKIES_BROWSER} session did not satisfy YouTube. Make sure "
-                f"you are signed in to YouTube in {COOKIES_BROWSER}.")
-    return (" No YouTube session is configured. On this machine run "
-            "./refresh-cookies.sh, which lets Clipper use your browser's sign-in.")
+        return (f"CLIPPER_COOKIES_BROWSER={COOKIES_BROWSER} reads a local browser "
+                f"profile and cannot work on a server. Use CLIPPER_COOKIES_FILE "
+                f"with an exported cookies.txt instead.")
+    return ("No YouTube session is configured, so YouTube is refusing most "
+            "videos as bot traffic. Export cookies.txt from a signed-in browser "
+            "and point CLIPPER_COOKIES_FILE at it.")
 
 # Message templates; the session hint is appended at raise time so it always
 # reflects the CURRENT configuration rather than whatever it was at import.
@@ -390,8 +408,13 @@ def _run_with_progress(cmd: list, on_progress=None, _retrying: bool = False) -> 
             # Full log to the server console for debugging; only the sentence
             # travels to the user.
             print("[clipper] yt-dlp failure:\n" + log)
-            raise RuntimeError(_public_failure(log))
-        print("[clipper] downloader failure:\n" + log)
+        else:
+            print("[clipper] downloader failure:\n" + log)
+        # The fix for an auth refusal belongs to whoever runs this deployment,
+        # so it is printed here rather than shown to the person who pasted the
+        # link and can do nothing about it.
+        if _is_auth_failure(log):
+            print(f"[clipper] ACTION NEEDED: {_cookie_operator_hint()}")
         raise RuntimeError(_public_failure(log))
 
 
