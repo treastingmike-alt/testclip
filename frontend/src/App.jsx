@@ -600,20 +600,54 @@ export default function App() {
       || params.has("customer_session_token")
       || params.has("checkout_id");
 
+    /* What the account was immediately before checkout, stashed by Pricing.
+       Absent for a purchase begun elsewhere, or in private mode -- so the
+       comparison below falls back to "are they off the free plan". */
+    let before = null;
+    try {
+      before = JSON.parse(window.sessionStorage.getItem("billingBeforeCheckout"));
+    } catch { /* ignore */ }
+
+    /* Did this payment actually land yet?
+
+       The old test was "does the user have any entitlements", which read as
+       "has paid" only because Free happened to have none. The moment Free
+       gained caption editing, every returning buyer matched on the first tick:
+       polling stopped before the webhook could arrive and the modal announced
+       "You're on Free" to someone who had just paid for Creator. It was also
+       always wrong for top-ups, which grant credits and change nothing else.
+
+       A real purchase moves the plan or the balance. Compare those. */
+    function paymentLanded(u) {
+      if (!u) return false;
+      if (before) return u.plan !== before.plan || (u.credits ?? 0) > before.credits;
+      return Boolean(u.plan) && u.plan !== "free";
+    }
+
     async function refresh(attempt = 0) {
       const nextUser = await fetchMe();
       if (cancelled) return;
       setUser(nextUser);
-      /* Keep polling until the plan actually changes. The webhook is what
-         grants credits, and it races the redirect -- a fixed number of tries
-         used to give up while the payment was still settling, leaving someone
-         who HAD paid looking at their old balance. */
-      if (returningFromPayment && attempt < 8
-          && !nextUser?.entitlements?.length) {
+      /* Keep polling until it does change. The webhook grants the credits and
+         it races the redirect, so a buyer can easily arrive first. */
+      if (returningFromPayment && attempt < 8 && !paymentLanded(nextUser)) {
         window.setTimeout(() => refresh(attempt + 1).catch(() => {}), 1500);
+        return;
       }
-      if (returningFromPayment && nextUser?.entitlements?.length) {
+      if (returningFromPayment && paymentLanded(nextUser)) {
+        try { window.sessionStorage.removeItem("billingBeforeCheckout"); }
+        catch { /* ignore */ }
         setJustUpgraded(nextUser);
+      } else if (returningFromPayment) {
+        /* Twelve seconds and still nothing. Say so plainly instead of
+           congratulating them on a plan they did not buy -- the charge is real
+           and they need to know we know about it. */
+        toast("Payment received — your account is still updating", {
+          detail: "Refresh in a moment. If it still looks wrong, contact us "
+                + "and we'll sort it out.",
+          tone: "info",
+          ttl: 15000,
+        });
       }
     }
     refresh().catch(() => {});

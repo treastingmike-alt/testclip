@@ -19,6 +19,8 @@ export function usePlan(user) {
   return useMemo(() => {
     const entitlements = user?.entitlements || [];
     const limits = user?.limits || catalogue?.limits?.free || FALLBACK;
+    // What the Free plan itself grants, straight from /billing/plans.
+    const freeGrants = catalogue?.entitlements?.free || null;
     const can = (feature) => entitlements.includes(feature);
     return {
       plan: user?.plan || "free",
@@ -26,8 +28,20 @@ export function usePlan(user) {
          The admin bypass (ADMIN_EMAILS) grants every entitlement while leaving
          the plan column at "free", so a plan-string check told admins their
          exports would be watermarked when the server had already decided they
-         would not be. Any future comped account has the same shape. */
-      isFree: entitlements.length === 0,
+         would not be. Any future comped account has the same shape.
+
+         "Free" therefore means HOLDING NOTHING BEYOND WHAT FREE ITSELF GRANTS,
+         which is not the same as holding nothing. Testing for an empty list
+         worked only while Free had no capabilities at all, and every free
+         account started reporting isFree === false the day it gained caption
+         editing. Comparing against the server's own list for the free plan
+         keeps this correct however the plans are rearranged next.
+
+         Before the catalogue arrives, fall back to the watermark -- the one
+         entitlement no free account has ever had. */
+      isFree: freeGrants
+        ? entitlements.every((feature) => freeGrants.includes(feature))
+        : !entitlements.includes("no_watermark"),
       watermarked: !can("no_watermark"),
       isAdmin: !!user?.is_admin,
       limits,

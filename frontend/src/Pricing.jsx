@@ -109,6 +109,19 @@ export default function Pricing({ user, onRequireAuth, modal = false, onClose, o
       });
       if (r.checkout_url) {
         setNotice("Opening secure checkout…");
+        /* Remember what the account looked like BEFORE paying, so the return
+           journey can tell "the payment landed" from "nothing happened yet" by
+           comparing against it. Every cheaper signal is wrong for some real
+           purchase: a top-up changes no plan and no entitlements, only the
+           balance, and "has any entitlements at all" silently broke the moment
+           Free gained its first one. sessionStorage because this must survive
+           the round trip to Polar and no longer. */
+        try {
+          window.sessionStorage.setItem("billingBeforeCheckout", JSON.stringify({
+            plan: user.plan || "free",
+            credits: user.credits ?? 0,
+          }));
+        } catch { /* private mode: fall back to the plan check on return */ }
         window.location.assign(r.checkout_url);
         return;
       }
