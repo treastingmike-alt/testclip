@@ -208,6 +208,27 @@ def emoji_font() -> dict:
     return None
 
 
+def _is_devanagari(text: str) -> bool:
+    return any(0x0900 <= ord(c) <= 0x097F for c in text)
+
+
+def devanagari_family(preferred: str = None) -> str:
+    """A shipped family that can draw Devanagari, or None if none can.
+
+    Missing Devanagari is not a soft fallback the way a missing weight is: libass
+    reports "failed to find any fallback with glyph 0x939", ffmpeg exits non-zero
+    and render_clip raises, so a Hindi clip fails outright rather than rendering
+    in the wrong face. The per-font coverage flag already exists (see
+    _discover_fonts) and was only ever reported to the editor -- this is what
+    makes it decide something.
+    """
+    if preferred and any(e["family"] == preferred and e.get("devanagari")
+                         for e in FONTS.values()):
+        return preferred
+    return next((e["family"] for e in FONTS.values() if e.get("devanagari")),
+                None)
+
+
 def _discover_fonts() -> dict:
     """Every font in assets/fonts, keyed by a slug derived from its filename.
 
@@ -726,6 +747,19 @@ def build_ass(words: list, clip_start_time: float, out_path: str,
     if size_px:
         st = {**st, "size": max(MIN_CAPTION_PX, min(MAX_CAPTION_PX, int(size_px)))}
     st = _recolour(st, color, active_color)
+
+    # Swap the whole caption face when the speech is Devanagari and the chosen
+    # one cannot draw it. Whole-style rather than per-run: mixing two faces
+    # inside a line looks like a bug, and the alternative -- naming the Hindi
+    # face around each run -- means emitting \fn overrides into cues that are
+    # already carrying karaoke colour state.
+    if _is_devanagari("".join(_word_text(w) for w in words)):
+        family = devanagari_family(st["font"])
+        if family and family != st["font"]:
+            print(f"[clipper] captions contain Devanagari; using {family} "
+                  f"instead of {st['font']}, which cannot draw it")
+            st = {**st, "font": family}
+
     lines = [_header(margin_v, st, play_res, title_style, title_font)]
     lines.append(_title_events(title, play_res, title_style))
 

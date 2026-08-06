@@ -1467,7 +1467,14 @@ def _build_proxies_quietly(job_id: str, video_path: str, job_dir: str,
             storage.publish(job_id, job_dir, [f"preview_{i}.mp4"])
             print(f"[clipper] editor preview ready for {job_id} clip {i} "
                   f"({lo:.0f}s-{hi:.0f}s)")
-        except (RuntimeError, OSError) as e:
+        except Exception as e:
+            # Deliberately broad. boto3 raises S3UploadFailedError and
+            # ClientError, which descend straight from Exception and so slipped
+            # past the (RuntimeError, OSError) this used to catch -- an R2
+            # permission problem then killed this whole thread mid-loop, taking
+            # the remaining previews with it and printing a traceback that
+            # looked like a crash in the job itself. A proxy is a convenience;
+            # nothing that happens to one may escape this loop.
             print(f"[clipper] proxy for {job_id} clip {i} failed (live editing "
                   f"unavailable for it): {e}")
 
