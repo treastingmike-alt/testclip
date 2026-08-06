@@ -27,6 +27,8 @@ remains real scratch space; this module is the boundary that work crosses on
 its way out, not a filesystem replacement.
 """
 
+from app import env  # noqa: F401  -- .env must be read BEFORE _build() runs
+
 import os
 import shutil
 
@@ -192,6 +194,12 @@ def _build():
     configuration at all. Misconfigured R2 raises here at import rather than at
     the first upload -- a job that transcribes, analyses and renders before
     discovering it cannot store the result has wasted real money.
+
+    This runs at import, which is why the module loads .env at the top. Without
+    that, importing storage before app.env -- which any script or worker
+    entrypoint may do -- read an unset STORAGE_BACKEND and silently chose the
+    local disk. The failure is invisible until a second container looks for a
+    file the first one "stored" and finds nothing.
     """
     backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if backend in ("", "local", "filesystem"):

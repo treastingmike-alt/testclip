@@ -1445,6 +1445,30 @@ def _job_priority(user: User = None) -> int:
     return 0
 
 
+def _await_uploaded_source(job_id: str, job_dir: str, timeout: float = 120.0):
+    """The uploaded source, waiting for it to appear in storage if necessary.
+
+    The upload is published AFTER the job is enqueued, so a worker that is idle
+    when the job lands can claim it before the last bytes have been stored.
+    That window is short but entirely real, and losing it means telling someone
+    their file is missing seconds after they watched it upload.
+
+    Polls rather than coordinates: a flag saying "source ready" would be one
+    more thing to get wrong, and the file's own existence already answers the
+    question.
+    """
+    deadline = time.monotonic() + timeout
+    delay = 0.5
+    while True:
+        path = storage.ensure_local(job_id, job_dir, "source.mp4")
+        if path:
+            return path
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5.0)
+
+
 def run_queued_job(job_id: str) -> None:
     """Run one claimed job. The worker's only entry point into the pipeline.
 
@@ -1465,9 +1489,14 @@ def run_queued_job(job_id: str) -> None:
     # Only the fields JobRequest actually declares: options also carries the
     # frozen plan decisions (watermark, retention, ceilings), which are read
     # directly by the pipeline and would be rejected as unknown fields here.
+    #
+    # options already contains `url` -- it is req.dict() -- so the row's value
+    # is assigned over the top rather than passed as a second keyword, which is
+    # a duplicate argument and a TypeError on every single job.
     fields = set(JobRequest.model_fields)
-    req = JobRequest(**{k: v for k, v in options.items() if k in fields},
-                     url=url)
+    data = {k: v for k, v in options.items() if k in fields}
+    data["url"] = url          # the Job row is authoritative
+    req = JobRequest(**data)
 
     uploaded = options.get("input_type") == "upload"
     # Re-resolved rather than carried: the loops are files on the worker's own
@@ -1592,7 +1621,28 @@ async def submit_uploaded_job(background_tasks: BackgroundTasks,
 
     job_id = _start_job(req, background_tasks, user, uploaded=True,
                         gameplay_loops=gameplay_loops)
-    os.replace(job_dir, os.path.join(STORAGE_DIR, job_id))
+    final_dir = os.path.join(STORAGE_DIR, job_id)
+    os.replace(job_dir, final_dir)
+
+    # The API and the worker are different containers with different disks, so
+    # a file sitting here is invisible to whichever worker picks the job up.
+    # Publishing it makes the source fetchable by key; the worker pulls it back
+    # with storage.ensure_local.
+    #
+    # Before _start_job would be wrong: publishing takes as long as the upload
+    # again for a large file, and the request is already holding the client
+    # open. This ordering costs a small race -- a worker can claim the job
+    # before the bytes land -- which is why the worker waits for the source
+    # rather than failing on a miss.
+    try:
+        storage.publish(job_id, final_dir, ["source.mp4"])
+    except Exception as exc:
+        update_job(job_id, status="failed",
+                   error="We couldn't store your upload. Please try again.")
+        queue.dequeue(job_id)
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't store your upload. Please try again.") from exc
     return {"job_id": job_id}
 
 
@@ -1731,8 +1781,13 @@ def _run_pipeline_locked(job_id: str, req: JobRequest, gameplay_loops: list = No
         # this job directory, so extracting audio locally avoids yt-dlp entirely.
         audio_path = os.path.join(job_dir, "audio.mp3")
         if uploaded_source:
-            video_path = os.path.join(job_dir, "source.mp4")
-            if not os.path.exists(video_path):
+            # Not necessarily on this disk: the container that accepted the
+            # upload is not the one rendering it. ensure_local returns the file
+            # if it is here and pulls it from storage if it is not.
+            update_job(job_id, status="downloading",
+                       progress_message="Getting your video ready...", percent=0)
+            video_path = _await_uploaded_source(job_id, job_dir)
+            if not video_path:
                 raise RuntimeError("The uploaded source video is missing. Upload it again.")
             update_job(job_id, status="downloading", progress_message="Getting your video ready...", percent=0)
             workspace.ensure_space(job_dir, os.path.getsize(video_path))
